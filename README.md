@@ -109,7 +109,7 @@ The owned regex rule is named **Readalong • Hide voice cues**, under the Reada
 
 | Permission | Purpose |
 |---|---|
-| `generation` | Detect completed replies for optional autoplay and identify the speaking character. |
+| `generation` | Detect completed replies for automatic preparation and identify the speaking character. |
 | `interceptor` | Add optional voice-cue instructions to the existing generation. |
 | `chat_mutation` | Read selected chat messages; no message writes are performed. |
 | `chats` | Verify that each requested chat belongs to the requesting user before reading it. |
