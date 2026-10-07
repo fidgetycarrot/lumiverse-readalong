@@ -2,9 +2,9 @@
 
 Listen to assistant passages and find your place at a glance. Readalong marks your estimated sentence within continuous audio, lets you browse and preview speech voices, and saves character voice assignments. Optional emotion and speaker cues come from your existing chat model: **there is no second LLM call**.
 
-Recommended connection: **your saved Lumiverse OpenRouter TTS connection → `google/gemini-3.8-flash-tts` → Kore**. Readalong 0.1.3 reuses Lumiverse’s native TTS endpoint and saved provider key. When upgrading an existing Gemini setup, it automatically selects a matching saved OpenRouter TTS connection if one is available. Readalong fetches OpenRouter's speech model catalog and the full voice list reported for each model. Gemini's 30 studio voices are bundled as a fallback. Voice previews use one short sample. Native connection keys remain entirely in Lumiverse’s server-side encrypted storage. Direct-mode keys use the encrypted, per-user extension enclave. No provider key is returned to the frontend.
+Recommended connection: **your saved Lumiverse OpenRouter TTS connection → `google/gemini-3.8-flash-tts` → Kore**. Readalong 0.1.4 reuses Lumiverse’s native TTS endpoint and saved provider key. When upgrading an existing Gemini setup, it automatically selects a matching saved OpenRouter TTS connection if one is available. Readalong fetches OpenRouter's speech model catalog and the full voice list reported for each model. Gemini's 30 studio voices are bundled as a fallback. Voice previews use one short sample. Native connection keys remain entirely in Lumiverse’s server-side encrypted storage. Direct-mode keys use the encrypted, per-user extension enclave. No provider key is returned to the frontend.
 
-Version **0.1.3** prepares the **whole message before enabling Play**, batches adjacent text in the same voice, and schedules prepared audio continuously across voice changes. It adds a movable floating player with Play/Pause, Stop, elapsed time, and Replay. Ordinary quoted dialogue switches to the speaking character, with surrounding prose read by the narrator; explicit speaker cues still take precedence.
+Version **0.1.4** prepares the **whole message before enabling Play**, batches adjacent text in the same voice, and schedules prepared audio continuously across voice changes. It adds a movable floating player with Play/Pause, Stop, elapsed time, and Replay. Ordinary quoted dialogue switches to the speaking character, with surrounding prose read by the narrator; explicit speaker cues still take precedence.
 
 ## Install
 
@@ -24,6 +24,8 @@ Use a current Lumiverse 1.2.0 or newer build with Spindle. This package includes
 
 A GitHub source is needed for automatic remote updates. Source and prebuilt bundles are available at [fidgetycarrot/lumiverse-readalong](https://github.com/fidgetycarrot/lumiverse-readalong).
 
+**Upgrading from 0.1.3:** update Readalong from its extension settings. Version 0.1.4 declares the missing `ui_panels` permission for the floating player, bringing the requested total to eight. The current Lumiverse host grants this permission during update; if it still shows 7/8, enable **UI panels** (`ui_panels`) and reload Readalong. A missing or revoked widget permission leaves speech and the drawer player usable.
+
 ## First reading
 
 1. Open the Readalong drawer tab, or use the Readalong input-bar action.
@@ -31,7 +33,7 @@ A GitHub source is needed for automatic remote updates. Source and prebuilt bund
 3. Pick a speech model. Select a default voice and click **Listen** to preview it. Search filters the complete voice list for the chosen model.
 4. Open a chat. Click **Read aloud** on a message, or choose an assistant message in the Readalong player and click **Prepare message**. Wait for the whole message to be ready, then press **Play** in the player or floating widget. Nothing plays while it is preparing.
 5. **Pause** keeps your place. **Resume** continues from the same audio position. **Replay** uses the prepared audio without another speech request. **Stop** releases that audio and clears the marker. Return to passage scrolls a mounted passage into view; optional Follow does this at sentence changes.
-6. The floating player appears when preparing a message or preview. Drag it to a convenient place; hide it with × and reopen it with **Floating player** in the drawer or the Readalong input-bar action. Hiding it leaves playback running. The native Spindle host supplies its drag behavior.
+6. With `ui_panels` granted, the floating player appears when preparing a message or preview. Drag it to a convenient place; hide it with × and reopen it with **Floating player** in the drawer or the Readalong input-bar action. Hiding it leaves playback running. The native Spindle host supplies its drag behavior.
 
 All voice passages are synthesized and decoded before Play is enabled, with at most three native requests running at once (two for direct modes). Preparation generates speech for the **entire selected message**, even if you only listen to part of it. Adjacent text using the same effective voice/direction shares a request, up to 3,000 characters. Playback uses one audio clock with no network loading between passages. Provider-generated silence can still occur in the audio itself. Prepared audio stays in memory only until Stop, another reading, a chat/message change, or unloading; it is not written into the chat. Messages exceeding 256 MiB of decoded audio are rejected to protect browser memory.
 
@@ -45,7 +47,9 @@ Turn off Lumiverse's built-in TTS autoplay if using Readalong's autoplay, so the
 
 ## Troubleshooting
 
-**Gemini says it only supports PCM, or the transparent proxy rejects the response:** update to **0.1.3**, select **Lumiverse connection**, choose your working saved OpenRouter TTS connection, and click **Listen**. The upgrade selects an existing OpenRouter connection automatically for older Gemini settings where possible.
+**Gemini says it only supports PCM, or the transparent proxy rejects the response:** update to **0.1.4**, select **Lumiverse connection**, choose your working saved OpenRouter TTS connection, and click **Listen**. The upgrade selects an existing OpenRouter connection automatically for older Gemini settings where possible.
+
+**`PERMISSION_DENIED:ui_panels`, even with 7/7 granted:** version 0.1.3 omitted the widget permission from its manifest. Update to **0.1.4**; the extension now requests eight permissions. Enable `ui_panels` if it is not granted, then reload Readalong or click **Floating player** to refresh its grants. You can prepare, play, and pause in the drawer while the widget permission is unavailable.
 
 **No saved connections:** add a TTS connection in Lumiverse’s voice settings, then refresh the Readalong connection list. Readalong never creates, changes, or deletes native connection profiles or keys.
 
@@ -106,6 +110,7 @@ The owned regex rule is named **Readalong • Hide voice cues**, under the Reada
 | `characters` | List characters and add the native character-editor Voice tab. |
 | `regex_scripts` | Install the extension-owned display-only cue filter. |
 | `cors_proxy` | Fetch voice/model lists and speech from OpenRouter or the selected local endpoint. |
+| `ui_panels` | Create the movable floating playback widget; drawer playback remains usable without it. |
 
 Settings and keys are isolated per user even in operator installs. Responses to explicit frontend requests are routed back to the originating frontend session where the host supports session routing.
 
@@ -120,7 +125,7 @@ npm run build
 
 Requires Bun for builds/tests. Types are pinned to `lumiverse-spindle-types@0.6.39`. Runtime bundles have no third-party runtime dependencies.
 
-Verified against the current Lumiverse source and Spindle types. All 69 parser/provider/session/playback tests pass, including automatic narration/dialogue detection, voice inheritance and overrides, full preparation, ordered parallel responses, gapless scheduling, exact audio pause/resume, speed changes, replay, cancellation, native connection reuse, PCM/WAV conversion, response bounds, provider errors, credential redaction, and diagnostic isolation. Browser UI checks used a mock speech connection and covered voice search, model-specific lists, previews, continuous Web Audio playback, a five-minute buffered fixture, estimated sentence markers, floating controls, pause/resume, replay without new requests, stop during preparation, errors without retries, chat changes, and unloading. The backend bundle also passed Lumiverse's current static extension scanner. Live OpenRouter synthesis still needs testing in your Lumiverse instance with your key; the development checks did not make paid speech requests.
+Verified against the current Lumiverse source and Spindle types. All 70 parser/provider/session/playback tests pass, including automatic narration/dialogue detection, voice inheritance and overrides, full preparation, ordered parallel responses, gapless scheduling, exact audio pause/resume, speed changes, replay, cancellation, native connection reuse, PCM/WAV conversion, response bounds, provider errors, credential redaction, and diagnostic isolation. Browser UI checks used a mock speech connection and covered voice search, model-specific lists, previews, continuous Web Audio playback, a five-minute buffered fixture, estimated sentence markers, floating controls, pause/resume, replay without new requests, stop during preparation, errors without retries, chat changes, and unloading. The backend bundle also passed Lumiverse's current static extension scanner. Version 0.1.4 also checks the declared widget permission and actual grant reporting, with browser regressions for missing, revoked/stale, and restored grants. The mock host now enforces `ui_panels` for widget creation. Live OpenRouter synthesis still needs testing in your Lumiverse instance with your key; the development checks did not make paid speech requests.
 
 Native mode uses Lumiverse’s session-authenticated `/api/v1/tts-connections`, `/api/v1/settings/voiceSettings` (read-only voice/detection preferences), and `/api/v1/tts/synthesize` routes, the same routes as its built-in voice player. Gemini on OpenRouter requests `pcm`; Readalong preserves the 16-bit mono samples and adds a WAV header (24 kHz by default, or the response’s rate parameter). Other native providers retain their configured output format. The public OpenRouter catalog supplies complete model-specific voice lists instead of the host’s shorter curated list. Direct OpenRouter mode remains available for MP3 models; it refuses Gemini speech before sending a paid request and directs you to a saved Lumiverse connection. The host’s CORS media guard remains unchanged.
 

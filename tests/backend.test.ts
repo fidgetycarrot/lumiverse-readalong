@@ -1,5 +1,7 @@
 import { describe,test,expect } from 'bun:test';
 import { DEFAULTS as GEMINI_DEFAULTS } from '../src/shared';
+import manifest from '../spindle.json';
+const granted=new Set<string>(manifest.permissions);
 const DEFAULTS={...GEMINI_DEFAULTS,model:'mistralai/voxtral-mini-tts-2603'};
 const files=new Map<string,string>(),keys=new Map<string,string>(),rules:any[]=[];
 const outgoing:any[]=[],requests:any[]=[];
@@ -13,7 +15,7 @@ let messageReads=0;
   onFrontendMessage:(h:any)=>{handler=h},sendToFrontend:(p:any,u:string,o:any)=>outgoing.push({p,u,o}),
   on:(event:string,h:Function)=>{listeners.set(event,h);return()=>{}},
   registerInterceptor:(h:any)=>{interceptor=h},log:{info:()=>{}},
-  permissions:{has:()=>true,getGranted:async()=>['cors_proxy','characters','chats','chat_mutation','generation','regex_scripts','interceptor']},
+  permissions:{has:(permission:string)=>granted.has(permission),getGranted:async()=>[...granted]},
   userStorage:{exists:async(path:string,u:string)=>files.has(u+path),read:async(path:string,u:string)=>files.get(u+path),write:async(path:string,value:string,u:string)=>{files.set(u+path,value)}},
   enclave:{has:async(k:string,u:string)=>keys.has(u+k),put:async(k:string,v:string,u:string)=>keys.set(u+k,v),get:async(k:string,u:string)=>keys.get(u+k),delete:async(k:string,u:string)=>keys.delete(u+k)},
   regex_scripts:{list:async()=>({data:rules,total:rules.length}),create:async(r:any)=>{const s={...r,id:'rule',can_mutate:true};rules.push(s);return s},update:async()=>{}},
@@ -39,6 +41,13 @@ async function call(type:string,data:any={},user='one',session='tab1'){
   return outgoing.find(r=>r.p.requestId===requestId);
 }
 describe('backend provider and session integration',()=>{
+  test('widget permission is declared and init reports actual grants after revocation',async()=>{
+    expect(manifest.permissions).toContain('ui_panels');
+    expect((await call('init')).p.data.permissions).toContain('ui_panels');
+    granted.delete('ui_panels');
+    try{expect((await call('init')).p.data.permissions).not.toContain('ui_panels')}
+    finally{granted.add('ui_panels')}
+  });
   test('character listing projects only IDs, names and native voice references',async()=>{
     expect((await call('characters')).p.data.characters).toEqual([{id:'mara',name:'Mara',ttsVoice:{connectionId:'saved',voice:'Puck'}}]);
   });

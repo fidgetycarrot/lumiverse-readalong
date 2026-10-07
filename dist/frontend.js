@@ -837,6 +837,8 @@ function setup(ctx) {
   let readingAbort = null, clockTimer = null;
   let browserQueueActive = false, browserResume = null;
   let widget = null;
+  let widgetError = "";
+  const widgetPermissionHint = "Enable the UI panels permission (ui_panels) in Readalong’s extension settings to use the floating player. You can play and pause here in the meantime.";
   let currentSegments = [], position = 0, markedPosition = -1;
   let playbackSettler = null;
   const pending = new Map;
@@ -978,15 +980,35 @@ function setup(ctx) {
       notice("Stopped.");
   }
   function showWidget() {
-    if (!widget && typeof ctx.ui.createFloatWidget === "function") {
-      const width = Math.min(320, Math.max(240, window.innerWidth - 24));
-      widget = ctx.ui.createFloatWidget({ width, height: 146, initialPosition: { x: Math.max(12, window.innerWidth - width - 24), y: Math.max(12, window.innerHeight - 220) }, snapToEdge: true, tooltip: "Readalong · drag to move" });
-      widget.root.classList.add("ra-mini");
-      widget.root.dataset.raUi = "true";
-      widget.root.setAttribute("aria-label", "Readalong floating player");
+    if (!permissions.includes("ui_panels"))
+      return;
+    try {
+      if (!widget && typeof ctx.ui.createFloatWidget === "function") {
+        const width = Math.min(320, Math.max(240, window.innerWidth - 24));
+        widget = ctx.ui.createFloatWidget({ width, height: 146, initialPosition: { x: Math.max(12, window.innerWidth - width - 24), y: Math.max(12, window.innerHeight - 220) }, snapToEdge: true, tooltip: "Readalong · drag to move" });
+        widget.root.classList.add("ra-mini");
+        widget.root.dataset.raUi = "true";
+        widget.root.setAttribute("aria-label", "Readalong floating player");
+      }
+      widget?.setVisible(true);
+      renderWidget();
+      widgetError = "";
+    } catch (error) {
+      try {
+        widget?.destroy();
+      } catch {}
+      widget = null;
+      widgetError = error instanceof Error && /PERMISSION_DENIED.*ui_panels/.test(error.message) ? widgetPermissionHint : "The floating player is unavailable. You can play and pause here in the Readalong drawer.";
     }
-    widget?.setVisible(true);
-    renderWidget();
+  }
+  async function openWidget() {
+    try {
+      permissions = await ctx.permissions.getGranted();
+    } catch {}
+    if (disposed)
+      return;
+    showWidget();
+    renderPlayer();
   }
   function renderWidget() {
     if (!widget || disposed)
@@ -1409,10 +1431,12 @@ function setup(ctx) {
       row.append(read, button("Refresh messages", () => safe(refreshMessages)));
     }
     if (typeof ctx.ui.createFloatWidget === "function")
-      row.append(button("Floating player", showWidget));
+      row.append(button("Floating player", () => safe(openWidget)));
     if (currentMessage)
       row.append(button("Return to passage", () => marker.follow()));
     player.append(row);
+    if (ready && typeof ctx.ui.createFloatWidget === "function" && (widgetError || !permissions.includes("ui_panels")))
+      player.append(el("p", widgetError || widgetPermissionHint, "ra-muted"));
     if (phase === "idle" && messages.length)
       player.append(field("Assistant message", select([...messages].reverse().map((m) => ({ value: m.id, label: `${m.name || "Assistant"} · ${plainText(stripCues(m.content)).slice(0, 70)}` })), selectedId, (v) => {
         selectedId = v;
@@ -1743,8 +1767,8 @@ function setup(ctx) {
   }));
   const action = ctx.ui.registerInputBarAction({ id: "readalong", label: "Readalong", subtitle: "Listen and find your place" });
   cleanups.push(action.onClick(() => {
-    showWidget();
     tab.activate();
+    safe(openWidget);
   }));
   function installEditor() {
     if (editorTab || !permissions.includes("characters"))

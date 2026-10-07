@@ -1,5 +1,5 @@
 {
-  "version": "0.1.3",
+  "version": "0.1.4",
   "name": "Readalong",
   "identifier": "readalong",
   "author": "fidgetycarrot",
@@ -13,7 +13,8 @@
     "chats",
     "characters",
     "regex_scripts",
-    "cors_proxy"
+    "cors_proxy",
+    "ui_panels"
   ],
   "entry_backend": "dist/backend.js",
   "entry_frontend": "dist/frontend.js",
