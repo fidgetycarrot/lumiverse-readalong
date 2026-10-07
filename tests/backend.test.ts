@@ -5,6 +5,8 @@ const outgoing:any[]=[],requests:any[]=[];
 let handler:(p:any,user:string,session?:string)=>Promise<void>, interceptor:(messages:any[],ctx:any)=>Promise<any[]>;
 const listeners=new Map<string,Function>();
 let failure=false;
+let hiddenJson=false, diagnosticStatus=402;
+let keyStatus=200, keyRemaining:number|null=null;
 let messageReads=0;
 (globalThis as any).spindle={
   onFrontendMessage:(h:any)=>{handler=h},sendToFrontend:(p:any,u:string,o:any)=>outgoing.push({p,u,o}),
@@ -20,6 +22,11 @@ let messageReads=0;
   cors:async(url:string,options:any)=>{
     requests.push({url,options});
     if(failure)throw new Error('Bearer sk-or-v1-secret failed');
+    if(url.endsWith('/key'))return{status:keyStatus,body:JSON.stringify(keyStatus===200?{data:{limit:keyRemaining===null?null:10,limit_remaining:keyRemaining}}:{error:{message:'Invalid key sk-or-v1-secret'}})};
+    if(url.endsWith('/audio/speech') && hiddenJson) {
+      if(options?.responseType==='arraybuffer')throw new Error('CORS proxy transparent proxy only serves audio data (received Content-Type: application/json)');
+      return{status:diagnosticStatus,headers:{'content-type':'application/json'},body:JSON.stringify({error:{message:'Insufficient credits sk-or-v1-secret',metadata:{raw:'must not escape'}}})};
+    }
     if(url.includes('models'))return{status:200,body:JSON.stringify({data:[{id:DEFAULTS.model,name:'Gemini',architecture:{output_modalities:['speech']},supported_voices:['Kore','Puck']},{id:'text-only',architecture:{output_modalities:['text']}}]})};
     return{status:200,headers:{'content-type':'audio/mpeg'},encoding:'base64',body:'SUQzBAAAAA=='};
   },
@@ -77,5 +84,47 @@ describe('backend provider and session integration',()=>{
   test('failed request errors redact secrets',async()=>{
     failure=true;const r=await call('speech',{segment:{text:'Hi.'}});failure=false;
     expect(r.p.error).not.toContain('sk-or-v1-secret');expect(r.p.error).toContain('[redacted]');
+  });
+  test('a rejected JSON reply is explained without an automatic speech retry',async()=>{
+    hiddenJson=true;
+    const before=requests.length;const r=await call('speech',{segment:{text:'Hi.'}});
+    expect(requests.length).toBe(before+1);expect(r.p.error).toContain('JSON error instead of audio');
+    expect(r.p.error).not.toContain('transparent proxy');expect(r.p.canDiagnoseSpeech).toBe(true);
+  });
+  test('a connection check makes only a key lookup and no speech request',async()=>{
+    const before=requests.length;const r=await call('check_connection');
+    expect(requests.length).toBe(before+1);expect(requests.at(-1).url).toBe('https://openrouter.ai/api/v1/key');
+    expect(requests.at(-1).options.body).toBeUndefined();expect(r.p.data.message).toContain('accepts your saved key');
+    expect(JSON.stringify(r)).not.toContain('sk-or-v1-secret');
+  });
+  test('key checks expose authentication errors and spending-limit exhaustion',async()=>{
+    keyStatus=401;const bad=await call('check_connection');keyStatus=200;
+    expect(bad.p.error).toContain('HTTP 401');expect(bad.p.error).not.toContain('sk-or-v1-secret');
+    keyRemaining=0;const empty=await call('check_connection');keyRemaining=null;
+    expect(empty.p.error).toContain('spending limit');
+  });
+  test('a failed voice diagnostic cannot be triggered by another user or tab',async()=>{
+    const before=requests.length;
+    expect((await call('diagnose_speech',{},'one','tab2')).p.error).toContain('No recent');
+    expect((await call('diagnose_speech',{},'two','tab1')).p.error).toContain('No recent');
+    expect(requests.length).toBe(before);
+  });
+  test('an explicit diagnostic reveals the provider error once and redacts its key',async()=>{
+    const before=requests.length;const r=await call('diagnose_speech');
+    expect(requests.length).toBe(before+1);expect(requests.at(-1).options.responseType).toBe('text');
+    expect(r.p.error).toContain('HTTP 402');expect(r.p.error).toContain('Insufficient credits');
+    expect(r.p.error).not.toContain('sk-or-v1-secret');expect(r.p.error).not.toContain('must not escape');
+    expect(r.p.canDiagnoseSpeech).toBe(false);
+    await call('diagnose_speech');expect(requests.length).toBe(before+1);
+  });
+  test('stale failures cannot be retried by the diagnostic',async()=>{
+    await call('speech',{segment:{text:'Hi.'}});const before=requests.length;
+    const original=Date.now;Date.now=()=>original()+11*60*1000;
+    try {expect((await call('diagnose_speech')).p.error).toContain('No recent')}finally{Date.now=original}
+    expect(requests.length).toBe(before);
+  });
+  test('successful speech clears the diagnostic for an earlier failed request',async()=>{
+    await call('speech',{segment:{text:'Hi.'}});hiddenJson=false;
+    const r=await call('speech',{segment:{text:'Hi.'}});expect(r.p.canDiagnoseSpeech).toBe(false);
   });
 });

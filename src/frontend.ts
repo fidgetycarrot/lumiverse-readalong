@@ -30,6 +30,8 @@ function toggle(label: string, value: boolean, change: (v: boolean) => void) { c
 
 export function setup(ctx: SpindleFrontendContext) {
   let settings = normalizeSettings(DEFAULTS), hasKey = false, ready = false, disposed = false;
+  let canDiagnoseSpeech = false, diagnosing = false, diagnoseButton: HTMLButtonElement | null = null;
+  let diagnoseHint: HTMLElement | null = null;
   let models: SpeechModel[] = [{ id:DEFAULTS.model, name:'Google: Gemini 3.8 Flash TTS', voices:GEMINI_VOICES }];
   let characters: {id:string;name:string}[] = [], permissions: string[] = [];
   let messages: MessageInfo[] = [], selectedId = '';
@@ -49,6 +51,11 @@ export function setup(ctx: SpindleFrontendContext) {
   root.append(heading,intro,status,player,config,voicesCard,assignmentsCard);
   function notice(text: string, error = false) { if (!disposed) { status.textContent = text; status.classList.toggle('ra-error',error) } }
   async function safe(work:()=>Promise<void>) { try { await work() } catch(e) { notice(e instanceof Error ? e.message : 'Readalong failed.',true) } }
+  function showDiagnostics(available:boolean) {
+    canDiagnoseSpeech = available;
+    if (diagnoseButton) diagnoseButton.hidden = !available || diagnosing;
+    if (diagnoseHint) diagnoseHint.hidden = !available || diagnosing;
+  }
   function rpc(type: string, payload: Record<string,unknown> = {}): Promise<any> {
     if (disposed) return Promise.reject(new Error('Readalong was closed.'));
     const requestId = crypto.randomUUID();
@@ -60,6 +67,7 @@ export function setup(ctx: SpindleFrontendContext) {
   cleanups.push(ctx.onBackendMessage((payload: any) => {
     if (payload?.type === 'reply') {
       const p = pending.get(payload.requestId); if (!p) return; clearTimeout(p.timer); pending.delete(payload.requestId);
+      if (typeof payload.canDiagnoseSpeech === 'boolean') showDiagnostics(payload.canDiagnoseSpeech);
       if (payload.error) p.reject(new Error(payload.error)); else p.resolve(payload.data);
     } else if (payload?.type === 'new_message' && ready && settings.autoPlay && payload.chatId === ctx.getActiveChat().chatId && !playing) {
       void safe(async () => { await startMessage(payload.message) });
@@ -224,6 +232,17 @@ export function setup(ctx: SpindleFrontendContext) {
       const key=textInput('',()=>{},'password');key.autocomplete='off';key.placeholder=settings.provider==='openrouter' && hasKey?'Key saved · leave blank to keep it':'Paste your API key';
       config.append(field('API key',key),button('Save key',()=>safe(async()=>{if(!key.value.trim())throw new Error('Paste a key first.');const r=await rpc('save_key',{key:key.value,provider:settings.provider});hasKey=r.hasKey;key.value='';key.placeholder='Key saved';notice('API key saved securely.');})),button('Remove saved key',()=>safe(async()=>{await rpc('save_key',{key:'',provider:settings.provider});hasKey=false;key.placeholder='Paste your API key';notice('Saved key removed.');})));
       config.append(el('p','Your key stays in encrypted extension storage. Each preview or reading makes a speech request to this connection.','ra-muted'));
+      config.append(button('Check connection',()=>safe(async()=>{
+        notice('Checking connection…');const r=await rpc('check_connection',{settings});notice(r.message);
+      })));
+      diagnoseButton=button('Show provider error',()=>safe(async()=>{
+        if(diagnosing)return;diagnosing=true;stop(false);showDiagnostics(false);notice('Reading the provider response…');
+        try {const r=await rpc('diagnose_speech');notice(r.message)}finally{diagnosing=false;showDiagnostics(canDiagnoseSpeech)}
+      }));
+      diagnoseHint=el('p','Show provider error repeats the last failed speech request once to read its status and message. If that request succeeds, the provider may charge for speech.','ra-muted');
+      config.append(diagnoseButton,diagnoseHint);showDiagnostics(canDiagnoseSpeech);
+    } else {
+      diagnoseButton=null;diagnoseHint=null;
     }
     config.append(toggle('Automatically read new replies after they finish',settings.autoPlay,v=>settings.autoPlay=v),toggle('Ask the existing chat model for occasional emotion and speaker cues',settings.promptEmotions,v=>settings.promptEmotions=v),toggle('Use emotion cues when the speech model supports them',settings.useEmotions,v=>settings.useEmotions=v),button('Save settings',()=>safe(saveSettings),true));
     config.append(el('p','Emotion cues add a few tokens to normal chat replies. No second LLM is called. Hidden tags remain in the original message.','ra-muted'));

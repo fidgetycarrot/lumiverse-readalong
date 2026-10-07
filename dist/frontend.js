@@ -313,6 +313,8 @@ function toggle(label, value, change) {
 }
 function setup(ctx) {
   let settings = normalizeSettings(DEFAULTS), hasKey = false, ready = false, disposed = false;
+  let canDiagnoseSpeech = false, diagnosing = false, diagnoseButton = null;
+  let diagnoseHint = null;
   let models = [{ id: DEFAULTS.model, name: "Google: Gemini 3.8 Flash TTS", voices: GEMINI_VOICES }];
   let characters = [], permissions = [];
   let messages = [], selectedId = "";
@@ -348,6 +350,13 @@ function setup(ctx) {
       notice(e instanceof Error ? e.message : "Readalong failed.", true);
     }
   }
+  function showDiagnostics(available) {
+    canDiagnoseSpeech = available;
+    if (diagnoseButton)
+      diagnoseButton.hidden = !available || diagnosing;
+    if (diagnoseHint)
+      diagnoseHint.hidden = !available || diagnosing;
+  }
   function rpc(type, payload = {}) {
     if (disposed)
       return Promise.reject(new Error("Readalong was closed."));
@@ -368,6 +377,8 @@ function setup(ctx) {
         return;
       clearTimeout(p.timer);
       pending.delete(payload.requestId);
+      if (typeof payload.canDiagnoseSpeech === "boolean")
+        showDiagnostics(payload.canDiagnoseSpeech);
       if (payload.error)
         p.reject(new Error(payload.error));
       else
@@ -748,6 +759,32 @@ function setup(ctx) {
         notice("Saved key removed.");
       })));
       config.append(el("p", "Your key stays in encrypted extension storage. Each preview or reading makes a speech request to this connection.", "ra-muted"));
+      config.append(button("Check connection", () => safe(async () => {
+        notice("Checking connection…");
+        const r = await rpc("check_connection", { settings });
+        notice(r.message);
+      })));
+      diagnoseButton = button("Show provider error", () => safe(async () => {
+        if (diagnosing)
+          return;
+        diagnosing = true;
+        stop(false);
+        showDiagnostics(false);
+        notice("Reading the provider response…");
+        try {
+          const r = await rpc("diagnose_speech");
+          notice(r.message);
+        } finally {
+          diagnosing = false;
+          showDiagnostics(canDiagnoseSpeech);
+        }
+      }));
+      diagnoseHint = el("p", "Show provider error repeats the last failed speech request once to read its status and message. If that request succeeds, the provider may charge for speech.", "ra-muted");
+      config.append(diagnoseButton, diagnoseHint);
+      showDiagnostics(canDiagnoseSpeech);
+    } else {
+      diagnoseButton = null;
+      diagnoseHint = null;
     }
     config.append(toggle("Automatically read new replies after they finish", settings.autoPlay, (v) => settings.autoPlay = v), toggle("Ask the existing chat model for occasional emotion and speaker cues", settings.promptEmotions, (v) => settings.promptEmotions = v), toggle("Use emotion cues when the speech model supports them", settings.useEmotions, (v) => settings.useEmotions = v), button("Save settings", () => safe(saveSettings), true));
     config.append(el("p", "Emotion cues add a few tokens to normal chat replies. No second LLM is called. Hidden tags remain in the original message.", "ra-muted"));

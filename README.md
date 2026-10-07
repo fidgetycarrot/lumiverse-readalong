@@ -34,6 +34,14 @@ For a free first test, select Browser voices. Browser voice availability depends
 
 Turn off Lumiverse's built-in TTS autoplay if using Readalong's autoplay, so the two players do not speak at once. This extension's autoplay is off initially.
 
+## Troubleshooting voice previews
+
+Version 0.1.1 adds **Check connection** beside the saved API key. For OpenRouter, it checks the key and its spending limit without generating or charging for speech. A successful key check does not guarantee available account credit or access to a particular speech provider.
+
+If you see “CORS proxy transparent proxy only serves audio data (received Content-Type: application/json)” on version 0.1.0, update Readalong. This means the speech service returned JSON rather than audio; Spindle's binary proxy discards the response status and body before Readalong can read them. It does not identify which part of the request failed.
+
+After a new failed preview, click **Show provider error** to reveal the upstream HTTP status and error message. This explicitly repeats the last failed speech request once, using Spindle's text response mode. The error is shown without exposing your key or dumping the response body. If the repeated request succeeds, that speech can be billed; the diagnostic discards its audio and asks you to try Listen again. There are no automatic speech retries. Diagnostics expire after ten minutes and are available only to the user and browser tab that made the failed request.
+
 ## Character voices
 
 Choose a character in the Readalong panel, select a voice, preview it, and Save voice. The character editor also gets a **Voice** tab with the same controls. Assignments are tied to the character ID and survive chat changes. You can separately choose a narrator voice.
@@ -96,7 +104,7 @@ npm run build
 
 Requires Bun for builds/tests. Types are pinned to `lumiverse-spindle-types@0.6.39`. Runtime bundles have no third-party runtime dependencies.
 
-Verified against the current Lumiverse source and Spindle types. All 23 parser/provider/session tests pass. Browser UI checks used a mock speech connection and covered voice search, model-specific lists, previews, actual audio-element playback, sentence markers, pause/resume, stop, chat changes, and unloading. The backend bundle also passed Lumiverse's current static extension scanner. Live OpenRouter synthesis still needs testing in your Lumiverse instance with your key; the development checks did not make paid speech requests.
+Verified against the current Lumiverse source and Spindle types. All 33 parser/provider/session tests pass, including masked JSON failures, connection checks, credential redaction, and diagnostic isolation. Browser UI checks used a mock speech connection and covered voice search, model-specific lists, previews, actual audio-element playback, sentence markers, pause/resume, stop, chat changes, and unloading. The backend bundle also passed Lumiverse's current static extension scanner. Live OpenRouter synthesis still needs testing in your Lumiverse instance with your key; the development checks did not make paid speech requests.
 
 OpenRouter requests use its documented OpenAI-compatible `/api/v1/audio/speech` endpoint with `response_format: "mp3"`. If a selected provider ignores that format and returns raw PCM, Spindle's transparent media proxy may reject it; use a provider that honors MP3 output. No direct-network bypass is used.
 
