@@ -63,6 +63,8 @@ describe('voice selection and settings',()=>{
     const segment={text:'Hi.',speaker:'Mara',emotion:'worried',delivery:'whispers'};
     const current=speechRequest(DEFAULTS,segment);expect(current.input).toBe('Hi.');expect(current).toHaveProperty('provider');
     const legacy=speechRequest({...DEFAULTS,model:'google/gemini-3.1-flash-tts-preview'},segment);expect(legacy.input).toBe('[worried] [whispers] Hi.');expect(legacy).not.toHaveProperty('provider');
+    expect(current.response_format).toBe('pcm');expect(legacy.response_format).toBe('pcm');
+    expect(speechRequest({...DEFAULTS,model:'openai/gpt-4o-mini-tts'},segment).response_format).toBe('mp3');
   });
   test('bad numeric settings and object keys are rejected',()=>{
     const s=normalizeSettings(JSON.parse('{"speed":999,"volume":-1,"provider":"bad","assignments":{"__proto__":{"voice":"x"}}}'));

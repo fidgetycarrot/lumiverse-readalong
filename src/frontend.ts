@@ -1,6 +1,7 @@
 import type { SpindleFrontendContext, SpindleCharacterEditorTabHandle } from 'lumiverse-spindle-types';
-import { DEFAULTS, GEMINI_VOICES, EMOTIONS, DELIVERIES, normalizeSettings, parseSegments, selectVoice, speakerCharacterId, plainText, stripCues, type Settings, type SpeechSegment, type SpeechModel, type MessageInfo, type VoiceAssignment } from './shared';
+import { DEFAULTS, GEMINI_VOICES, EMOTIONS, DELIVERIES, needsPcm, normalizeSettings, parseSegments, selectVoice, speakerCharacterId, plainText, stripCues, type Settings, type SpeechSegment, type SpeechModel, type MessageInfo, type VoiceAssignment } from './shared';
 import { PassageMarker } from './highlight';
+import { createNativeTtsClient, type NativeConnection } from './native-tts';
 
 const STYLE = `
 ::highlight(lumiverse-readalong){background:rgba(245,190,80,.30);color:inherit;text-decoration:underline;text-decoration-color:#e7b24c;text-decoration-thickness:2px;}
@@ -33,6 +34,8 @@ export function setup(ctx: SpindleFrontendContext) {
   let canDiagnoseSpeech = false, diagnosing = false, diagnoseButton: HTMLButtonElement | null = null;
   let diagnoseHint: HTMLElement | null = null;
   let models: SpeechModel[] = [{ id:DEFAULTS.model, name:'Google: Gemini 3.8 Flash TTS', voices:GEMINI_VOICES }];
+  const nativeTts=createNativeTtsClient(), nativeRequests=new Set<AbortController>();
+  let nativeConnections:NativeConnection[]=[], catalogEpoch=0;
   let characters: {id:string;name:string}[] = [], permissions: string[] = [];
   let messages: MessageInfo[] = [], selectedId = '';
   let playbackId = 0, playing = false, paused = false, currentMessage: MessageInfo | null = null;
@@ -80,7 +83,7 @@ export function setup(ctx: SpindleFrontendContext) {
     return models.find(m => m.id === settings.model)?.voices ?? [];
   }
   function voiceSelect(value: string, change: (value: string)=>void, inherited = false) {
-    const names = voiceNames(); if (value && !names.includes(value)) names.unshift(value);
+    const names = [...voiceNames()]; if (value && !names.includes(value)) names.unshift(value);
     return select([...(inherited ? [{value:'',label:'Use default voice'}] : []), ...names.map(name=>({value:name,label:name}))],value,change);
   }
   function contentRoot(messageId: string) {
@@ -90,6 +93,7 @@ export function setup(ctx: SpindleFrontendContext) {
   }
   function stop(showStatus = true) {
     playbackId++; playing = false; paused = false;
+    for(const controller of nativeRequests)controller.abort();nativeRequests.clear();
     if (audio) { audio.pause(); audio.removeAttribute('src'); audio.load(); audio = null }
     if (utterance) { speechSynthesis.cancel(); utterance = null }
     playbackSettler?.(); playbackSettler = null;
@@ -118,9 +122,9 @@ export function setup(ctx: SpindleFrontendContext) {
       speechSynthesis.speak(u);
     });
   }
-  function audioSpeech(data: {audio:string;mime:string}, token: number) {
+  function audioSpeech(data: {audio?:string;bytes?:Uint8Array;mime:string}, token: number) {
     if (token !== playbackId) return Promise.resolve();
-    const bytes = Uint8Array.from(atob(data.audio), c=>c.charCodeAt(0));
+    const bytes = data.bytes ?? Uint8Array.from(atob(data.audio!), c=>c.charCodeAt(0));
     audioUrl = URL.createObjectURL(new Blob([bytes],{ type:data.mime }));
     audio = new Audio(audioUrl); audio.playbackRate = settings.speed; audio.volume = settings.volume;
     const a = audio;
@@ -132,6 +136,15 @@ export function setup(ctx: SpindleFrontendContext) {
       if (!paused) void a.play().catch(() => { finish(); reject(new Error('Audio was blocked. Press Read again to allow playback.')) });
     });
   }
+  function activeNative(id=settings.connectionId) { return nativeConnections.find(c=>c.id===id) }
+  async function prepareSpeech(segment:SpeechSegment, snapshot:Settings, characterId?:string) {
+    if(snapshot.provider!=='lumiverse')return rpc('speech',{segment,characterId,previewSettings:snapshot});
+    const connection=activeNative(snapshot.connectionId);
+    if(!connection)throw new Error('Choose a saved Lumiverse TTS connection first. Add one in Lumiverse’s voice settings if the list is empty.');
+    const controller=new AbortController();nativeRequests.add(controller);
+    try{return await nativeTts.speech(connection,snapshot,segment,characterId,AbortSignal.any([controller.signal,AbortSignal.timeout(70000)]))}
+    finally{nativeRequests.delete(controller)}
+  }
   async function startMessage(message: MessageInfo) {
     stop(false);
     currentMessage = { ...message, characterId:message.characterId ?? speakerCharacterId(message.name,characters,ctx.getActiveChat().characterId ?? undefined) };
@@ -142,7 +155,7 @@ export function setup(ctx: SpindleFrontendContext) {
     try {
       const settingsSnapshot = normalizeSettings(settings);
       // Capture this reading's settings so a voice preview or form change cannot alter an in-flight request.
-      const prepare = (i: number) => rpc('speech',{ segment:currentSegments[i], characterId:speakerCharacterId(currentSegments[i].speaker,characters,currentMessage?.characterId), previewSettings:settingsSnapshot });
+      const prepare = (i: number) => prepareSpeech(currentSegments[i],settingsSnapshot,speakerCharacterId(currentSegments[i].speaker,characters,currentMessage?.characterId));
       let prepared = settings.provider !== 'browser' ? prepare(0) : null;
       for (let i = 0; i < currentSegments.length && token === playbackId; i++) {
         position = i;
@@ -170,7 +183,7 @@ export function setup(ctx: SpindleFrontendContext) {
       if (settings.provider === 'browser') await browserSpeech(segment,undefined,voice);
       else {
         const previewSettings = { ...settings, voice, assignments:{} };
-        const data = await rpc('speech',{segment,previewSettings});
+        const data = await prepareSpeech(segment,normalizeSettings(previewSettings));
         if (token !== playbackId) return;
         notice(`Listening to ${voice}…`); await audioSpeech(data,token);
       }
@@ -179,6 +192,34 @@ export function setup(ctx: SpindleFrontendContext) {
   }
   async function saveSettings() {
     const r = await rpc('save',{settings}); settings = r.settings; notice('Settings saved.');
+  }
+  function chooseNative(connection:NativeConnection, preserveModel=false) {
+    settings.provider='lumiverse';settings.connectionId=connection.id;
+    if(!preserveModel){settings.model=connection.model || DEFAULTS.model;settings.voice=connection.voice || DEFAULTS.voice}
+  }
+  async function refreshCatalog() {
+    const epoch=++catalogEpoch, provider=settings.provider, connection=activeNative();
+    let next:SpeechModel[];
+    if(provider==='lumiverse') {
+      if(!connection){models=[];renderConfig();renderVoices();renderAssignments();return}
+      if(connection.provider==='openrouter_tts') {
+        try{next=(await rpc('models')).models}
+        catch{next=[{id:settings.model,name:settings.model,voices:/gemini-.*tts/i.test(settings.model)?GEMINI_VOICES:await nativeTts.voices(connection.id)}]}
+      } else {
+        const results=await Promise.all([nativeTts.models(connection.id),nativeTts.voices(connection.id)]);
+        next=results[0].map(m=>({...m,voices:results[1]}));
+        if(!next.length)next=[{id:connection.model,name:connection.model,voices:results[1]}];
+      }
+    } else if(provider==='openrouter') next=(await rpc('models')).models;
+    else return;
+    if(disposed || epoch!==catalogEpoch || provider!==settings.provider || provider==='lumiverse' && connection?.id!==settings.connectionId)return;
+    models=next;if(!models.some(m=>m.id===settings.model))models.unshift({id:settings.model,name:settings.model,voices:[]});
+    renderConfig();renderVoices();renderAssignments();
+  }
+  async function refreshNativeConnections() {
+    const next=await nativeTts.connections();if(disposed)return;nativeConnections=next;
+    if(settings.provider==='lumiverse' && !settings.connectionId && next.length)chooseNative(next.find(c=>c.provider==='openrouter_tts')??next[0]);
+    renderConfig();await refreshCatalog();
   }
   async function refreshMessages() {
     const chatId = ctx.getActiveChat().chatId; if (!chatId) { messages = []; renderPlayer(); return }
@@ -218,17 +259,31 @@ export function setup(ctx: SpindleFrontendContext) {
   }
   function renderConfig() {
     config.replaceChildren(el('h3','Speech connection'));
-    config.append(field('Provider',select([{value:'openrouter',label:'OpenRouter'},{value:'browser',label:'Browser voices · free'},{value:'local',label:'Local / OpenAI-compatible'}],settings.provider,v=>{
+    config.append(field('Provider',select([{value:'lumiverse',label:'Lumiverse connection · recommended'},{value:'openrouter',label:'OpenRouter · direct'},{value:'browser',label:'Browser voices · free'},{value:'local',label:'Local / OpenAI-compatible'}],settings.provider,v=>{
       stop(false); settings.provider=v as Settings['provider'];
-      if(v==='browser')settings.voice=voiceNames()[0] ?? '';else if(v==='local'){settings.model='kokoro';settings.voice='af_heart'}else{settings.model=DEFAULTS.model;settings.voice='Kore'};
-      renderConfig();renderVoices();renderAssignments();void safe(saveSettings);
+      if(v==='lumiverse'){const connection=activeNative()??nativeConnections.find(c=>c.provider==='openrouter_tts')??nativeConnections[0];if(connection)chooseNative(connection)}
+      else if(v==='browser')settings.voice=voiceNames()[0] ?? '';else if(v==='local'){settings.model='kokoro';settings.voice='af_heart'}else{settings.model=DEFAULTS.model;settings.voice='Kore'};
+      renderConfig();renderVoices();renderAssignments();void safe(async()=>{await saveSettings();await refreshCatalog()});
     })));
+    if(settings.provider==='lumiverse') {
+      config.append(field('Saved TTS connection',select([{value:'',label:'Choose a connection'},...nativeConnections.map(c=>({value:c.id,label:`${c.name} · ${c.provider.replace(/_tts$/,'')}`}))],settings.connectionId,v=>{
+        stop(false);const connection=nativeConnections.find(c=>c.id===v);if(connection)chooseNative(connection);else settings.connectionId='';
+        renderConfig();renderVoices();renderAssignments();void safe(async()=>{await saveSettings();await refreshCatalog()});
+      })));
+      config.append(button('Refresh connections and voices',()=>safe(refreshNativeConnections)));
+      if(models.length && activeNative())config.append(field('Speech model',select(models.map(m=>({value:m.id,label:m.name})),settings.model,v=>{stop(false);settings.model=v;settings.voice=voiceNames()[0]??'';renderConfig();renderVoices();renderAssignments();void safe(saveSettings)})));
+      config.append(el('p','Uses your saved Lumiverse TTS connection and key. No separate key or helper app is needed. Add or edit connections in Lumiverse’s voice settings.','ra-muted'));
+      config.append(button('Check connection',()=>safe(async()=>{if(!activeNative())throw new Error('Choose a saved TTS connection first.');notice('Checking connection…');notice(await nativeTts.check(settings.connectionId))})));
+      if(/gemini-3\.8.*tts/i.test(settings.model))config.append(el('p','Gemini 3.8 reads clean dialogue through this connection. Lumiverse’s current TTS endpoint does not pass its per-sentence emotion directions.','ra-muted'));
+      diagnoseButton=null;diagnoseHint=null;
+    }
     if(settings.provider==='openrouter') {
-      config.append(field('Speech model',select(models.map(m=>({value:m.id,label:m.name})),settings.model,v=>{stop(false);settings.model=v;settings.voice=voiceNames()[0]??'';renderVoices();renderAssignments();void safe(saveSettings)})));
+      config.append(field('Speech model',select(models.map(m=>({value:m.id,label:m.name})),settings.model,v=>{stop(false);settings.model=v;settings.voice=voiceNames()[0]??'';renderConfig();renderVoices();renderAssignments();void safe(saveSettings)})));
       config.append(button('Refresh models and voices',()=>safe(async()=>{const r=await rpc('models');models=r.models;if(!models.some(m=>m.id===settings.model))models.unshift({id:settings.model,name:settings.model,voices:[]});renderConfig();renderVoices();renderAssignments();notice('Voice lists updated from OpenRouter.')})));
+
     }
     if(settings.provider==='local')config.append(field('API base URL',textInput(settings.localUrl,v=>settings.localUrl=v)),field('Model ID',textInput(settings.model,v=>settings.model=v)));
-    if(settings.provider!=='browser') {
+    if(settings.provider!=='browser' && settings.provider!=='lumiverse') {
       const key=textInput('',()=>{},'password');key.autocomplete='off';key.placeholder=settings.provider==='openrouter' && hasKey?'Key saved · leave blank to keep it':'Paste your API key';
       config.append(field('API key',key),button('Save key',()=>safe(async()=>{if(!key.value.trim())throw new Error('Paste a key first.');const r=await rpc('save_key',{key:key.value,provider:settings.provider});hasKey=r.hasKey;key.value='';key.placeholder='Key saved';notice('API key saved securely.');})),button('Remove saved key',()=>safe(async()=>{await rpc('save_key',{key:'',provider:settings.provider});hasKey=false;key.placeholder='Paste your API key';notice('Saved key removed.');})));
       config.append(el('p','Your key stays in encrypted extension storage. Each preview or reading makes a speech request to this connection.','ra-muted'));
@@ -311,10 +366,16 @@ export function setup(ctx: SpindleFrontendContext) {
   renderPlayer();renderConfig();renderVoices();renderAssignments();ctx.ready();
   void safe(async()=>{
     const r=await rpc('init');if(disposed)return;settings=r.settings;hasKey=r.hasKey;permissions=r.permissions;ready=true;
+    try {
+      nativeConnections=await nativeTts.connections();if(disposed)return;
+      const existing=nativeConnections.find(c=>c.provider==='openrouter_tts' && c.model===settings.model) ?? nativeConnections.find(c=>c.provider==='openrouter_tts');
+      if(needsPcm(settings) && existing){chooseNative(existing,true);await saveSettings()}
+      else if(settings.provider==='lumiverse' && !settings.connectionId && nativeConnections.length){chooseNative(existing??nativeConnections[0]);await saveSettings()}
+    } catch { /* Direct/browser modes remain available if native TTS is absent. */ }
     renderPlayer();renderConfig();renderVoices();renderAssignments();installEditor();
     if(r.cueStatus)notice(r.cueStatus,true);else notice('Ready. Choose a voice and listen to a sample.');
     if(permissions.includes('characters')){try{const r=await rpc('characters');characters=r.characters;renderAssignments()}catch{}}
-    if(permissions.includes('cors_proxy')){try{const r=await rpc('models');models=r.models;if(!models.some(m=>m.id===settings.model))models.unshift({id:settings.model,name:settings.model,voices:[]});renderConfig();renderVoices();renderAssignments()}catch{notice('Using the bundled Gemini voices. Refresh the list when the connection is available.')}}
+    if(settings.provider==='lumiverse' || permissions.includes('cors_proxy')){try{await refreshCatalog()}catch{notice('Could not refresh the voice list. Check the saved connection and try Refresh again.',true)}}
     if(permissions.includes('chat_mutation'))await refreshMessages();
   });
   return()=>{

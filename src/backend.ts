@@ -1,5 +1,5 @@
 import type { SpindleAPI, ChatMessageDTO } from 'lumiverse-spindle-types';
-import { DEFAULTS, CUE_PATTERN, HIDE_RULE_NAME, EMOTION_INSTRUCTION, normalizeSettings, speechRequest, type Settings, type SpeechSegment, type SpeechModel } from './shared';
+import { DEFAULTS, CUE_PATTERN, HIDE_RULE_NAME, EMOTION_INSTRUCTION, needsPcm, normalizeSettings, speechRequest, type Settings, type SpeechSegment, type SpeechModel } from './shared';
 import { isHiddenJsonError, providerError, redactSecrets } from './provider-errors';
 declare const spindle: SpindleAPI;
 const settingsByUser = new Map<string, Settings>();
@@ -68,6 +68,7 @@ function validLocalUrl(input: string) {
   return url.href.replace(/\/$/, '');
 }
 async function speechConnection(settings: Settings, userId: string) {
+  if(settings.provider==='lumiverse' || settings.provider==='browser')throw new Error('This voice connection is played through the Lumiverse frontend.');
   const openrouter = settings.provider === 'openrouter';
   const key = await spindle.enclave.get(openrouter ? 'openrouter_key' : 'local_key', userId);
   if (openrouter && !key) throw new Error('Add your OpenRouter API key in Readalong settings.');
@@ -91,6 +92,7 @@ async function checkConnection(settings: Settings, userId: string) {
   return { message:'The speech server accepted the model-list request. No speech was generated.' };
 }
 async function synthesize(segment: SpeechSegment, settings: Settings, userId: string, characterId?: string) {
+  if (needsPcm(settings)) throw new Error('For Gemini voices, select Lumiverse connection in Readalong and choose your saved OpenRouter TTS connection. No speech request was sent.');
   const {base,headers,key,label} = await speechConnection(settings,userId);
   const result = await spindle.cors(`${base}/audio/speech`, {
     method: 'POST', headers,

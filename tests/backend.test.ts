@@ -1,5 +1,6 @@
 import { describe,test,expect } from 'bun:test';
-import { DEFAULTS } from '../src/shared';
+import { DEFAULTS as GEMINI_DEFAULTS } from '../src/shared';
+const DEFAULTS={...GEMINI_DEFAULTS,model:'mistralai/voxtral-mini-tts-2603'};
 const files=new Map<string,string>(),keys=new Map<string,string>(),rules:any[]=[];
 const outgoing:any[]=[],requests:any[]=[];
 let handler:(p:any,user:string,session?:string)=>Promise<void>, interceptor:(messages:any[],ctx:any)=>Promise<any[]>;
@@ -48,6 +49,7 @@ describe('backend provider and session integration',()=>{
     expect((await call('init',{},'two')).p.data.hasKey).toBe(false);
     expect(JSON.stringify(outgoing)).not.toContain('sk-or-v1-secret');
     expect(Array.from(files.values()).join('')).not.toContain('sk-or-v1-secret');
+    await call('save',{settings:DEFAULTS});
   });
   test('models return the complete model-specific voice list',async()=>{
     const r=await call('models');expect(r.p.data.models).toEqual([{id:DEFAULTS.model,name:'Gemini',voices:['Kore','Puck']}]);
@@ -59,11 +61,11 @@ describe('backend provider and session integration',()=>{
     const own=await call('message',{chatId:'one-chat',messageId:'m1'});
     expect(own.p.data.message.content).toBe('Hello.');expect(messageReads).toBe(before+1);
   });
-  test('Gemini 3.8 gets clean dialogue and separate emotion metadata',async()=>{
+  test('direct MP3 speech sends clean dialogue to the originating tab',async()=>{
     const r=await call('speech',{segment:{text:'Are you sure?',speaker:'Mara',emotion:'worried',delivery:'whispers'}});
     expect(r.p.data.mime).toBe('audio/mpeg');
     const req=requests.at(-1);expect(req.url).toBe('https://openrouter.ai/api/v1/audio/speech');
-    expect(JSON.parse(req.options.body)).toMatchObject({model:DEFAULTS.model,voice:'Kore',input:'Are you sure?',response_format:'mp3',provider:{options:{'google-ai-studio':{speech_metadata:{style:'worried, whispering'}}}}});
+    expect(JSON.parse(req.options.body)).toMatchObject({model:DEFAULTS.model,voice:'Kore',input:'Are you sure?',response_format:'mp3'});
     expect(req.options.responseType).toBe('arraybuffer');
     expect(r.o.frontendSessionId).toBe('tab1');
   });
@@ -122,6 +124,10 @@ describe('backend provider and session integration',()=>{
     const original=Date.now;Date.now=()=>original()+11*60*1000;
     try {expect((await call('diagnose_speech')).p.error).toContain('No recent')}finally{Date.now=original}
     expect(requests.length).toBe(before);
+  });
+  test('Gemini cannot make an invalid paid MP3 request through the proxy',async()=>{
+    const before=requests.length;const r=await call('speech',{segment:{text:'Hi.'},previewSettings:GEMINI_DEFAULTS});
+    expect(r.p.error).toContain('Lumiverse connection');expect(requests.length).toBe(before);
   });
   test('successful speech clears the diagnostic for an earlier failed request',async()=>{
     await call('speech',{segment:{text:'Hi.'}});hiddenJson=false;

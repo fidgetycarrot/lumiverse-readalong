@@ -2,7 +2,7 @@
 
 Listen to assistant passages and find your place at a glance. Readalong highlights the sentence currently playing, lets you browse and preview speech voices, and saves character voice assignments. Optional emotion and speaker cues come from your existing chat model: **there is no second LLM call**.
 
-Default connection: **OpenRouter → `google/gemini-3.8-flash-tts` → Kore**. Readalong fetches OpenRouter's speech model catalog and the full voice list reported for each model. Gemini's 30 studio voices are bundled as a fallback. Voice previews use one short sample. Your OpenRouter key is saved in Lumiverse's encrypted, per-user extension enclave and is never included in settings files or sent back to the frontend.
+Recommended connection: **your saved Lumiverse OpenRouter TTS connection → `google/gemini-3.8-flash-tts` → Kore**. Readalong 0.1.2 reuses Lumiverse’s native TTS endpoint and saved provider key. When upgrading an existing Gemini setup, it automatically selects a matching saved OpenRouter TTS connection if one is available. Readalong fetches OpenRouter's speech model catalog and the full voice list reported for each model. Gemini's 30 studio voices are bundled as a fallback. Voice previews use one short sample. Native connection keys remain entirely in Lumiverse’s server-side encrypted storage. Direct-mode keys use the encrypted, per-user extension enclave. No provider key is returned to the frontend.
 
 ## Install
 
@@ -25,22 +25,27 @@ A GitHub source is needed for automatic remote updates. Source and prebuilt bund
 ## First reading
 
 1. Open the Readalong drawer tab, or use the Readalong input-bar action.
-2. Leave the provider on OpenRouter, paste your OpenRouter API key, and choose Save key.
+2. Select **Lumiverse connection** and choose the saved OpenRouter TTS connection that already works in Lumiverse. Its existing key is reused. If the list is empty, add a TTS connection in Lumiverse’s voice settings, then click **Refresh connections and voices**.
 3. Pick a speech model. Select a default voice and click **Listen** to preview it. Search filters the complete voice list for the chosen model.
 4. Open a chat. Click **Read aloud** on a message, or choose an assistant message in the Readalong player and click **Read message**.
 5. Pause keeps the current sentence highlighted. Resume continues the same clip. Stop clears the marker. Return to passage scrolls a mounted passage into view; optional Follow does this at sentence changes.
+
+Gemini speech is requested as PCM and wrapped in a WAV container for playback, using the same approach as Lumiverse’s Google speech provider. No helper app or Lumiverse patch is needed. **Check connection** tests the saved connection without generating speech; **Listen** makes one speech request. Native provider errors appear immediately, without a second diagnostic speech request. Stop aborts native requests and stops playback, although OpenRouter may still charge for work already started.
 
 For a free first test, select Browser voices. Browser voice availability depends on the device/browser, and emotion directions are not applied in that mode. The local/OpenAI-compatible option requests MP3 from an `/audio/speech` endpoint; common Kokoro voice IDs are shown, with a custom voice field for other servers.
 
 Turn off Lumiverse's built-in TTS autoplay if using Readalong's autoplay, so the two players do not speak at once. This extension's autoplay is off initially.
 
-## Troubleshooting voice previews
+## Troubleshooting
 
-Version 0.1.1 adds **Check connection** beside the saved API key. For OpenRouter, it checks the key and its spending limit without generating or charging for speech. A successful key check does not guarantee available account credit or access to a particular speech provider.
+**Gemini says it only supports PCM, or the transparent proxy rejects the response:** update to **0.1.2**, select **Lumiverse connection**, choose your working saved OpenRouter TTS connection, and click **Listen**. The upgrade selects an existing OpenRouter connection automatically for older Gemini settings where possible.
 
-If you see “CORS proxy transparent proxy only serves audio data (received Content-Type: application/json)” on version 0.1.0, update Readalong. This means the speech service returned JSON rather than audio; Spindle's binary proxy discards the response status and body before Readalong can read them. It does not identify which part of the request failed.
+**No saved connections:** add a TTS connection in Lumiverse’s voice settings, then refresh the Readalong connection list. Readalong never creates, changes, or deletes native connection profiles or keys.
 
-After a new failed preview, click **Show provider error** to reveal the upstream HTTP status and error message. This explicitly repeats the last failed speech request once, using Spindle's text response mode. The error is shown without exposing your key or dumping the response body. If the repeated request succeeds, that speech can be billed; the diagnostic discards its audio and asks you to try Listen again. There are no automatic speech retries. Diagnostics expire after ten minutes and are available only to the user and browser tab that made the failed request.
+**Native speech fails:** its provider status/message appears on the first request. Check connection performs the native provider’s key/connection test, without speech. A successful check does not guarantee credit, model access, or synthesis success.
+
+**Direct MP3 speech returns JSON:** Spindle may hide the original status and error body. Click Check connection, then Show provider error if needed. This explicit diagnostic repeats the last failed speech request once; if that request succeeds, normal speech charges may apply. It never retries automatically. The diagnostic is limited to the originating user/tab and expires after ten minutes.
+
 
 ## Character voices
 
@@ -59,7 +64,7 @@ Readalong can add a compact instruction to the chat generation already being mad
 The lantern trembled in her hand.
 ```
 
-A display-only regex hides these cues from assistant messages. They remain in the original stored text for speech, and normal bracketed prose remains untouched. Emotion and delivery persist until changed; a speaker change resets them. For Gemini 3.8, the extension sends clean dialogue and passes delivery guidance as `provider.options.google-ai-studio.speech_metadata.style`, as documented by OpenRouter. For Gemini 3.1 it translates approved cues to audio tags. Other models get clean dialogue without unsupported control cues. Providers that do not honor the style metadata still receive clean speech text.
+A display-only regex hides these cues from assistant messages. They remain in the original stored text for speech, and normal bracketed prose remains untouched. Emotion and delivery persist until changed; a speaker change resets them. For Gemini 3.8, native playback receives clean dialogue. **Lumiverse’s current native OpenRouter TTS adapter does not forward per-sentence `speech_metadata`**, so Gemini 3.8 emotion/delivery cues currently have no effect through that connection. They remain hidden and saved for future support. Native Gemini 3.1 uses approved inline audio tags; OpenAI mini-TTS models receive separate style instructions where their native adapter supports them. Other models get clean dialogue. Instructions do not guarantee a particular performance.
 
 Supported emotions: neutral, happy, sad, angry, worried, curious, excited, sarcastic, tender, afraid.
 
@@ -72,7 +77,7 @@ The owned regex rule is named **Readalong • Hide voice cues**, under the Reada
 ## What this version does and does not guarantee
 
 - Highlights whole sentences based on actual clip playback. It does **not** estimate individual word timings. OpenRouter's speech endpoint does not document alignment timestamps.
-- Synthesizes one sentence ahead for smoother transitions. Stop prevents further queued playback, but a request already sent to the provider cannot be canceled through Spindle's buffered CORS API and may still be billed.
+- Synthesizes one sentence ahead for smoother transitions. Stop prevents further queued playback, and aborts native synthesis requests. Direct-mode requests already sent through Spindle’s buffered CORS API cannot be canceled. Either provider may still bill for work already started.
 - Reads completed messages. Live token-by-token narration is not enabled in this first version.
 - Leaves the host's message text nodes and stored message content intact. Uses browser CSS Highlights, with an overlay fallback.
 - Re-finds text after message DOM changes. Uses the currently verified Lumiverse message-content anchor; unusual display regex transformations, HTML islands, collapsed/virtualized messages, or complex formatting can prevent an inline match. The player always shows the current spoken sentence as a fallback. It does not automatically open a collapsed message or remount an offscreen virtualized message.
@@ -104,8 +109,8 @@ npm run build
 
 Requires Bun for builds/tests. Types are pinned to `lumiverse-spindle-types@0.6.39`. Runtime bundles have no third-party runtime dependencies.
 
-Verified against the current Lumiverse source and Spindle types. All 33 parser/provider/session tests pass, including masked JSON failures, connection checks, credential redaction, and diagnostic isolation. Browser UI checks used a mock speech connection and covered voice search, model-specific lists, previews, actual audio-element playback, sentence markers, pause/resume, stop, chat changes, and unloading. The backend bundle also passed Lumiverse's current static extension scanner. Live OpenRouter synthesis still needs testing in your Lumiverse instance with your key; the development checks did not make paid speech requests.
+Verified against the current Lumiverse source and Spindle types. All 44 parser/provider/session tests pass, including native connection reuse, PCM/WAV conversion, cancellation, response bounds, provider errors, credential redaction, and diagnostic isolation. Browser UI checks used a mock speech connection and covered voice search, model-specific lists, previews, actual audio-element playback, sentence markers, pause/resume, stop, chat changes, and unloading. The backend bundle also passed Lumiverse's current static extension scanner. Live OpenRouter synthesis still needs testing in your Lumiverse instance with your key; the development checks did not make paid speech requests.
 
-OpenRouter requests use its documented OpenAI-compatible `/api/v1/audio/speech` endpoint with `response_format: "mp3"`. If a selected provider ignores that format and returns raw PCM, Spindle's transparent media proxy may reject it; use a provider that honors MP3 output. No direct-network bypass is used.
+Native mode uses Lumiverse’s session-authenticated `/api/v1/tts-connections` and `/api/v1/tts/synthesize` routes, the same routes as its built-in voice player. Gemini on OpenRouter requests `pcm`; Readalong preserves the 16-bit mono samples and adds a WAV header (24 kHz by default, or the response’s rate parameter). Other native providers retain their configured output format. The public OpenRouter catalog supplies complete model-specific voice lists instead of the host’s shorter curated list. Direct OpenRouter mode remains available for MP3 models; it refuses Gemini speech before sending a paid request and directs you to a saved Lumiverse connection. The host’s CORS media guard remains unchanged.
 
 API references: [Spindle documentation](https://docs.lumiverse.chat/), [OpenRouter speech API](https://openrouter.ai/docs/guides/overview/multimodal/tts), [Gemini 3.8 Flash TTS](https://openrouter.ai/google/gemini-3.8-flash-tts/).

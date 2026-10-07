@@ -5,14 +5,15 @@ export const CUE_PATTERN = String.raw`\[(?:emotion|delivery|speaker):[^\]\r\n]{1
 export const HIDE_RULE_NAME = 'Readalong • Hide voice cues';
 export interface VoiceAssignment { voice: string; emotion: string; delivery: string }
 export interface Settings {
-  provider: 'openrouter' | 'browser' | 'local';
+  provider: 'lumiverse' | 'openrouter' | 'browser' | 'local';
+  connectionId: string;
   model: string; voice: string; narratorVoice: string; localUrl: string;
   autoPlay: boolean; follow: boolean; promptEmotions: boolean; useEmotions: boolean;
   speed: number; volume: number;
   assignments: Record<string, VoiceAssignment>;
 }
 export const DEFAULTS: Settings = {
-  provider: 'openrouter', model: 'google/gemini-3.8-flash-tts', voice: 'Kore', narratorVoice: '',
+  provider: 'openrouter', connectionId:'', model: 'google/gemini-3.8-flash-tts', voice: 'Kore', narratorVoice: '',
   localUrl: 'http://localhost:8880/v1', autoPlay: false, follow: false,
   promptEmotions: true, useEmotions: true, speed: 1, volume: 0.85, assignments: {},
 };
@@ -34,7 +35,8 @@ export function normalizeSettings(raw: unknown): Settings {
     assignments[key.slice(0, 200)] = { voice: str(v.voice, '', 160), emotion: enumValue(v.emotion, EMOTIONS, 'neutral'), delivery: enumValue(v.delivery, DELIVERIES, 'normal') };
   }
   return {
-    provider: ['openrouter','browser','local'].includes(r.provider ?? '') ? r.provider! : DEFAULTS.provider,
+    connectionId: str(r.connectionId,'',160),
+    provider: ['lumiverse','openrouter','browser','local'].includes(r.provider ?? '') ? r.provider! : DEFAULTS.provider,
     model: str(r.model, DEFAULTS.model), voice: str(r.voice, DEFAULTS.voice), narratorVoice: str(r.narratorVoice, ''),
     localUrl: str(r.localUrl, DEFAULTS.localUrl, 500),
     autoPlay: r.autoPlay === true, follow: r.follow === true,
@@ -96,13 +98,16 @@ export function speechInput(segment: SpeechSegment, assignment: VoiceAssignment,
   if (assignment.delivery !== 'normal') cues.push(`[${assignment.delivery}]`);
   return [...cues, segment.text].join(' ');
 }
+export function needsPcm(settings: Settings): boolean {
+  return settings.provider === 'openrouter' && /^google\/gemini-.*tts/i.test(settings.model);
+}
 export function speechRequest(settings: Settings, segment: SpeechSegment, characterId?: string): Record<string,unknown> {
   const assignment = selectVoice(settings,segment,characterId);
   const openrouter = settings.provider === 'openrouter';
   // Gemini 3.8 reads text verbatim; never put performance directions in its input.
   const gemini38 = openrouter && /^google\/gemini-3\.8.*tts/.test(settings.model);
   const legacyTags = openrouter && /^google\/gemini-3\.1.*tts/.test(settings.model);
-  const body: Record<string,unknown> = { model:settings.model, voice:assignment.voice, input:speechInput(segment,assignment,legacyTags), response_format:'mp3' };
+  const body: Record<string,unknown> = { model:settings.model, voice:assignment.voice, input:speechInput(segment,assignment,legacyTags), response_format:needsPcm(settings) ? 'pcm' : 'mp3' };
   if (gemini38) {
     const emotions: Record<string,string> = { happy:'happy and cheerful',sad:'sad',angry:'angry',worried:'worried',curious:'curious',excited:'excited',sarcastic:'sarcastic',tender:'warm and tender',afraid:'afraid' };
     const deliveries: Record<string,string> = { whispers:'whispering',shouts:'shouting',softly:'soft-spoken',slowly:'slow and deliberate',laughs:'with a light laugh',sighs:'with a sigh' };

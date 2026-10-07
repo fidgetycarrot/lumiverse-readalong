@@ -6,6 +6,7 @@ var CUE_PATTERN = String.raw`\[(?:emotion|delivery|speaker):[^\]\r\n]{1,80}\]`;
 var HIDE_RULE_NAME = "Readalong \u2022 Hide voice cues";
 var DEFAULTS = {
   provider: "openrouter",
+  connectionId: "",
   model: "google/gemini-3.8-flash-tts",
   voice: "Kore",
   narratorVoice: "",
@@ -29,7 +30,8 @@ function normalizeSettings(raw) {
       assignments[key.slice(0, 200)] = { voice: str(v.voice, "", 160), emotion: enumValue(v.emotion, EMOTIONS, "neutral"), delivery: enumValue(v.delivery, DELIVERIES, "normal") };
     }
   return {
-    provider: ["openrouter", "browser", "local"].includes(r.provider ?? "") ? r.provider : DEFAULTS.provider,
+    connectionId: str(r.connectionId, "", 160),
+    provider: ["lumiverse", "openrouter", "browser", "local"].includes(r.provider ?? "") ? r.provider : DEFAULTS.provider,
     model: str(r.model, DEFAULTS.model),
     voice: str(r.voice, DEFAULTS.voice),
     narratorVoice: str(r.narratorVoice, ""),
@@ -71,12 +73,15 @@ function speechInput(segment, assignment, supportsTags) {
     cues.push(`[${assignment.delivery}]`);
   return [...cues, segment.text].join(" ");
 }
+function needsPcm(settings) {
+  return settings.provider === "openrouter" && /^google\/gemini-.*tts/i.test(settings.model);
+}
 function speechRequest(settings, segment, characterId) {
   const assignment = selectVoice(settings, segment, characterId);
   const openrouter = settings.provider === "openrouter";
   const gemini38 = openrouter && /^google\/gemini-3\.8.*tts/.test(settings.model);
   const legacyTags = openrouter && /^google\/gemini-3\.1.*tts/.test(settings.model);
-  const body = { model: settings.model, voice: assignment.voice, input: speechInput(segment, assignment, legacyTags), response_format: "mp3" };
+  const body = { model: settings.model, voice: assignment.voice, input: speechInput(segment, assignment, legacyTags), response_format: needsPcm(settings) ? "pcm" : "mp3" };
   if (gemini38) {
     const emotions = { happy: "happy and cheerful", sad: "sad", angry: "angry", worried: "worried", curious: "curious", excited: "excited", sarcastic: "sarcastic", tender: "warm and tender", afraid: "afraid" };
     const deliveries = { whispers: "whispering", shouts: "shouting", softly: "soft-spoken", slowly: "slow and deliberate", laughs: "with a light laugh", sighs: "with a sigh" };
@@ -208,6 +213,8 @@ function validLocalUrl(input) {
   return url.href.replace(/\/$/, "");
 }
 async function speechConnection(settings, userId) {
+  if (settings.provider === "lumiverse" || settings.provider === "browser")
+    throw new Error("This voice connection is played through the Lumiverse frontend.");
   const openrouter = settings.provider === "openrouter";
   const key = await spindle.enclave.get(openrouter ? "openrouter_key" : "local_key", userId);
   if (openrouter && !key)
@@ -238,6 +245,8 @@ async function checkConnection(settings, userId) {
   return { message: "The speech server accepted the model-list request. No speech was generated." };
 }
 async function synthesize(segment, settings, userId, characterId) {
+  if (needsPcm(settings))
+    throw new Error("For Gemini voices, select Lumiverse connection in Readalong and choose your saved OpenRouter TTS connection. No speech request was sent.");
   const { base, headers, key, label } = await speechConnection(settings, userId);
   const result = await spindle.cors(`${base}/audio/speech`, {
     method: "POST",

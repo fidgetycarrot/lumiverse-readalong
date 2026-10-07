@@ -5,6 +5,7 @@ var GEMINI_VOICES = ["Zephyr", "Puck", "Charon", "Kore", "Fenrir", "Leda", "Orus
 var CUE_PATTERN = String.raw`\[(?:emotion|delivery|speaker):[^\]\r\n]{1,80}\]`;
 var DEFAULTS = {
   provider: "openrouter",
+  connectionId: "",
   model: "google/gemini-3.8-flash-tts",
   voice: "Kore",
   narratorVoice: "",
@@ -35,7 +36,8 @@ function normalizeSettings(raw) {
       assignments[key.slice(0, 200)] = { voice: str(v.voice, "", 160), emotion: enumValue(v.emotion, EMOTIONS, "neutral"), delivery: enumValue(v.delivery, DELIVERIES, "normal") };
     }
   return {
-    provider: ["openrouter", "browser", "local"].includes(r.provider ?? "") ? r.provider : DEFAULTS.provider,
+    connectionId: str(r.connectionId, "", 160),
+    provider: ["lumiverse", "openrouter", "browser", "local"].includes(r.provider ?? "") ? r.provider : DEFAULTS.provider,
     model: str(r.model, DEFAULTS.model),
     voice: str(r.voice, DEFAULTS.voice),
     narratorVoice: str(r.narratorVoice, ""),
@@ -100,6 +102,20 @@ function selectVoice(settings, segment, characterId) {
     emotion: settings.useEmotions ? segment.emotion || assigned?.emotion || "neutral" : "neutral",
     delivery: settings.useEmotions ? segment.delivery || assigned?.delivery || "normal" : "normal"
   };
+}
+function speechInput(segment, assignment, supportsTags) {
+  if (!supportsTags)
+    return segment.text;
+  const emotionTag = { happy: "happy", sad: "sad", angry: "angry", worried: "worried", curious: "curious", excited: "excited", sarcastic: "sarcastic", tender: "warmly", afraid: "scared" };
+  const cues = [];
+  if (emotionTag[assignment.emotion])
+    cues.push(`[${emotionTag[assignment.emotion]}]`);
+  if (assignment.delivery !== "normal")
+    cues.push(`[${assignment.delivery}]`);
+  return [...cues, segment.text].join(" ");
+}
+function needsPcm(settings) {
+  return settings.provider === "openrouter" && /^google\/gemini-.*tts/i.test(settings.model);
 }
 
 // src/highlight.ts
@@ -244,6 +260,191 @@ class PassageMarker {
   }
 }
 
+// src/audio.ts
+var MAX_AUDIO_BYTES = 25 * 1024 * 1024;
+function pcmToWav(pcm, contentType = "audio/pcm") {
+  const mime = contentType.split(";")[0].trim().toLowerCase();
+  if (pcm.length >= 44 && new TextDecoder().decode(pcm.subarray(0, 4)) === "RIFF" && new TextDecoder().decode(pcm.subarray(8, 12)) === "WAVE")
+    return pcm;
+  if (!["audio/pcm", "audio/x-pcm"].includes(mime))
+    throw new Error("OpenRouter returned an unsupported audio format. Expected Gemini PCM audio.");
+  const parameter = (name, fallback) => {
+    const match = contentType.match(new RegExp(`(?:^|;)\\s*${name}\\s*=\\s*"?([^;"\\s]+)`, "i"));
+    return match ? Number(match[1]) : fallback;
+  };
+  const rate = parameter("rate", 24000), channels = parameter("channels", 1);
+  if (!Number.isInteger(rate) || rate < 8000 || rate > 96000 || channels !== 1)
+    throw new Error("OpenRouter returned unsupported PCM sample settings.");
+  if (!pcm.length || pcm.length % 2 || pcm.length > MAX_AUDIO_BYTES)
+    throw new Error("OpenRouter returned empty, incomplete, or oversized PCM audio.");
+  const wav = new Uint8Array(pcm.length + 44), view = new DataView(wav.buffer);
+  const text = (offset, value) => {
+    for (let i = 0;i < value.length; i++)
+      wav[offset + i] = value.charCodeAt(i);
+  };
+  text(0, "RIFF");
+  view.setUint32(4, pcm.length + 36, true);
+  text(8, "WAVE");
+  text(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, rate, true);
+  view.setUint32(28, rate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  text(36, "data");
+  view.setUint32(40, pcm.length, true);
+  wav.set(pcm, 44);
+  return wav;
+}
+
+// src/provider-errors.ts
+function redactSecrets(message, secret) {
+  if (secret)
+    message = message.split(secret).join("[redacted]");
+  return message.replace(/Bearer\s+[^\s"']+|sk-or-v1-[^\s"']+/gi, "[redacted]");
+}
+function providerError(label, status, body, secret) {
+  let detail = "";
+  try {
+    const data = JSON.parse(body);
+    const error = data?.error;
+    detail = typeof error === "string" ? error : typeof error?.message === "string" ? error.message : "";
+  } catch {}
+  detail = redactSecrets(detail, secret).replace(/[\u0000-\u001f]/g, " ").slice(0, 600);
+  const hints = {
+    400: "Check the selected model, voice, and output format.",
+    401: "Save a valid API key for this connection.",
+    402: "Check your speech credit and API key spending limit.",
+    403: "Check this key’s access to the selected model and provider.",
+    404: "Check model availability and provider routing in your account.",
+    429: "The provider is rate limited. Wait before trying again."
+  };
+  return `${label} returned HTTP ${status}${detail ? `: ${detail}` : "."}${hints[status] ? ` ${hints[status]}` : ""}`;
+}
+
+// src/native-tts.ts
+var API = "/api/v1";
+async function boundedBytes(response, limit) {
+  if (Number(response.headers.get("content-length")) > limit)
+    throw new Error("Lumiverse returned an oversized speech response.");
+  if (!response.body)
+    return new Uint8Array;
+  const reader = response.body.getReader(), chunks = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done)
+        break;
+      size += value.length;
+      if (size > limit)
+        throw new Error("Lumiverse returned an oversized speech response.");
+      chunks.push(value);
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return bytes;
+}
+function style(emotion, delivery) {
+  const values = { happy: "happy and cheerful", sad: "sad", angry: "angry", worried: "worried", curious: "curious", excited: "excited", sarcastic: "sarcastic", tender: "warm and tender", afraid: "afraid", whispers: "whispering", shouts: "shouting", softly: "soft-spoken", slowly: "slow and deliberate", laughs: "with a light laugh", sighs: "with a sigh" };
+  return [values[emotion], values[delivery]].filter(Boolean).join(", ");
+}
+function nativeSpeechRequest(connection, settings, segment, characterId) {
+  const assignment = selectVoice(settings, segment, characterId), model = settings.model || connection.model;
+  const openrouter = connection.provider === "openrouter_tts";
+  const gemini = /gemini-.*tts/i.test(model);
+  const legacyTags = gemini && /gemini-3\.1/i.test(model);
+  const direction = style(assignment.emotion, assignment.delivery);
+  const parameters = {};
+  if (openrouter && gemini)
+    parameters.speed = 1;
+  if (/gpt-4o-mini-tts/i.test(model) && ["openrouter_tts", "openai_tts"].includes(connection.provider) && direction)
+    parameters.instructions = `Speak ${direction}.`;
+  return {
+    connectionId: connection.id,
+    text: speechInput(segment, assignment, legacyTags),
+    voice: assignment.voice || connection.voice,
+    model,
+    parameters,
+    outputFormat: openrouter && gemini ? "pcm" : connection.outputFormat
+  };
+}
+function createNativeTtsClient(transport = fetch) {
+  async function request(path, options = {}) {
+    return transport(`${API}${path}`, { ...options, credentials: "include", redirect: "error", signal: options.signal ?? AbortSignal.timeout(70000) });
+  }
+  async function readJson(response) {
+    const text = new TextDecoder().decode(await boundedBytes(response, 1024 * 1024));
+    if (!response.ok)
+      throw new Error(providerError("Lumiverse TTS", response.status, text));
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      throw new Error("Lumiverse returned an unexpected TTS response.");
+    }
+    if (typeof data.error === "string")
+      throw new Error(redactSecrets(data.error.slice(0, 600)));
+    return data;
+  }
+  return {
+    async connections() {
+      const all = [];
+      for (let offset = 0;offset < 2000; offset += 200) {
+        const result = await readJson(await request(`/tts-connections?limit=200&offset=${offset}`));
+        if (!Array.isArray(result.data))
+          throw new Error("This Lumiverse build did not return its TTS connections.");
+        for (const p of result.data)
+          if (typeof p.id === "string" && typeof p.provider === "string")
+            all.push({ id: p.id, name: p.name || p.id, provider: p.provider, model: p.model || "", voice: p.voice || "", outputFormat: p.default_parameters?.output_format });
+        if (result.data.length < 200 || typeof result.total === "number" && offset + result.data.length >= result.total)
+          break;
+      }
+      return all;
+    },
+    async models(id) {
+      const result = await readJson(await request(`/tts-connections/${encodeURIComponent(id)}/models`));
+      return (Array.isArray(result.models) ? result.models : []).filter((m) => typeof m.id === "string").map((m) => ({ id: m.id, name: m.label || m.id, voices: [] }));
+    },
+    async voices(id) {
+      const result = await readJson(await request(`/tts-connections/${encodeURIComponent(id)}/voices`));
+      return (Array.isArray(result.voices) ? result.voices : []).map((v) => typeof v === "string" ? v : v.id).filter((v) => typeof v === "string");
+    },
+    async check(id) {
+      const result = await readJson(await request(`/tts-connections/${encodeURIComponent(id)}/test`, { method: "POST" }));
+      if (result.success !== true)
+        throw new Error(typeof result.message === "string" ? redactSecrets(result.message.slice(0, 600)) : "Lumiverse could not connect to this TTS provider.");
+      return "Lumiverse accepts this saved TTS connection. Click Listen to test a voice. No speech was generated.";
+    },
+    async speech(connection, settings, segment, characterId, signal) {
+      const body = nativeSpeechRequest(connection, settings, segment, characterId);
+      const response = await request("/tts/synthesize", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal });
+      const mime = response.headers.get("content-type")?.toLowerCase() ?? "";
+      if (!response.ok || mime.includes("json")) {
+        const text = new TextDecoder().decode(await boundedBytes(response, 64 * 1024));
+        throw new Error(providerError("Lumiverse TTS", response.status, text));
+      }
+      const bytes = await boundedBytes(response, 25 * 1024 * 1024);
+      if (!bytes.length)
+        throw new Error("Lumiverse returned no speech audio.");
+      if (mime.startsWith("audio/pcm") || mime.startsWith("audio/x-pcm"))
+        return { bytes: pcmToWav(bytes, mime), mime: "audio/wav" };
+      if (!mime.startsWith("audio/") && !mime.startsWith("application/ogg"))
+        throw new Error("Lumiverse returned an unsupported speech response.");
+      return { bytes, mime };
+    }
+  };
+}
+
 // src/frontend.ts
 var STYLE = `
 ::highlight(lumiverse-readalong){background:rgba(245,190,80,.30);color:inherit;text-decoration:underline;text-decoration-color:#e7b24c;text-decoration-thickness:2px;}
@@ -316,6 +517,8 @@ function setup(ctx) {
   let canDiagnoseSpeech = false, diagnosing = false, diagnoseButton = null;
   let diagnoseHint = null;
   let models = [{ id: DEFAULTS.model, name: "Google: Gemini 3.8 Flash TTS", voices: GEMINI_VOICES }];
+  const nativeTts = createNativeTtsClient(), nativeRequests = new Set;
+  let nativeConnections = [], catalogEpoch = 0;
   let characters = [], permissions = [];
   let messages = [], selectedId = "";
   let playbackId = 0, playing = false, paused = false, currentMessage = null;
@@ -400,7 +603,7 @@ function setup(ctx) {
     return models.find((m) => m.id === settings.model)?.voices ?? [];
   }
   function voiceSelect(value, change, inherited = false) {
-    const names = voiceNames();
+    const names = [...voiceNames()];
     if (value && !names.includes(value))
       names.unshift(value);
     return select([...inherited ? [{ value: "", label: "Use default voice" }] : [], ...names.map((name) => ({ value: name, label: name }))], value, change);
@@ -413,6 +616,9 @@ function setup(ctx) {
     playbackId++;
     playing = false;
     paused = false;
+    for (const controller of nativeRequests)
+      controller.abort();
+    nativeRequests.clear();
     if (audio) {
       audio.pause();
       audio.removeAttribute("src");
@@ -483,7 +689,7 @@ function setup(ctx) {
   function audioSpeech(data, token) {
     if (token !== playbackId)
       return Promise.resolve();
-    const bytes = Uint8Array.from(atob(data.audio), (c) => c.charCodeAt(0));
+    const bytes = data.bytes ?? Uint8Array.from(atob(data.audio), (c) => c.charCodeAt(0));
     audioUrl = URL.createObjectURL(new Blob([bytes], { type: data.mime }));
     audio = new Audio(audioUrl);
     audio.playbackRate = settings.speed;
@@ -513,6 +719,23 @@ function setup(ctx) {
         });
     });
   }
+  function activeNative(id = settings.connectionId) {
+    return nativeConnections.find((c) => c.id === id);
+  }
+  async function prepareSpeech(segment, snapshot, characterId) {
+    if (snapshot.provider !== "lumiverse")
+      return rpc("speech", { segment, characterId, previewSettings: snapshot });
+    const connection = activeNative(snapshot.connectionId);
+    if (!connection)
+      throw new Error("Choose a saved Lumiverse TTS connection first. Add one in Lumiverse’s voice settings if the list is empty.");
+    const controller = new AbortController;
+    nativeRequests.add(controller);
+    try {
+      return await nativeTts.speech(connection, snapshot, segment, characterId, AbortSignal.any([controller.signal, AbortSignal.timeout(70000)]));
+    } finally {
+      nativeRequests.delete(controller);
+    }
+  }
   async function startMessage(message) {
     stop(false);
     currentMessage = { ...message, characterId: message.characterId ?? speakerCharacterId(message.name, characters, ctx.getActiveChat().characterId ?? undefined) };
@@ -528,7 +751,7 @@ function setup(ctx) {
     renderPlayer();
     try {
       const settingsSnapshot = normalizeSettings(settings);
-      const prepare = (i) => rpc("speech", { segment: currentSegments[i], characterId: speakerCharacterId(currentSegments[i].speaker, characters, currentMessage?.characterId), previewSettings: settingsSnapshot });
+      const prepare = (i) => prepareSpeech(currentSegments[i], settingsSnapshot, speakerCharacterId(currentSegments[i].speaker, characters, currentMessage?.characterId));
       let prepared = settings.provider !== "browser" ? prepare(0) : null;
       for (let i = 0;i < currentSegments.length && token === playbackId; i++) {
         position = i;
@@ -577,7 +800,7 @@ function setup(ctx) {
         await browserSpeech(segment, undefined, voice);
       else {
         const previewSettings = { ...settings, voice, assignments: {} };
-        const data = await rpc("speech", { segment, previewSettings });
+        const data = await prepareSpeech(segment, normalizeSettings(previewSettings));
         if (token !== playbackId)
           return;
         notice(`Listening to ${voice}…`);
@@ -599,6 +822,60 @@ function setup(ctx) {
     const r = await rpc("save", { settings });
     settings = r.settings;
     notice("Settings saved.");
+  }
+  function chooseNative(connection, preserveModel = false) {
+    settings.provider = "lumiverse";
+    settings.connectionId = connection.id;
+    if (!preserveModel) {
+      settings.model = connection.model || DEFAULTS.model;
+      settings.voice = connection.voice || DEFAULTS.voice;
+    }
+  }
+  async function refreshCatalog() {
+    const epoch = ++catalogEpoch, provider = settings.provider, connection = activeNative();
+    let next;
+    if (provider === "lumiverse") {
+      if (!connection) {
+        models = [];
+        renderConfig();
+        renderVoices();
+        renderAssignments();
+        return;
+      }
+      if (connection.provider === "openrouter_tts") {
+        try {
+          next = (await rpc("models")).models;
+        } catch {
+          next = [{ id: settings.model, name: settings.model, voices: /gemini-.*tts/i.test(settings.model) ? GEMINI_VOICES : await nativeTts.voices(connection.id) }];
+        }
+      } else {
+        const results = await Promise.all([nativeTts.models(connection.id), nativeTts.voices(connection.id)]);
+        next = results[0].map((m) => ({ ...m, voices: results[1] }));
+        if (!next.length)
+          next = [{ id: connection.model, name: connection.model, voices: results[1] }];
+      }
+    } else if (provider === "openrouter")
+      next = (await rpc("models")).models;
+    else
+      return;
+    if (disposed || epoch !== catalogEpoch || provider !== settings.provider || provider === "lumiverse" && connection?.id !== settings.connectionId)
+      return;
+    models = next;
+    if (!models.some((m) => m.id === settings.model))
+      models.unshift({ id: settings.model, name: settings.model, voices: [] });
+    renderConfig();
+    renderVoices();
+    renderAssignments();
+  }
+  async function refreshNativeConnections() {
+    const next = await nativeTts.connections();
+    if (disposed)
+      return;
+    nativeConnections = next;
+    if (settings.provider === "lumiverse" && !settings.connectionId && next.length)
+      chooseNative(next.find((c) => c.provider === "openrouter_tts") ?? next[0]);
+    renderConfig();
+    await refreshCatalog();
   }
   async function refreshMessages() {
     const chatId = ctx.getActiveChat().chatId;
@@ -701,10 +978,14 @@ function setup(ctx) {
   }
   function renderConfig() {
     config.replaceChildren(el("h3", "Speech connection"));
-    config.append(field("Provider", select([{ value: "openrouter", label: "OpenRouter" }, { value: "browser", label: "Browser voices · free" }, { value: "local", label: "Local / OpenAI-compatible" }], settings.provider, (v) => {
+    config.append(field("Provider", select([{ value: "lumiverse", label: "Lumiverse connection · recommended" }, { value: "openrouter", label: "OpenRouter · direct" }, { value: "browser", label: "Browser voices · free" }, { value: "local", label: "Local / OpenAI-compatible" }], settings.provider, (v) => {
       stop(false);
       settings.provider = v;
-      if (v === "browser")
+      if (v === "lumiverse") {
+        const connection = activeNative() ?? nativeConnections.find((c) => c.provider === "openrouter_tts") ?? nativeConnections[0];
+        if (connection)
+          chooseNative(connection);
+      } else if (v === "browser")
         settings.voice = voiceNames()[0] ?? "";
       else if (v === "local") {
         settings.model = "kokoro";
@@ -716,13 +997,56 @@ function setup(ctx) {
       renderConfig();
       renderVoices();
       renderAssignments();
-      safe(saveSettings);
+      safe(async () => {
+        await saveSettings();
+        await refreshCatalog();
+      });
     })));
+    if (settings.provider === "lumiverse") {
+      config.append(field("Saved TTS connection", select([{ value: "", label: "Choose a connection" }, ...nativeConnections.map((c) => ({ value: c.id, label: `${c.name} · ${c.provider.replace(/_tts$/, "")}` }))], settings.connectionId, (v) => {
+        stop(false);
+        const connection = nativeConnections.find((c) => c.id === v);
+        if (connection)
+          chooseNative(connection);
+        else
+          settings.connectionId = "";
+        renderConfig();
+        renderVoices();
+        renderAssignments();
+        safe(async () => {
+          await saveSettings();
+          await refreshCatalog();
+        });
+      })));
+      config.append(button("Refresh connections and voices", () => safe(refreshNativeConnections)));
+      if (models.length && activeNative())
+        config.append(field("Speech model", select(models.map((m) => ({ value: m.id, label: m.name })), settings.model, (v) => {
+          stop(false);
+          settings.model = v;
+          settings.voice = voiceNames()[0] ?? "";
+          renderConfig();
+          renderVoices();
+          renderAssignments();
+          safe(saveSettings);
+        })));
+      config.append(el("p", "Uses your saved Lumiverse TTS connection and key. No separate key or helper app is needed. Add or edit connections in Lumiverse’s voice settings.", "ra-muted"));
+      config.append(button("Check connection", () => safe(async () => {
+        if (!activeNative())
+          throw new Error("Choose a saved TTS connection first.");
+        notice("Checking connection…");
+        notice(await nativeTts.check(settings.connectionId));
+      })));
+      if (/gemini-3\.8.*tts/i.test(settings.model))
+        config.append(el("p", "Gemini 3.8 reads clean dialogue through this connection. Lumiverse’s current TTS endpoint does not pass its per-sentence emotion directions.", "ra-muted"));
+      diagnoseButton = null;
+      diagnoseHint = null;
+    }
     if (settings.provider === "openrouter") {
       config.append(field("Speech model", select(models.map((m) => ({ value: m.id, label: m.name })), settings.model, (v) => {
         stop(false);
         settings.model = v;
         settings.voice = voiceNames()[0] ?? "";
+        renderConfig();
         renderVoices();
         renderAssignments();
         safe(saveSettings);
@@ -740,7 +1064,7 @@ function setup(ctx) {
     }
     if (settings.provider === "local")
       config.append(field("API base URL", textInput(settings.localUrl, (v) => settings.localUrl = v)), field("Model ID", textInput(settings.model, (v) => settings.model = v)));
-    if (settings.provider !== "browser") {
+    if (settings.provider !== "browser" && settings.provider !== "lumiverse") {
       const key = textInput("", () => {}, "password");
       key.autocomplete = "off";
       key.placeholder = settings.provider === "openrouter" && hasKey ? "Key saved · leave blank to keep it" : "Paste your API key";
@@ -962,6 +1286,19 @@ function setup(ctx) {
     hasKey = r.hasKey;
     permissions = r.permissions;
     ready = true;
+    try {
+      nativeConnections = await nativeTts.connections();
+      if (disposed)
+        return;
+      const existing = nativeConnections.find((c) => c.provider === "openrouter_tts" && c.model === settings.model) ?? nativeConnections.find((c) => c.provider === "openrouter_tts");
+      if (needsPcm(settings) && existing) {
+        chooseNative(existing, true);
+        await saveSettings();
+      } else if (settings.provider === "lumiverse" && !settings.connectionId && nativeConnections.length) {
+        chooseNative(existing ?? nativeConnections[0]);
+        await saveSettings();
+      }
+    } catch {}
     renderPlayer();
     renderConfig();
     renderVoices();
@@ -978,17 +1315,11 @@ function setup(ctx) {
         renderAssignments();
       } catch {}
     }
-    if (permissions.includes("cors_proxy")) {
+    if (settings.provider === "lumiverse" || permissions.includes("cors_proxy")) {
       try {
-        const r = await rpc("models");
-        models = r.models;
-        if (!models.some((m) => m.id === settings.model))
-          models.unshift({ id: settings.model, name: settings.model, voices: [] });
-        renderConfig();
-        renderVoices();
-        renderAssignments();
+        await refreshCatalog();
       } catch {
-        notice("Using the bundled Gemini voices. Refresh the list when the connection is available.");
+        notice("Could not refresh the voice list. Check the saved connection and try Refresh again.", true);
       }
     }
     if (permissions.includes("chat_mutation"))
