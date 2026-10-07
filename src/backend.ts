@@ -1,5 +1,6 @@
 import type { SpindleAPI, ChatMessageDTO } from 'lumiverse-spindle-types';
-import { DEFAULTS, CUE_PATTERN, HIDE_RULE_NAME, EMOTION_INSTRUCTION, needsPcm, normalizeSettings, speechRequest, type Settings, type SpeechSegment, type SpeechModel } from './shared';
+import { DEFAULTS, CUE_PATTERN, HIDE_RULE_NAME, EMOTION_INSTRUCTION, needsPcm, normalizeSettings, speechRequest, readVoiceRef, type CharacterInfo, type Settings, type SpeechSegment, type SpeechModel } from './shared';
+import { MAX_PASSAGE_CHARS } from './playback-plan';
 import { isHiddenJsonError, providerError, redactSecrets } from './provider-errors';
 declare const spindle: SpindleAPI;
 const settingsByUser = new Map<string, Settings>();
@@ -146,10 +147,10 @@ spindle.onFrontendMessage(async (payload, userId, sessionId) => {
     } else if (p.type === 'diagnose_speech') {
       reply(await diagnoseSpeech(scope,userId));
     } else if (p.type === 'characters') {
-      const characters: {id:string;name:string}[] = [];
+      const characters: CharacterInfo[] = [];
       for (let offset = 0; ; offset += 200) {
         const { data, total } = await spindle.characters.list({ limit: 200, offset, userId });
-        characters.push(...data.map(c => ({ id: c.id, name: c.name })));
+        characters.push(...data.map(c => ({ id: c.id, name: c.name, ttsVoice:readVoiceRef(c.extensions?.ttsVoice) })));
         if (data.length < 200 || characters.length >= total) break;
       }
       reply({ characters });
@@ -168,7 +169,7 @@ spindle.onFrontendMessage(async (payload, userId, sessionId) => {
     } else if (p.type === 'speech') {
       if ((busy.get(scope) ?? 0) >= 2) throw new Error('Speech is already being prepared. Try again shortly.');
       const s = p.segment;
-      if (!s || typeof s.text !== 'string' || s.text.length > 1200 || !s.text.trim()) throw new Error('Invalid speech passage.');
+      if (!s || typeof s.text !== 'string' || s.text.length > MAX_PASSAGE_CHARS || !s.text.trim()) throw new Error('Invalid speech passage.');
       const segment: SpeechSegment = { text: s.text, speaker: typeof s.speaker === 'string' ? s.speaker.slice(0,80) : '', emotion: typeof s.emotion === 'string' ? s.emotion : '', delivery: typeof s.delivery === 'string' ? s.delivery : '' };
       const version = canceled.get(scope) ?? 0;
       busy.set(scope, (busy.get(scope) ?? 0) + 1);

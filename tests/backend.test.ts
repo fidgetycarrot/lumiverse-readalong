@@ -17,7 +17,7 @@ let messageReads=0;
   userStorage:{exists:async(path:string,u:string)=>files.has(u+path),read:async(path:string,u:string)=>files.get(u+path),write:async(path:string,value:string,u:string)=>{files.set(u+path,value)}},
   enclave:{has:async(k:string,u:string)=>keys.has(u+k),put:async(k:string,v:string,u:string)=>keys.set(u+k,v),get:async(k:string,u:string)=>keys.get(u+k),delete:async(k:string,u:string)=>keys.delete(u+k)},
   regex_scripts:{list:async()=>({data:rules,total:rules.length}),create:async(r:any)=>{const s={...r,id:'rule',can_mutate:true};rules.push(s);return s},update:async()=>{}},
-  characters:{list:async()=>({data:[{id:'mara',name:'Mara'}]})},
+  characters:{list:async()=>({data:[{id:'mara',name:'Mara',extensions:{ttsVoice:{connectionId:'saved',voice:'Puck',metadata:'do-not-project'},other:'do-not-project'}}]})},
   chats:{get:async(id:string,u:string)=>id===`${u}-chat`?{id}:null},
   chat:{getMessages:async()=>{messageReads++;return[{id:'m1',name:'Mara',is_user:false,content:'Hello.'}]}},
   cors:async(url:string,options:any)=>{
@@ -39,6 +39,9 @@ async function call(type:string,data:any={},user='one',session='tab1'){
   return outgoing.find(r=>r.p.requestId===requestId);
 }
 describe('backend provider and session integration',()=>{
+  test('character listing projects only IDs, names and native voice references',async()=>{
+    expect((await call('characters')).p.data.characters).toEqual([{id:'mara',name:'Mara',ttsVoice:{connectionId:'saved',voice:'Puck'}}]);
+  });
   test('startup installs a display-only hide rule',async()=>{
     const r=await call('init');expect(rules).toHaveLength(1);expect(rules[0].target).toBe('display');expect(r.p.data.cueStatus).toBe('');
     await call('init');expect(rules).toHaveLength(1);

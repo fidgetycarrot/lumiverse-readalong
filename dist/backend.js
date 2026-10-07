@@ -15,10 +15,19 @@ var DEFAULTS = {
   follow: false,
   promptEmotions: true,
   useEmotions: true,
+  inheritVoices: true,
   speed: 1,
   volume: 0.85,
   assignments: {}
 };
+function readVoiceRef(raw) {
+  if (!raw || typeof raw !== "object")
+    return;
+  const v = raw;
+  if (typeof v.connectionId !== "string" || !v.connectionId || v.connectionId.length > 160)
+    return;
+  return { connectionId: v.connectionId, voice: typeof v.voice === "string" ? v.voice.slice(0, 160) : "" };
+}
 function normalizeSettings(raw) {
   const r = raw && typeof raw === "object" ? raw : {};
   const str = (v, fallback, max = 200) => typeof v === "string" ? v.trim().slice(0, max) : fallback;
@@ -40,6 +49,7 @@ function normalizeSettings(raw) {
     follow: r.follow === true,
     promptEmotions: r.promptEmotions !== false,
     useEmotions: r.useEmotions !== false,
+    inheritVoices: r.inheritVoices !== false,
     speed: clamp(r.speed, 0.5, 2, 1),
     volume: clamp(r.volume, 0, 1, 0.85),
     assignments
@@ -92,6 +102,9 @@ function speechRequest(settings, segment, characterId) {
   return body;
 }
 var EMOTION_INSTRUCTION = `When vocal delivery matters, add sparse voice cues immediately before the affected sentence, using [emotion:neutral|happy|sad|angry|worried|curious|excited|sarcastic|tender|afraid] and optionally [delivery:normal|whispers|shouts|softly|slowly|laughs|sighs]. Choose one value per cue, not the list. For a speaker change use [speaker:Character Name], or [speaker:narrator] for narration. Cues persist until changed; a speaker change resets emotion and delivery. Use the exact character name, preserve ordinary prose and formatting, and avoid tagging every sentence. These cues are hidden from the reader and used only for speech. Do not add any other bracketed audio instructions.`;
+
+// src/playback-plan.ts
+var MAX_PASSAGE_CHARS = 3000;
 
 // src/provider-errors.ts
 function redactSecrets(message, secret) {
@@ -326,7 +339,7 @@ spindle.onFrontendMessage(async (payload, userId, sessionId) => {
       const characters = [];
       for (let offset = 0;; offset += 200) {
         const { data, total } = await spindle.characters.list({ limit: 200, offset, userId });
-        characters.push(...data.map((c) => ({ id: c.id, name: c.name })));
+        characters.push(...data.map((c) => ({ id: c.id, name: c.name, ttsVoice: readVoiceRef(c.extensions?.ttsVoice) })));
         if (data.length < 200 || characters.length >= total)
           break;
       }
@@ -351,7 +364,7 @@ spindle.onFrontendMessage(async (payload, userId, sessionId) => {
       if ((busy.get(scope) ?? 0) >= 2)
         throw new Error("Speech is already being prepared. Try again shortly.");
       const s = p.segment;
-      if (!s || typeof s.text !== "string" || s.text.length > 1200 || !s.text.trim())
+      if (!s || typeof s.text !== "string" || s.text.length > MAX_PASSAGE_CHARS || !s.text.trim())
         throw new Error("Invalid speech passage.");
       const segment = { text: s.text, speaker: typeof s.speaker === "string" ? s.speaker.slice(0, 80) : "", emotion: typeof s.emotion === "string" ? s.emotion : "", delivery: typeof s.delivery === "string" ? s.delivery : "" };
       const version = canceled.get(scope) ?? 0;

@@ -1,7 +1,9 @@
-import type { SpindleFrontendContext, SpindleCharacterEditorTabHandle } from 'lumiverse-spindle-types';
-import { DEFAULTS, GEMINI_VOICES, EMOTIONS, DELIVERIES, needsPcm, normalizeSettings, parseSegments, selectVoice, speakerCharacterId, plainText, stripCues, type Settings, type SpeechSegment, type SpeechModel, type MessageInfo, type VoiceAssignment } from './shared';
+import type { SpindleFrontendContext, SpindleCharacterEditorTabHandle, SpindleFloatWidgetHandle } from 'lumiverse-spindle-types';
+import { DEFAULTS, GEMINI_VOICES, EMOTIONS, DELIVERIES, needsPcm, normalizeSettings, parseSegments, speakerCharacterId, plainText, stripCues, type CharacterInfo, type Settings, type SpeechSegment, type SpeechModel, type MessageInfo, type VoiceAssignment } from './shared';
 import { PassageMarker } from './highlight';
 import { createNativeTtsClient, type NativeConnection } from './native-tts';
+import { planSpeech, prepareAll, estimatedSentenceIndex, type SpeechPassage, type VoiceContext } from './playback-plan';
+import { BufferedPlayer } from './playback';
 
 const STYLE = `
 ::highlight(lumiverse-readalong){background:rgba(245,190,80,.30);color:inherit;text-decoration:underline;text-decoration-color:#e7b24c;text-decoration-thickness:2px;}
@@ -21,6 +23,11 @@ const STYLE = `
 .ra progress{width:100%;height:5px;accent-color:#e7b24c}.ra .ra-voice-list{display:flex;gap:7px;flex-wrap:wrap;max-height:240px;overflow:auto;padding:4px 0;}
 .ra .ra-voice-list button{padding:6px 10px;font-size:12px}.ra .ra-voice-list button[aria-pressed=true]{border-color:#e7b24c;background:rgba(245,190,80,.12)}
 .ra-bubble{display:flex;gap:8px;align-items:center;padding:5px 0;font-size:12px}.ra-bubble button{padding:5px 9px;font-size:12px;}.ra details>summary{cursor:pointer;font-size:13px;margin:8px 0;}
+.ra-mini{font:13px/1.4 system-ui,sans-serif;color:var(--lumiverse-text,#eee);padding:12px;background:var(--lumiverse-bg,#202026);height:100%;box-sizing:border-box;}
+.ra-mini .ra-row{display:flex;gap:7px;align-items:center}.ra-mini .ra-caption{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin:7px 0;color:var(--lumiverse-text-muted,#aaa);}
+.ra-mini button{font:inherit;border:1px solid var(--lumiverse-border,#555);border-radius:7px;background:var(--lumiverse-fill,#292932);color:inherit;padding:6px 10px;cursor:pointer;}
+.ra-mini button:disabled{opacity:.5;cursor:default}.ra-mini .ra-primary{background:var(--lumiverse-primary,#ac8b4f);color:var(--lumiverse-on-primary,#fff);}
+.ra-mini .ra-close{margin-left:auto;padding:2px 7px;}.ra-mini progress{width:100%;height:4px;accent-color:#e7b24c;}
 `;
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, text = '', className = '') { const node = document.createElement(tag); if (text) node.textContent = text; if (className) node.className = className; return node }
 function button(text: string, action: () => void | Promise<void>, primary = false) { const b = el('button',text,primary ? 'ra-primary' : ''); b.type = 'button'; b.onclick = () => { void action() }; return b }
@@ -28,6 +35,7 @@ function field(label: string, input: HTMLElement) { const l = el('label','', 'ra
 function select(options: {value:string;label:string}[], value: string, change: (v: string) => void) { const s = el('select'); for (const o of options) { const option = el('option',o.label); option.value = o.value; s.append(option) }; s.value = value; s.onchange = () => change(s.value); return s }
 function textInput(value: string, onInput: (value: string) => void, type = 'text') { const i = el('input'); i.type = type; i.value = value; i.oninput = () => onInput(i.value); return i }
 function toggle(label: string, value: boolean, change: (v: boolean) => void) { const row = el('label','', 'ra-toggle'), i = el('input'); i.type = 'checkbox'; i.checked = value; i.onchange = () => change(i.checked); row.append(i,el('span',label)); return row }
+function timeLabel(seconds:number){const value=Math.floor(seconds);return `${Math.floor(value/60)}:${String(value%60).padStart(2,'0')}`}
 
 export function setup(ctx: SpindleFrontendContext) {
   let settings = normalizeSettings(DEFAULTS), hasKey = false, ready = false, disposed = false;
@@ -36,14 +44,23 @@ export function setup(ctx: SpindleFrontendContext) {
   let models: SpeechModel[] = [{ id:DEFAULTS.model, name:'Google: Gemini 3.8 Flash TTS', voices:GEMINI_VOICES }];
   const nativeTts=createNativeTtsClient(), nativeRequests=new Set<AbortController>();
   let nativeConnections:NativeConnection[]=[], catalogEpoch=0;
-  let characters: {id:string;name:string}[] = [], permissions: string[] = [];
+  let characters: CharacterInfo[] = [], permissions: string[] = [];
   let messages: MessageInfo[] = [], selectedId = '';
   let playbackId = 0, playing = false, paused = false, currentMessage: MessageInfo | null = null;
-  let audio: HTMLAudioElement | null = null, utterance: SpeechSynthesisUtterance | null = null, audioUrl = '';
-  let currentSegments: SpeechSegment[] = [], position = 0, markerVisible = false;
+  let phase:'idle'|'preparing'|'ready'|'playing'|'paused'|'finished'='idle';
+  let utterance: SpeechSynthesisUtterance | null = null;
+  const audioPlayer=new BufferedPlayer();
+  let currentPassages:SpeechPassage[]=[],preparedCount=0,currentPassage=0;
+  let readingAbort:AbortController|null=null,clockTimer:ReturnType<typeof setInterval>|null=null;
+  let browserQueueActive=false,browserResume:(()=>void)|null=null;
+  let widget:SpindleFloatWidgetHandle|null=null;
+  let currentSegments: SpeechSegment[] = [], position = 0, markedPosition=-1;
   let playbackSettler: (() => void) | null = null;
   const pending = new Map<string,{resolve:(data:any)=>void;reject:(err:Error)=>void;timer:ReturnType<typeof setTimeout>}>();
   const cleanups: (()=>void)[] = [], bubbleHandles = new Map<string,Element>();
+  const primeAudio=()=>{try{audioPlayer.unlock();removePrimer()}catch{}};
+  const removePrimer=()=>{document.removeEventListener('pointerdown',primeAudio,true);document.removeEventListener('keydown',primeAudio,true)};
+  document.addEventListener('pointerdown',primeAudio,{capture:true,passive:true});document.addEventListener('keydown',primeAudio,true);cleanups.push(removePrimer);
   let editorTab: SpindleCharacterEditorTabHandle | null = null;
   const tab = ctx.ui.registerDrawerTab({ id:'readalong', title:'Readalong', shortName:'Read', description:'Listen to passages, assign character voices, and follow the spoken text', keywords:['tts','voice','speech','audio'] });
   const root = tab.root; root.classList.add('ra'); root.dataset.raUi = 'true';
@@ -52,7 +69,7 @@ export function setup(ctx: SpindleFrontendContext) {
   const status = el('p','Loading…','ra-status'); status.setAttribute('role','status'); status.setAttribute('aria-live','polite');
   const player = el('section','', 'ra-card'), config = el('section','', 'ra-card'), voicesCard = el('section','', 'ra-card'), assignmentsCard = el('section','', 'ra-card');
   root.append(heading,intro,status,player,config,voicesCard,assignmentsCard);
-  function notice(text: string, error = false) { if (!disposed) { status.textContent = text; status.classList.toggle('ra-error',error) } }
+  function notice(text: string, error = false) { if (!disposed) { status.textContent = text; status.classList.toggle('ra-error',error);renderWidget() } }
   async function safe(work:()=>Promise<void>) { try { await work() } catch(e) { notice(e instanceof Error ? e.message : 'Readalong failed.',true) } }
   function showDiagnostics(available:boolean) {
     canDiagnoseSpeech = available;
@@ -72,11 +89,11 @@ export function setup(ctx: SpindleFrontendContext) {
       const p = pending.get(payload.requestId); if (!p) return; clearTimeout(p.timer); pending.delete(payload.requestId);
       if (typeof payload.canDiagnoseSpeech === 'boolean') showDiagnostics(payload.canDiagnoseSpeech);
       if (payload.error) p.reject(new Error(payload.error)); else p.resolve(payload.data);
-    } else if (payload?.type === 'new_message' && ready && settings.autoPlay && payload.chatId === ctx.getActiveChat().chatId && !playing) {
-      void safe(async () => { await startMessage(payload.message) });
+    } else if (payload?.type === 'new_message' && ready && settings.autoPlay && payload.chatId === ctx.getActiveChat().chatId && (phase==='idle' || phase==='finished')) {
+      void safe(async () => { await startMessage(payload.message,true) });
     }
   }));
-  const marker = new PassageMarker(v => { markerVisible = v });
+  const marker = new PassageMarker(()=>{});
   function voiceNames(): string[] {
     if (settings.provider === 'browser') return ('speechSynthesis' in window ? speechSynthesis.getVoices().map(v=>v.name) : []);
     if (settings.provider === 'local') return ['af_heart','af_bella','af_nicole','am_adam','am_michael','bf_emma','bm_george'];
@@ -91,107 +108,165 @@ export function setup(ctx: SpindleFrontendContext) {
     // Current host content anchor. If it changes, keep the passage visible in our player.
     return bubble?.querySelector('[data-component="MessageContent"]') ?? bubble;
   }
+  function stopClock() { if(clockTimer)clearInterval(clockTimer);clockTimer=null }
   function stop(showStatus = true) {
-    playbackId++; playing = false; paused = false;
+    playbackId++; playing = false; paused = false; phase='idle';stopClock();
+    readingAbort?.abort();readingAbort=null;
     for(const controller of nativeRequests)controller.abort();nativeRequests.clear();
-    if (audio) { audio.pause(); audio.removeAttribute('src'); audio.load(); audio = null }
+    audioPlayer.clear();
+    browserResume?.();browserResume=null;browserQueueActive=false;
     if (utterance) { speechSynthesis.cancel(); utterance = null }
     playbackSettler?.(); playbackSettler = null;
-    if (audioUrl) { URL.revokeObjectURL(audioUrl); audioUrl = '' }
-    marker.reset(); currentMessage = null; currentSegments = []; position = 0;
+    marker.reset(); currentMessage = null; currentSegments = [];currentPassages=[];preparedCount=0;position=0;markedPosition=-1;currentPassage=0;
     void rpc('cancel').catch(()=>{}); renderPlayer();
     if (showStatus) notice('Stopped.');
   }
-  function pause() {
-    if (!playing) return;
-    paused = !paused;
-    if (paused) { audio?.pause(); if (utterance) speechSynthesis.pause() }
-    else { if (audio) void audio.play().catch(()=>notice('Press Play to allow audio.',true)); if (utterance) speechSynthesis.resume() }
+  function showWidget() {
+    if(!widget && typeof ctx.ui.createFloatWidget==='function') {
+      const width=Math.min(320,Math.max(240,window.innerWidth-24));
+      widget=ctx.ui.createFloatWidget({width,height:146,initialPosition:{x:Math.max(12,window.innerWidth-width-24),y:Math.max(12,window.innerHeight-220)},snapToEdge:true,tooltip:'Readalong · drag to move'});
+      widget.root.classList.add('ra-mini');widget.root.dataset.raUi='true';widget.root.setAttribute('aria-label','Readalong floating player');
+    }
+    widget?.setVisible(true);renderWidget();
+  }
+  function renderWidget() {
+    if(!widget || disposed)return;
+    const header=el('div','', 'ra-row');header.append(el('strong','Readalong'));
+    if(audioPlayer.duration){const time=el('span',`${timeLabel(audioPlayer.elapsed)} / ${timeLabel(audioPlayer.duration)}`,'ra-time');header.append(time)}
+    const close=button('×',()=>widget?.setVisible(false));close.className='ra-close';close.setAttribute('aria-label','Hide floating player');header.append(close);
+    const caption=el('p',phase==='playing' || phase==='paused' ? `${currentSegments[position]?.speaker || 'Voice'} · ${currentPassages[currentPassage]?.voice || ''}` : status.textContent ?? 'Choose a message.','ra-caption');
+    caption.title=currentSegments[position]?.text ?? caption.textContent ?? '';
+    const controls=el('div','', 'ra-row');
+    const play=button(phase==='paused'?'Resume':phase==='playing'?'Pause':phase==='finished'?'Replay':'Play',()=>safe(playOrPause),true);
+    play.disabled=phase==='preparing' || phase==='idle';controls.append(play);
+    const stopButton=button('Stop',()=>stop());stopButton.disabled=phase==='idle';controls.append(stopButton,button('Open player',()=>tab.activate()));
+    const progress=el('progress');progress.max=1;progress.value=phase==='preparing'?preparedCount/Math.max(1,currentPassages.length):phase==='finished'?1:phase==='ready'?0:audioPlayer.duration?audioPlayer.elapsed/audioPlayer.duration:position/Math.max(1,currentSegments.length);progress.setAttribute('aria-label',phase==='preparing'?'Speech preparation':'Playback progress');
+    widget.root.replaceChildren(header,caption,controls,progress);
+  }
+  function markSentence(passageIndex:number,sentenceIndex:number) {
+    const next=currentPassages.slice(0,passageIndex).reduce((sum,p)=>sum+p.segments.length,0)+sentenceIndex;
+    if(next===markedPosition && currentPassage===passageIndex)return;
+    currentPassage=passageIndex;position=next;markedPosition=next;
+    if(currentMessage){marker.mark(()=>contentRoot(currentMessage!.id),currentSegments[position].text);if(settings.follow)marker.follow()}
     renderPlayer();
   }
-  function browserSpeech(segment: SpeechSegment, characterId?: string, previewVoice?: string) {
+  function updateClock() {
+    if(phase!=='playing')return;
+    const at=audioPlayer.position,passage=currentPassages[at.index];
+    if(passage)markSentence(at.index,estimatedSentenceIndex(passage,at.fraction));
+    const progress=widget?.root.querySelector('progress');if(progress)progress.value=at.duration?at.elapsed/at.duration:0;
+    const time=widget?.root.querySelector('.ra-time');if(time)time.textContent=`${timeLabel(at.elapsed)} / ${timeLabel(at.duration)}`;
+  }
+  function finished() {
+    playing=false;paused=false;phase='finished';stopClock();
+    if(currentPassages.length)markSentence(currentPassages.length-1,currentPassages.at(-1)!.segments.length-1);
+    notice(currentPassages[0]?.settings.provider==='browser'?'Finished. Replay reads this passage again.':'Finished. Replay uses the prepared audio.');renderPlayer();
+  }
+  audioPlayer.onEnded=finished;
+  async function playOrPause() {
+    if(phase==='preparing' || phase==='idle')return;
+    if(phase==='playing') {
+      if(browserQueueActive)speechSynthesis.pause();else{updateClock();audioPlayer.pause()}
+      paused=true;playing=false;phase='paused';stopClock();notice('Paused. Your place is saved.');renderPlayer();return;
+    }
+    const token=playbackId;
+    if(phase==='paused' && browserQueueActive){speechSynthesis.resume();paused=false;playing=true;phase='playing';browserResume?.();browserResume=null;notice('Reading…');renderPlayer();return}
+    if(phase==='finished'){marker.reset();position=0;markedPosition=-1;currentPassage=0;audioPlayer.rewind()}
+    paused=false;
+    if(currentPassages[0]?.settings.provider==='browser') {
+      playing=true;phase='playing';browserQueueActive=true;notice('Reading…');renderPlayer();
+      try {
+        for(let i=0;i<currentPassages.length && token===playbackId;i++) {
+          if(paused)await new Promise<void>(resolve=>browserResume=resolve);
+          if(token!==playbackId)return;
+          markSentence(i,0);await browserSpeech(currentPassages[i],token,i);
+        }
+        if(token===playbackId){browserQueueActive=false;finished()}
+      } catch(e){if(token===playbackId){stop(false);throw e}}
+      return;
+    }
+    audioPlayer.unlock();
+    const started=await audioPlayer.play();
+    if(token!==playbackId || !started)return;
+    playing=true;phase='playing';notice('Reading…');updateClock();renderPlayer();
+    stopClock();clockTimer=setInterval(updateClock,100);
+  }
+  function browserSpeech(passage:SpeechPassage,token:number,passageIndex:number) {
     return new Promise<void>((resolve,reject) => {
       if (!('speechSynthesis' in window)) { reject(new Error('Browser voices are unavailable in this browser.')); return }
-      const u = new SpeechSynthesisUtterance(segment.text); utterance = u;
-      const voice = previewVoice ?? selectVoice(settings,segment,characterId).voice;
-      u.voice = speechSynthesis.getVoices().find(v => v.name === voice) ?? null;
-      u.rate = settings.speed; u.volume = settings.volume;
-      playbackSettler = resolve;
-      u.onend = () => { utterance = null; playbackSettler = null; resolve() };
-      u.onerror = e => { utterance = null; playbackSettler = null; e.error === 'canceled' || e.error === 'interrupted' ? resolve() : reject(new Error(`Browser speech failed: ${e.error}`)) };
+      const u = new SpeechSynthesisUtterance(passage.segment.text); utterance = u;
+      u.voice = speechSynthesis.getVoices().find(v => v.name === passage.voice) ?? null;
+      u.rate = settings.speed; u.volume = settings.volume;playbackSettler=resolve;
+      u.onboundary=e=>{if(token!==playbackId || phase!=='playing')return;let end=0;for(let i=0;i<passage.segments.length;i++){end+=passage.segments[i].text.length+1;if(e.charIndex<end){markSentence(passageIndex,i);break}}};
+      const finish=()=>{if(utterance===u){utterance=null;playbackSettler=null}};
+      u.onend=()=>{finish();resolve()};
+      u.onerror=e=>{finish();if(token===playbackId && e.error!=='canceled' && e.error!=='interrupted')reject(new Error(`Browser speech failed: ${e.error}`));else resolve()};
       speechSynthesis.speak(u);
     });
   }
-  function audioSpeech(data: {audio?:string;bytes?:Uint8Array;mime:string}, token: number) {
-    if (token !== playbackId) return Promise.resolve();
-    const bytes = data.bytes ?? Uint8Array.from(atob(data.audio!), c=>c.charCodeAt(0));
-    audioUrl = URL.createObjectURL(new Blob([bytes],{ type:data.mime }));
-    audio = new Audio(audioUrl); audio.playbackRate = settings.speed; audio.volume = settings.volume;
-    const a = audio;
-    return new Promise<void>((resolve,reject) => {
-      playbackSettler = resolve;
-      const finish = () => { if (audio === a) audio = null; playbackSettler = null; a.onended = null; a.onerror = null; URL.revokeObjectURL(a.src); audioUrl = ''; resolve() };
-      a.onended = finish;
-      a.onerror = () => { finish(); reject(new Error('The speech provider returned audio this browser cannot play.')) };
-      if (!paused) void a.play().catch(() => { finish(); reject(new Error('Audio was blocked. Press Read again to allow playback.')) });
-    });
-  }
   function activeNative(id=settings.connectionId) { return nativeConnections.find(c=>c.id===id) }
-  async function prepareSpeech(segment:SpeechSegment, snapshot:Settings, characterId?:string) {
-    if(snapshot.provider!=='lumiverse')return rpc('speech',{segment,characterId,previewSettings:snapshot});
+  async function prepareSpeech(segment:SpeechSegment, snapshot:Settings, signal?:AbortSignal) {
+    signal?.throwIfAborted();
+    if(snapshot.provider!=='lumiverse')return rpc('speech',{segment,previewSettings:snapshot});
     const connection=activeNative(snapshot.connectionId);
     if(!connection)throw new Error('Choose a saved Lumiverse TTS connection first. Add one in Lumiverse’s voice settings if the list is empty.');
     const controller=new AbortController();nativeRequests.add(controller);
-    try{return await nativeTts.speech(connection,snapshot,segment,characterId,AbortSignal.any([controller.signal,AbortSignal.timeout(70000)]))}
+    try{return await nativeTts.speech(connection,snapshot,segment,undefined,AbortSignal.any([controller.signal,AbortSignal.timeout(70000),...(signal?[signal]:[])]))}
     finally{nativeRequests.delete(controller)}
   }
-  async function startMessage(message: MessageInfo) {
+  async function startMessage(message: MessageInfo, autoStart=false) {
     stop(false);
-    currentMessage = { ...message, characterId:message.characterId ?? speakerCharacterId(message.name,characters,ctx.getActiveChat().characterId ?? undefined) };
-    currentSegments = parseSegments(message.content,message.name);
-    if (!currentSegments.length) { notice('There is no readable text in this message.'); return }
-    const token = playbackId; playing = true; paused = false; marker.reset();
-    renderPlayer();
+    const token=playbackId;readingAbort=new AbortController();const signal=readingAbort.signal;
+    currentMessage={...message,characterId:message.characterId ?? speakerCharacterId(message.name,characters,ctx.getActiveChat().characterId ?? undefined)};
+    phase='preparing';preparedCount=0;showWidget();notice('Preparing the whole message…');renderPlayer();
     try {
-      const settingsSnapshot = normalizeSettings(settings);
-      // Capture this reading's settings so a voice preview or form change cannot alter an in-flight request.
-      const prepare = (i: number) => prepareSpeech(currentSegments[i],settingsSnapshot,speakerCharacterId(currentSegments[i].speaker,characters,currentMessage?.characterId));
-      let prepared = settings.provider !== 'browser' ? prepare(0) : null;
-      for (let i = 0; i < currentSegments.length && token === playbackId; i++) {
-        position = i;
-        const segment = currentSegments[i];
-        notice(settings.provider === 'browser' ? 'Reading…' : 'Preparing speech…'); renderPlayer();
-        const data = prepared ? await prepared : null;
-        if (token !== playbackId) return;
-        // One sentence ahead; never synthesize the entire message just because Play was pressed.
-        prepared = settings.provider !== 'browser' && i + 1 < currentSegments.length ? prepare(i+1) : null;
-        prepared?.catch(()=>{});
-        marker.mark(()=>contentRoot(message.id),segment.text);
-        if (settings.follow) marker.follow();
-        notice('Reading…'); renderPlayer();
-        if (data) await audioSpeech(data,token); else await browserSpeech(segment,speakerCharacterId(segment.speaker,characters,currentMessage?.characterId));
+      const snapshot=normalizeSettings(settings);
+      const context:VoiceContext={characters,characterId:currentMessage.characterId,connections:nativeConnections};
+      let rules;
+      if(snapshot.provider==='lumiverse') {
+        const results=await Promise.allSettled([nativeTts.preferences(),ctx.chats.getActive?.() ?? Promise.resolve(null)]);
+        if(results[0].status==='fulfilled'){rules=results[0].value.rules;context.narrationVoice=results[0].value.narrationVoice}
+        if(results[1].status==='fulfilled')context.overrides=results[1].value?.metadata?.voiceOverrides as VoiceContext['overrides'];
       }
-      if (token === playbackId) { playing = false; paused = false; notice('Finished.'); renderPlayer(); }
-    } catch(e) { if (token === playbackId) { stop(false); throw e } }
+      if(token!==playbackId)return;
+      const parsed=parseSegments(message.content,message.name,rules);
+      currentPassages=planSpeech(parsed,snapshot,context);currentSegments=currentPassages.flatMap(p=>p.segments);
+      if(!currentSegments.length){stop(false);notice('There is no readable text in this message.');return}
+      let decodedBytes=0;
+      if(snapshot.provider!=='browser') {
+        const buffers=await prepareAll(currentPassages,async(p,_index,requestSignal)=>{
+          const data=await prepareSpeech(p.segment,p.settings,requestSignal);requestSignal.throwIfAborted();
+          const buffer=await audioPlayer.decode(data);requestSignal.throwIfAborted();
+          decodedBytes+=buffer.length*buffer.numberOfChannels*4;
+          if(decodedBytes>256*1024*1024)throw new Error('This message is too long to hold in memory. Read a shorter message.');
+          return buffer;
+        },signal,count=>{if(token===playbackId){preparedCount=count;notice(`Preparing the whole message · ${count} of ${currentPassages.length} passages ready…`);renderPlayer()}},snapshot.provider==='lumiverse'?3:2);
+        if(token!==playbackId)return;
+        audioPlayer.load(buffers);audioPlayer.setSpeed(settings.speed);audioPlayer.setVolume(settings.volume);
+      }
+      if(token!==playbackId)return;
+      phase='ready';notice('The whole message is ready. Press Play.');renderPlayer();
+      if(autoStart)await playOrPause();
+    } catch(e) {if(token===playbackId){stop(false);throw e}}
   }
   async function preview(voice: string, assignment?: Partial<VoiceAssignment>) {
-    stop(false);
-    const token = playbackId; playing = true;
-    const segment = { text:'The door was open. I took a breath, and stepped into the light.', speaker:'Preview', emotion:assignment?.emotion ?? 'neutral', delivery:assignment?.delivery ?? 'normal' };
-    currentSegments = [segment]; position = 0; renderPlayer(); notice(`Preparing ${voice}…`);
+    stop(false);const token=playbackId;readingAbort=new AbortController();
+    if(settings.provider!=='browser')audioPlayer.unlock();
+    const segment={text:'The door was open. I took a breath, and stepped into the light.',speaker:'Preview',emotion:assignment?.emotion ?? 'neutral',delivery:assignment?.delivery ?? 'normal'};
+    const snapshot=normalizeSettings({...settings,voice,narratorVoice:'',assignments:{},inheritVoices:false});
+    currentPassages=planSpeech([segment],snapshot,{characters:[]});currentSegments=[segment];position=0;phase='preparing';showWidget();renderPlayer();notice(`Preparing ${voice}…`);
     try {
-      if (settings.provider === 'browser') await browserSpeech(segment,undefined,voice);
-      else {
-        const previewSettings = { ...settings, voice, assignments:{} };
-        const data = await prepareSpeech(segment,normalizeSettings(previewSettings));
-        if (token !== playbackId) return;
-        notice(`Listening to ${voice}…`); await audioSpeech(data,token);
+      if(snapshot.provider!=='browser') {
+        const data=await prepareSpeech(currentPassages[0].segment,currentPassages[0].settings,readingAbort.signal);
+        if(token!==playbackId)return;
+        const buffer=await audioPlayer.decode(data);if(token!==playbackId)return;
+        audioPlayer.load([buffer]);audioPlayer.setSpeed(settings.speed);audioPlayer.setVolume(settings.volume);
       }
-      if (token === playbackId) { playing = false; notice(`Preview finished: ${voice}.`); renderPlayer() }
-    } catch(e) { if (token === playbackId) { stop(false); throw e } }
+      if(token!==playbackId)return;phase='ready';await playOrPause();
+    } catch(e) {if(token===playbackId){stop(false);throw e}}
   }
   async function saveSettings() {
-    const r = await rpc('save',{settings}); settings = r.settings; notice('Settings saved.');
+    const r = await rpc('save',{settings}); settings = normalizeSettings(r.settings); notice('Settings saved.');
   }
   function chooseNative(connection:NativeConnection, preserveModel=false) {
     settings.provider='lumiverse';settings.connectionId=connection.id;
@@ -234,28 +309,30 @@ export function setup(ctx: SpindleFrontendContext) {
     await startMessage(r.message);
   }
   function renderPlayer() {
-    player.replaceChildren(el('h3',playing ? 'Now reading' : 'Listen to a passage'));
+    player.replaceChildren(el('h3',phase==='preparing'?'Preparing the whole message':phase==='ready'?'Ready to play':phase==='playing' || phase==='paused'?'Now reading':'Listen to a passage'));
     const row = el('div','', 'ra-row');
-    if (playing) {
-      row.append(button(paused ? 'Resume' : 'Pause',pause,true),button('Stop',()=>stop()));
+    if (phase !== 'idle') {
+      const play=button(phase==='paused'?'Resume':phase==='playing'?'Pause':phase==='finished'?'Replay':'Play',()=>safe(playOrPause),true);play.disabled=phase==='preparing';
+      row.append(play,button('Stop',()=>stop()));
     } else {
-      const read = button('Read message',()=>safe(async()=>{ if (selectedId) await readId(selectedId); else { await refreshMessages(); if (selectedId) await readId(selectedId); else throw new Error('No assistant message found.') } }),true);
+      const read = button('Prepare message',()=>safe(async()=>{ if (selectedId) await readId(selectedId); else { await refreshMessages(); if (selectedId) await readId(selectedId); else throw new Error('No assistant message found.') } }),true);
       read.disabled = !ready; row.append(read,button('Refresh messages',()=>safe(refreshMessages)));
     }
+    if(typeof ctx.ui.createFloatWidget==='function')row.append(button('Floating player',showWidget));
     if (currentMessage) row.append(button('Return to passage',()=>marker.follow()));
     player.append(row);
-    if (!playing && messages.length) player.append(field('Assistant message',select([...messages].reverse().map(m=>({value:m.id,label:`${m.name || 'Assistant'} · ${plainText(stripCues(m.content)).slice(0,70)}`})), selectedId,v=>{selectedId=v})));
+    if (phase==='idle' && messages.length) player.append(field('Assistant message',select([...messages].reverse().map(m=>({value:m.id,label:`${m.name || 'Assistant'} · ${plainText(stripCues(m.content)).slice(0,70)}`})), selectedId,v=>{selectedId=v})));
     if (currentSegments.length) {
-      const segment = currentSegments[position], progress = el('progress'); progress.max = currentSegments.length; progress.value = playing ? position : position+1;
-      player.append(el('p',`${segment?.speaker || 'Voice'} · Sentence ${position+1} of ${currentSegments.length}`,'ra-muted'),progress,el('p',segment?.text ?? '', 'ra-passage'));
-      if (currentMessage) player.append(el('p', markerVisible ? 'The current sentence is highlighted in the passage.' : 'Keep your place here when the message is offscreen or its formatting differs.','ra-muted'));
-    } else player.append(el('p','The current sentence is highlighted while audio plays. Pausing keeps your place.','ra-muted'));
+      const segment = currentSegments[position], progress = el('progress');progress.max=phase==='preparing'?currentPassages.length:currentSegments.length;progress.value=phase==='preparing'?preparedCount:phase==='ready'?0:position+1;
+      player.append(el('p',`${segment?.speaker || 'Voice'} · ${currentPassages[currentPassage]?.voice || ''} · Sentence ${position+1} of ${currentSegments.length}`,'ra-muted'),progress,el('p',segment?.text ?? '', 'ra-passage'));
+      if (currentMessage) player.append(el('p','The sentence marker estimates your place within continuous audio. Pausing keeps it in place.','ra-muted'));
+    } else player.append(el('p','Prepare the whole message, then press Play. Narration and dialogue use their assigned voices.','ra-muted'));
     player.append(toggle('Follow the spoken passage as it moves down the page',settings.follow,v=>{settings.follow=v;void safe(saveSettings)}));
     const slider = el('input'); slider.type='range'; slider.min='.5'; slider.max='2'; slider.step='.1'; slider.value=String(settings.speed);
-    slider.oninput=()=>{settings.speed=Number(slider.value);speedLabel.textContent=`Playback speed · ${settings.speed.toFixed(1)}×`;if(audio)audio.playbackRate=settings.speed};
+    slider.oninput=()=>{settings.speed=Number(slider.value);speedLabel.textContent=`Playback speed · ${settings.speed.toFixed(1)}×`;audioPlayer.setSpeed(settings.speed)};
     slider.onchange=()=>{void safe(saveSettings)}; const speedLabel = el('span',`Playback speed · ${settings.speed.toFixed(1)}×`), speedField = el('label','', 'ra-field');speedField.append(speedLabel,slider);
-    const volume = el('input');volume.type='range';volume.min='0';volume.max='1';volume.step='.05';volume.value=String(settings.volume);volume.oninput=()=>{settings.volume=Number(volume.value);if(audio)audio.volume=settings.volume};volume.onchange=()=>{void safe(saveSettings)};
-    const controls = el('div','', 'ra-grid');controls.append(speedField,field('Volume',volume));player.append(controls);
+    const volume = el('input');volume.type='range';volume.min='0';volume.max='1';volume.step='.05';volume.value=String(settings.volume);volume.oninput=()=>{settings.volume=Number(volume.value);audioPlayer.setVolume(settings.volume)};volume.onchange=()=>{void safe(saveSettings)};
+    const controls = el('div','', 'ra-grid');controls.append(speedField,field('Volume',volume));player.append(controls);renderWidget();
   }
   function renderConfig() {
     config.replaceChildren(el('h3','Speech connection'));
@@ -314,6 +391,8 @@ export function setup(ctx: SpindleFrontendContext) {
     drawList();voicesCard.append(count,search,list);
     if(!names.length)voicesCard.append(el('p','This model has no voice list yet. Refresh models, or enter the voice ID below.','ra-muted'),field('Voice ID',textInput(settings.voice,v=>settings.voice=v)));
     voicesCard.append(field('Narrator voice',voiceSelect(settings.narratorVoice,v=>{settings.narratorVoice=v;void safe(saveSettings)},true)));
+    if(settings.provider==='lumiverse')voicesCard.append(toggle('Use Lumiverse’s saved character and narrator voices when no Readalong voice is assigned',settings.inheritVoices,v=>{settings.inheritVoices=v;void safe(saveSettings)}));
+    voicesCard.append(el('p','Quoted dialogue uses the speaking character; surrounding prose uses the narrator. Speaker cues override this detection. Choose different voices to hear the switch.','ra-muted'));
   }
   function assignmentForm(key: string, name: string, container: HTMLElement) {
     const assignment={...(settings.assignments[key]??{voice:'',emotion:'neutral',delivery:'normal'})};
@@ -325,7 +404,7 @@ export function setup(ctx: SpindleFrontendContext) {
     const actions=el('div','', 'ra-row');actions.append(button('Listen',()=>safe(()=>preview(assignment.voice||settings.voice,assignment))),button('Save voice',()=>safe(update),true),button('Use defaults',()=>safe(async()=>{delete settings.assignments[key];await saveSettings();assignmentForm(key,name,container)})));container.append(actions);
   }
   function renderAssignments() {
-    assignmentsCard.replaceChildren(el('h3','Character voices'),el('p','Assignments use this speech connection. Choose a voice again after changing provider or model.','ra-muted'));
+    assignmentsCard.replaceChildren(el('h3','Character voices'),el('p','Readalong assignments use this speech connection and override inherited Lumiverse voices. Choose a voice again after changing provider or model.','ra-muted'));
     const sub=el('div');let character: {id:string;name:string}|undefined=characters[0];
     if(characters.length)assignmentsCard.append(field('Character',select(characters.map(c=>({value:c.id,label:c.name})),character?.id??'',v=>{character=characters.find(c=>c.id===v);if(character)assignmentForm(`id:${character.id}`,character.name,sub)})));
     assignmentsCard.append(button('Refresh characters',()=>safe(async()=>{const r=await rpc('characters');characters=r.characters;renderAssignments();})),sub);
@@ -355,17 +434,17 @@ export function setup(ctx: SpindleFrontendContext) {
   onEvent('GENERATION_STOPPED',p=>{if(p?.chatId===ctx.getActiveChat().chatId && currentMessage)stop()});
   onEvent('CHARACTER_MESSAGE_RENDERED',()=>decorateMessages());
   cleanups.push(tab.onActivate(()=>{void safe(refreshMessages)}));
-  const action=ctx.ui.registerInputBarAction({id:'readalong',label:'Readalong',subtitle:'Listen and find your place'});cleanups.push(action.onClick(()=>tab.activate()));
+  const action=ctx.ui.registerInputBarAction({id:'readalong',label:'Readalong',subtitle:'Listen and find your place'});cleanups.push(action.onClick(()=>{showWidget();tab.activate()}));
   function installEditor() {
     if(editorTab || !permissions.includes('characters'))return;
-    editorTab=ctx.ui.registerCharacterEditorTab({id:'readalong-voice',title:'Voice'});editorTab.root.classList.add('ra');editorTab.root.dataset.raUi='true';
+    editorTab=ctx.ui.registerCharacterEditorTab({id:'readalong-voice',title:'Readalong voice'});editorTab.root.classList.add('ra');editorTab.root.dataset.raUi='true';
     const render=()=>{const state=ctx.ui.characterEditor.getState();if(state.open&&state.characterId)assignmentForm(`id:${state.characterId}`,characters.find(c=>c.id===state.characterId)?.name??'this character',editorTab!.root)};
     cleanups.push(ctx.ui.characterEditor.onChange(render),editorTab.onActivate(render));render();
   }
   if('speechSynthesis' in window){const refresh=()=>{if(settings.provider==='browser'){renderVoices();renderAssignments()}};speechSynthesis.addEventListener('voiceschanged',refresh);cleanups.push(()=>speechSynthesis.removeEventListener('voiceschanged',refresh))}
   renderPlayer();renderConfig();renderVoices();renderAssignments();ctx.ready();
   void safe(async()=>{
-    const r=await rpc('init');if(disposed)return;settings=r.settings;hasKey=r.hasKey;permissions=r.permissions;ready=true;
+    const r=await rpc('init');if(disposed)return;settings=normalizeSettings(r.settings);hasKey=r.hasKey;permissions=r.permissions;ready=true;
     try {
       nativeConnections=await nativeTts.connections();if(disposed)return;
       const existing=nativeConnections.find(c=>c.provider==='openrouter_tts' && c.model===settings.model) ?? nativeConnections.find(c=>c.provider==='openrouter_tts');
@@ -379,7 +458,7 @@ export function setup(ctx: SpindleFrontendContext) {
     if(permissions.includes('chat_mutation'))await refreshMessages();
   });
   return()=>{
-    stop(false);disposed=true;marker.dispose();for(const fn of cleanups)fn();editorTab?.destroy();action.destroy();tab.destroy();
+    stop(false);disposed=true;marker.dispose();audioPlayer.dispose();widget?.destroy();for(const fn of cleanups)fn();editorTab?.destroy();action.destroy();tab.destroy();
     for(const p of pending.values()){clearTimeout(p.timer);p.reject(new Error('Readalong unloaded.'))}pending.clear();ctx.dom.cleanup();
   };
 }

@@ -6,6 +6,15 @@ const connection:NativeConnection={id:'saved-router',name:'My OpenRouter',provid
 const settings={...DEFAULTS,provider:'lumiverse' as const,connectionId:connection.id};
 const segment={text:'Are you sure?',speaker:'Mara',emotion:'worried',delivery:'whispers'};
 describe('native Lumiverse TTS',()=>{
+  test('native preferences project only narration voice and valid detection rules',async()=>{
+    const calls:any[]=[];const client=createNativeTtsClient((async(url:any,init:any)=>{calls.push({url,init});return Response.json({value:{narrationVoice:{connectionId:'narrator',voice:'Charon',other:'do-not-project'},speechDetectionRules:{quoted:'speech',asterisked:'skip',undecorated:'speech'},sttLanguage:'do-not-project'}})}) as unknown as typeof fetch);
+    expect(await client.preferences()).toEqual({narrationVoice:{connectionId:'narrator',voice:'Charon'},rules:{quoted:'speech',asterisked:'skip',undecorated:'speech'}});
+    expect(calls[0].url).toBe('/api/v1/settings/voiceSettings');expect(calls[0].init.credentials).toBe('include');expect(calls[0].init.method).toBeUndefined();
+  });
+  test('malformed native voice preferences keep safe speech-detection defaults',async()=>{
+    const client=createNativeTtsClient((async()=>Response.json({value:{narrationVoice:{voice:'missing connection'},speechDetectionRules:{quoted:'evil',asterisked:'speech',undecorated:'thought'}}})) as unknown as typeof fetch);
+    expect(await client.preferences()).toEqual({narrationVoice:undefined,rules:{quoted:'speech',asterisked:'narration',undecorated:'narration'}});
+  });
   test('Gemini requests PCM through the saved connection without keys or spoken directions',()=>{
     expect(nativeSpeechRequest(connection,settings,segment)).toEqual({connectionId:'saved-router',model:DEFAULTS.model,text:'Are you sure?',voice:'Kore',parameters:{speed:1},outputFormat:'pcm'});
     expect(nativeSpeechRequest(connection,{...settings,assignments:{'id:mara':{voice:'Puck',emotion:'neutral',delivery:'normal'}}},segment,'mara').voice).toBe('Puck');

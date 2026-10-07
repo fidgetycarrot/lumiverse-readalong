@@ -14,10 +14,20 @@ var DEFAULTS = {
   follow: false,
   promptEmotions: true,
   useEmotions: true,
+  inheritVoices: true,
   speed: 1,
   volume: 0.85,
   assignments: {}
 };
+var DEFAULT_SPEECH_RULES = { quoted: "speech", asterisked: "narration", undecorated: "narration" };
+function readVoiceRef(raw) {
+  if (!raw || typeof raw !== "object")
+    return;
+  const v = raw;
+  if (typeof v.connectionId !== "string" || !v.connectionId || v.connectionId.length > 160)
+    return;
+  return { connectionId: v.connectionId, voice: typeof v.voice === "string" ? v.voice.slice(0, 160) : "" };
+}
 function speakerCharacterId(speaker, characters, fallback) {
   const name = speaker.trim().toLowerCase();
   if (name === "narrator")
@@ -46,6 +56,7 @@ function normalizeSettings(raw) {
     follow: r.follow === true,
     promptEmotions: r.promptEmotions !== false,
     useEmotions: r.useEmotions !== false,
+    inheritVoices: r.inheritVoices !== false,
     speed: clamp(r.speed, 0.5, 2, 1),
     volume: clamp(r.volume, 0, 1, 0.85),
     assignments
@@ -66,31 +77,62 @@ function plainText(text) {
 function splitSentences(text) {
   return Array.from(new Intl.Segmenter(undefined, { granularity: "sentence" }).segment(text), (s) => s.segment.trim()).filter(Boolean).flatMap((s) => s.length <= 650 ? [s] : s.match(/.{1,600}(?:\s|$)|.{1,600}/gu).map((x) => x.trim()).filter(Boolean));
 }
-function parseSegments(raw, defaultSpeaker = "") {
-  raw = raw.replace(/```[^]*?```/g, " ");
+function parseSegments(raw, defaultSpeaker = "", rules = DEFAULT_SPEECH_RULES) {
+  raw = raw.replace(/```[^]*?```/g, " ").replace(/!\[[^\]]*\]\([^)]*\)/g, " ").replace(/\[([^\]]+)\]\([^)]*\)/g, "$1").replace(/<[^>]*>/g, " ").replace(/&quot;/g, '"');
   const cue = new RegExp(`\\[(emotion|delivery|speaker):([^\\]\\r\\n]{1,80})\\]`, "gi");
-  const segments = [];
-  let speaker = defaultSpeaker, emotion = "", delivery = "", offset = 0;
-  const flush = (text) => {
-    for (const sentence of splitSentences(plainText(text)))
-      segments.push({ text: sentence, speaker, emotion, delivery });
-  };
-  for (const m of raw.matchAll(cue)) {
-    flush(raw.slice(offset, m.index));
-    const value = m[2].trim();
-    if (m[1].toLowerCase() === "speaker") {
-      speaker = value;
-      emotion = "";
-      delivery = "";
+  const pieces = [];
+  let speaker = defaultSpeaker, explicitSpeaker = false, emotion = "", delivery = "";
+  const classify = (text, action) => {
+    let offset = 0, prefix = "", appended = false;
+    const append = (prose) => {
+      if (!explicitSpeaker && action === "skip")
+        return;
+      const text = plainText(prose);
+      if (!text)
+        return;
+      if (/^["“”«»]+$/.test(text)) {
+        prefix += text;
+        return;
+      }
+      const chosen = explicitSpeaker ? speaker : action === "narration" ? "narrator" : defaultSpeaker;
+      const value = { text: prefix + text, speaker: chosen, emotion, delivery };
+      prefix = "";
+      appended = true;
+      const last = pieces.at(-1);
+      if (last && last.speaker === value.speaker && last.emotion === emotion && last.delivery === delivery)
+        last.text += " " + value.text;
+      else
+        pieces.push(value);
+    };
+    for (const match of text.matchAll(cue)) {
+      append(text.slice(offset, match.index));
+      const value = match[2].trim(), kind = match[1].toLowerCase();
+      if (kind === "speaker") {
+        speaker = value;
+        explicitSpeaker = true;
+        emotion = "";
+        delivery = "";
+      }
+      if (kind === "emotion")
+        emotion = enumValue(value, EMOTIONS, "neutral");
+      if (kind === "delivery")
+        delivery = enumValue(value, DELIVERIES, "normal");
+      offset = match.index + match[0].length;
     }
-    if (m[1].toLowerCase() === "emotion")
-      emotion = enumValue(value, EMOTIONS, "neutral");
-    if (m[1].toLowerCase() === "delivery")
-      delivery = enumValue(value, DELIVERIES, "normal");
-    offset = m.index + m[0].length;
+    append(text.slice(offset));
+    if (prefix && appended)
+      pieces.at(-1).text += prefix;
+  };
+  const pattern = /"[^"\n]*(?:\n[^"\n]*)*"|“[^”]*”|«[^»]*»|(?<!\*)\*(?!\*)([^*]+)\*(?!\*)/g;
+  const detection = raw.replace(new RegExp(CUE_PATTERN, "gi"), (match) => " ".repeat(match.length));
+  let cursor = 0;
+  for (const match of detection.matchAll(pattern)) {
+    classify(raw.slice(cursor, match.index), rules.undecorated);
+    classify(raw.slice(match.index, match.index + match[0].length), match[1] === undefined ? rules.quoted : rules.asterisked);
+    cursor = match.index + match[0].length;
   }
-  flush(raw.slice(offset));
-  return segments;
+  classify(raw.slice(cursor), rules.undecorated);
+  return pieces.flatMap((piece) => splitSentences(piece.text).map((text) => ({ ...piece, text })));
 }
 function selectVoice(settings, segment, characterId) {
   const byName = settings.assignments[`name:${segment.speaker.toLowerCase()}`];
@@ -125,6 +167,19 @@ function canon(c) {
 function normalizeText(text) {
   return Array.from(text).map(canon).join("").replace(/\s+/g, " ").trim();
 }
+function locateText(text, phrase, cursor = 0) {
+  const exact = normalizeText(phrase);
+  const words = exact.replace(/^["'«»\s]+|["'«»\s]+$/g, "");
+  let closest = null;
+  for (const needle of exact === words ? [exact] : [exact, words]) {
+    if (!needle)
+      continue;
+    const offset = text.indexOf(needle, cursor);
+    if (offset >= 0 && (!closest || offset < closest.offset))
+      closest = { offset, length: needle.length };
+  }
+  return closest;
+}
 function indexText(root) {
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
@@ -156,19 +211,17 @@ function indexText(root) {
   return { text, points };
 }
 function findTextRange(root, phrase, cursor = 0) {
-  const index = indexText(root), needle = normalizeText(phrase);
-  if (!needle)
+  const index = indexText(root), match = locateText(index.text, phrase, cursor);
+  if (!match)
     return null;
-  const at = index.text.indexOf(needle, cursor);
-  if (at < 0)
-    return null;
-  const a = index.points[at], b = index.points[at + needle.length - 1];
+  const { offset: at, length } = match;
+  const a = index.points[at], b = index.points[at + length - 1];
   if (!a || !b)
     return null;
   const range = document.createRange();
   range.setStart(a.node, a.offset);
   range.setEnd(b.node, b.offset + 1);
-  return { range, next: at + needle.length };
+  return { range, next: at + length };
 }
 
 class PassageMarker {
@@ -397,6 +450,17 @@ function createNativeTtsClient(transport = fetch) {
     return data;
   }
   return {
+    async preferences() {
+      const result = await readJson(await request("/settings/voiceSettings"));
+      const value = result.value && typeof result.value === "object" ? result.value : {};
+      const raw = value.speechDetectionRules ?? {}, rules = { ...DEFAULT_SPEECH_RULES };
+      for (const key of ["quoted", "asterisked", "undecorated"]) {
+        const allowed = key === "asterisked" ? ["thought", "narration", "skip"] : ["speech", "narration", "skip"];
+        if (allowed.includes(raw[key]))
+          rules[key] = raw[key];
+      }
+      return { rules, narrationVoice: readVoiceRef(value.narrationVoice) };
+    },
     async connections() {
       const all = [];
       for (let offset = 0;offset < 2000; offset += 200) {
@@ -445,6 +509,241 @@ function createNativeTtsClient(transport = fetch) {
   };
 }
 
+// src/playback-plan.ts
+var MAX_PASSAGE_CHARS = 3000;
+function planSpeech(segments, settings, context) {
+  const passages = [];
+  let previousKey = "";
+  for (const segment of segments) {
+    const characterId = speakerCharacterId(segment.speaker, context.characters, context.characterId);
+    const assignment = selectVoice(settings, segment, characterId);
+    const narrator = segment.speaker.trim().toLowerCase() === "narrator";
+    const explicit = settings.assignments[`name:${segment.speaker.toLowerCase()}`]?.voice || !narrator && characterId && settings.assignments[`id:${characterId}`]?.voice;
+    let snapshot = { ...settings, assignments: {}, narratorVoice: "", voice: assignment.voice };
+    if (settings.provider === "lumiverse" && settings.inheritVoices && !(narrator ? settings.narratorVoice : explicit)) {
+      const speech = readVoiceRef(characterId ? context.overrides?.characters?.[characterId] : undefined) ?? context.characters.find((c) => c.id === characterId)?.ttsVoice;
+      const inherited = narrator ? readVoiceRef(context.overrides?.narrator) ?? context.narrationVoice ?? speech : speech;
+      const connection = context.connections?.find((c) => c.id === inherited?.connectionId);
+      if (connection && inherited)
+        snapshot = { ...snapshot, connectionId: connection.id, model: connection.model || settings.model, voice: inherited.voice || connection.voice || assignment.voice };
+    }
+    const styleSupported = /gemini-3\.1.*tts|gpt-4o-mini-tts/i.test(snapshot.model) && snapshot.provider !== "browser";
+    const emotion = styleSupported ? assignment.emotion : "neutral", delivery = styleSupported ? assignment.delivery : "normal";
+    const key = JSON.stringify([snapshot.provider, snapshot.connectionId, snapshot.model, snapshot.voice, emotion, delivery]);
+    const last = passages.at(-1);
+    if (last && previousKey === key && last.segment.text.length + segment.text.length + 1 <= MAX_PASSAGE_CHARS) {
+      last.segment.text += " " + segment.text;
+      last.segments.push(segment);
+    } else
+      passages.push({ segment: { ...segment, emotion, delivery }, segments: [segment], settings: snapshot, voice: snapshot.voice });
+    previousKey = key;
+  }
+  return passages;
+}
+async function prepareAll(items, prepare, signal, progress, concurrency = 3) {
+  const abort = new AbortController, combined = AbortSignal.any([signal, abort.signal]);
+  const results = new Array(items.length);
+  let next = 0, completed = 0, firstError;
+  const worker = async () => {
+    try {
+      while (next < items.length) {
+        combined.throwIfAborted();
+        const index = next++;
+        results[index] = await prepare(items[index], index, combined);
+        combined.throwIfAborted();
+        progress(++completed);
+      }
+    } catch (error) {
+      if (firstError === undefined)
+        firstError = error;
+      abort.abort();
+      throw error;
+    }
+  };
+  await Promise.allSettled(Array.from({ length: Math.min(Math.max(1, concurrency), items.length) }, worker));
+  if (firstError !== undefined)
+    throw firstError;
+  signal.throwIfAborted();
+  return results;
+}
+function estimatedSentenceIndex(passage, fraction) {
+  const weights = passage.segments.map((s) => Math.max(1, s.text.replace(/[^\p{L}\p{N}]/gu, "").length) + 12 * splitSentences(s.text).length);
+  const target = Math.max(0, Math.min(0.999999, fraction)) * weights.reduce((a, b) => a + b, 0);
+  let sum = 0;
+  for (let i = 0;i < weights.length; i++) {
+    sum += weights[i];
+    if (target < sum)
+      return i;
+  }
+  return weights.length - 1;
+}
+
+// src/playback.ts
+class BufferedPlayer {
+  factory;
+  context = null;
+  gain = null;
+  buffers = [];
+  starts = [];
+  sources = [];
+  offset = 0;
+  anchor = 0;
+  speed = 1;
+  volume = 0.85;
+  running = false;
+  generation = 0;
+  primed = false;
+  onEnded = () => {};
+  constructor(factory = () => {
+    const Constructor = window.AudioContext ?? window.webkitAudioContext;
+    if (!Constructor)
+      throw new Error("This browser does not support continuous audio playback. Try Browser voices.");
+    return new Constructor;
+  }) {
+    this.factory = factory;
+  }
+  ensure() {
+    if (!this.context) {
+      this.context = this.factory();
+      this.gain = this.context.createGain();
+      this.gain.gain.value = this.volume;
+      this.gain.connect(this.context.destination);
+    }
+    return this.context;
+  }
+  unlock() {
+    const c = this.ensure();
+    c.resume().catch(() => {});
+    if (this.primed)
+      return;
+    const source = c.createBufferSource();
+    source.buffer = c.createBuffer(1, 1, c.sampleRate);
+    source.connect(this.gain);
+    source.start();
+    this.primed = true;
+  }
+  async decode(data) {
+    const bytes = data.bytes ?? Uint8Array.from(atob(data.audio), (c) => c.charCodeAt(0));
+    try {
+      const buffer = await this.ensure().decodeAudioData(bytes.slice().buffer);
+      if (!Number.isFinite(buffer.duration) || buffer.duration <= 0)
+        throw new Error;
+      return buffer;
+    } catch {
+      throw new Error("The speech provider returned audio this browser cannot play.");
+    }
+  }
+  load(buffers) {
+    this.clear();
+    let offset = 0;
+    this.buffers = buffers;
+    this.starts = buffers.map((b) => {
+      const start = offset;
+      offset += b.duration;
+      return start;
+    });
+  }
+  get duration() {
+    return this.buffers.reduce((sum, b) => sum + b.duration, 0);
+  }
+  get elapsed() {
+    return Math.min(this.duration, this.offset + (this.running ? Math.max(0, this.ensure().currentTime - this.anchor) * this.speed : 0));
+  }
+  get position() {
+    const elapsed = this.elapsed;
+    let index = 0;
+    while (index + 1 < this.starts.length && this.starts[index + 1] <= elapsed + 0.0000001)
+      index++;
+    const seconds = Math.max(0, elapsed - (this.starts[index] ?? 0)), duration = this.buffers[index]?.duration ?? 0;
+    return { index, seconds, fraction: duration ? Math.min(1, seconds / duration) : 0, elapsed, duration: this.duration };
+  }
+  unschedule() {
+    for (const source of this.sources) {
+      source.onended = null;
+      try {
+        source.stop();
+      } catch {}
+      source.disconnect();
+    }
+    this.sources = [];
+  }
+  schedule() {
+    const c = this.ensure(), generation = ++this.generation;
+    this.anchor = c.currentTime + 0.025;
+    this.running = true;
+    for (let i = 0;i < this.buffers.length; i++) {
+      const buffer = this.buffers[i], start = this.starts[i], end = start + buffer.duration;
+      if (end <= this.offset)
+        continue;
+      const source = c.createBufferSource();
+      source.buffer = buffer;
+      source.playbackRate.value = this.speed;
+      source.connect(this.gain);
+      if (i === this.buffers.length - 1)
+        source.onended = () => {
+          if (generation !== this.generation)
+            return;
+          this.offset = this.duration;
+          this.running = false;
+          this.unschedule();
+          this.onEnded();
+        };
+      this.sources.push(source);
+      source.start(this.anchor + Math.max(0, start - this.offset) / this.speed, Math.max(0, this.offset - start));
+    }
+  }
+  async play() {
+    if (!this.buffers.length)
+      throw new Error("Prepare a message first.");
+    const generation = this.generation, c = this.ensure();
+    await c.resume();
+    if (generation !== this.generation)
+      return false;
+    if (c.state !== "running")
+      throw new Error("Press Play to allow audio.");
+    if (this.running)
+      return true;
+    if (this.offset >= this.duration)
+      this.offset = 0;
+    this.schedule();
+    return true;
+  }
+  pause() {
+    this.offset = this.elapsed;
+    this.running = false;
+    this.generation++;
+    this.unschedule();
+  }
+  setSpeed(speed) {
+    const running = this.running;
+    this.pause();
+    this.speed = Math.max(0.5, Math.min(2, speed));
+    if (running)
+      this.schedule();
+  }
+  setVolume(volume) {
+    this.volume = Math.max(0, Math.min(1, volume));
+    if (this.gain)
+      this.gain.gain.value = this.volume;
+  }
+  rewind() {
+    this.pause();
+    this.offset = 0;
+  }
+  clear() {
+    this.pause();
+    this.offset = 0;
+    this.buffers = [];
+    this.starts = [];
+  }
+  dispose() {
+    this.clear();
+    this.context?.close().catch(() => {});
+    this.context = null;
+    this.gain = null;
+  }
+}
+
 // src/frontend.ts
 var STYLE = `
 ::highlight(lumiverse-readalong){background:rgba(245,190,80,.30);color:inherit;text-decoration:underline;text-decoration-color:#e7b24c;text-decoration-thickness:2px;}
@@ -464,6 +763,11 @@ var STYLE = `
 .ra progress{width:100%;height:5px;accent-color:#e7b24c}.ra .ra-voice-list{display:flex;gap:7px;flex-wrap:wrap;max-height:240px;overflow:auto;padding:4px 0;}
 .ra .ra-voice-list button{padding:6px 10px;font-size:12px}.ra .ra-voice-list button[aria-pressed=true]{border-color:#e7b24c;background:rgba(245,190,80,.12)}
 .ra-bubble{display:flex;gap:8px;align-items:center;padding:5px 0;font-size:12px}.ra-bubble button{padding:5px 9px;font-size:12px;}.ra details>summary{cursor:pointer;font-size:13px;margin:8px 0;}
+.ra-mini{font:13px/1.4 system-ui,sans-serif;color:var(--lumiverse-text,#eee);padding:12px;background:var(--lumiverse-bg,#202026);height:100%;box-sizing:border-box;}
+.ra-mini .ra-row{display:flex;gap:7px;align-items:center}.ra-mini .ra-caption{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin:7px 0;color:var(--lumiverse-text-muted,#aaa);}
+.ra-mini button{font:inherit;border:1px solid var(--lumiverse-border,#555);border-radius:7px;background:var(--lumiverse-fill,#292932);color:inherit;padding:6px 10px;cursor:pointer;}
+.ra-mini button:disabled{opacity:.5;cursor:default}.ra-mini .ra-primary{background:var(--lumiverse-primary,#ac8b4f);color:var(--lumiverse-on-primary,#fff);}
+.ra-mini .ra-close{margin-left:auto;padding:2px 7px;}.ra-mini progress{width:100%;height:4px;accent-color:#e7b24c;}
 `;
 function el(tag, text = "", className = "") {
   const node = document.createElement(tag);
@@ -512,6 +816,10 @@ function toggle(label, value, change) {
   row.append(i, el("span", label));
   return row;
 }
+function timeLabel(seconds) {
+  const value = Math.floor(seconds);
+  return `${Math.floor(value / 60)}:${String(value % 60).padStart(2, "0")}`;
+}
 function setup(ctx) {
   let settings = normalizeSettings(DEFAULTS), hasKey = false, ready = false, disposed = false;
   let canDiagnoseSpeech = false, diagnosing = false, diagnoseButton = null;
@@ -522,11 +830,30 @@ function setup(ctx) {
   let characters = [], permissions = [];
   let messages = [], selectedId = "";
   let playbackId = 0, playing = false, paused = false, currentMessage = null;
-  let audio = null, utterance = null, audioUrl = "";
-  let currentSegments = [], position = 0, markerVisible = false;
+  let phase = "idle";
+  let utterance = null;
+  const audioPlayer = new BufferedPlayer;
+  let currentPassages = [], preparedCount = 0, currentPassage = 0;
+  let readingAbort = null, clockTimer = null;
+  let browserQueueActive = false, browserResume = null;
+  let widget = null;
+  let currentSegments = [], position = 0, markedPosition = -1;
   let playbackSettler = null;
   const pending = new Map;
   const cleanups = [], bubbleHandles = new Map;
+  const primeAudio = () => {
+    try {
+      audioPlayer.unlock();
+      removePrimer();
+    } catch {}
+  };
+  const removePrimer = () => {
+    document.removeEventListener("pointerdown", primeAudio, true);
+    document.removeEventListener("keydown", primeAudio, true);
+  };
+  document.addEventListener("pointerdown", primeAudio, { capture: true, passive: true });
+  document.addEventListener("keydown", primeAudio, true);
+  cleanups.push(removePrimer);
   let editorTab = null;
   const tab = ctx.ui.registerDrawerTab({ id: "readalong", title: "Readalong", shortName: "Read", description: "Listen to passages, assign character voices, and follow the spoken text", keywords: ["tts", "voice", "speech", "audio"] });
   const root = tab.root;
@@ -544,6 +871,7 @@ function setup(ctx) {
     if (!disposed) {
       status.textContent = text;
       status.classList.toggle("ra-error", error);
+      renderWidget();
     }
   }
   async function safe(work) {
@@ -586,15 +914,13 @@ function setup(ctx) {
         p.reject(new Error(payload.error));
       else
         p.resolve(payload.data);
-    } else if (payload?.type === "new_message" && ready && settings.autoPlay && payload.chatId === ctx.getActiveChat().chatId && !playing) {
+    } else if (payload?.type === "new_message" && ready && settings.autoPlay && payload.chatId === ctx.getActiveChat().chatId && (phase === "idle" || phase === "finished")) {
       safe(async () => {
-        await startMessage(payload.message);
+        await startMessage(payload.message, true);
       });
     }
   }));
-  const marker = new PassageMarker((v) => {
-    markerVisible = v;
-  });
+  const marker = new PassageMarker(() => {});
   function voiceNames() {
     if (settings.provider === "browser")
       return "speechSynthesis" in window ? speechSynthesis.getVoices().map((v) => v.name) : [];
@@ -612,173 +938,326 @@ function setup(ctx) {
     const bubble = ctx.dom.findMessageElement(messageId);
     return bubble?.querySelector('[data-component="MessageContent"]') ?? bubble;
   }
+  function stopClock() {
+    if (clockTimer)
+      clearInterval(clockTimer);
+    clockTimer = null;
+  }
   function stop(showStatus = true) {
     playbackId++;
     playing = false;
     paused = false;
+    phase = "idle";
+    stopClock();
+    readingAbort?.abort();
+    readingAbort = null;
     for (const controller of nativeRequests)
       controller.abort();
     nativeRequests.clear();
-    if (audio) {
-      audio.pause();
-      audio.removeAttribute("src");
-      audio.load();
-      audio = null;
-    }
+    audioPlayer.clear();
+    browserResume?.();
+    browserResume = null;
+    browserQueueActive = false;
     if (utterance) {
       speechSynthesis.cancel();
       utterance = null;
     }
     playbackSettler?.();
     playbackSettler = null;
-    if (audioUrl) {
-      URL.revokeObjectURL(audioUrl);
-      audioUrl = "";
-    }
     marker.reset();
     currentMessage = null;
     currentSegments = [];
+    currentPassages = [];
+    preparedCount = 0;
     position = 0;
+    markedPosition = -1;
+    currentPassage = 0;
     rpc("cancel").catch(() => {});
     renderPlayer();
     if (showStatus)
       notice("Stopped.");
   }
-  function pause() {
-    if (!playing)
+  function showWidget() {
+    if (!widget && typeof ctx.ui.createFloatWidget === "function") {
+      const width = Math.min(320, Math.max(240, window.innerWidth - 24));
+      widget = ctx.ui.createFloatWidget({ width, height: 146, initialPosition: { x: Math.max(12, window.innerWidth - width - 24), y: Math.max(12, window.innerHeight - 220) }, snapToEdge: true, tooltip: "Readalong · drag to move" });
+      widget.root.classList.add("ra-mini");
+      widget.root.dataset.raUi = "true";
+      widget.root.setAttribute("aria-label", "Readalong floating player");
+    }
+    widget?.setVisible(true);
+    renderWidget();
+  }
+  function renderWidget() {
+    if (!widget || disposed)
       return;
-    paused = !paused;
-    if (paused) {
-      audio?.pause();
-      if (utterance)
-        speechSynthesis.pause();
-    } else {
-      if (audio)
-        audio.play().catch(() => notice("Press Play to allow audio.", true));
-      if (utterance)
-        speechSynthesis.resume();
+    const header = el("div", "", "ra-row");
+    header.append(el("strong", "Readalong"));
+    if (audioPlayer.duration) {
+      const time = el("span", `${timeLabel(audioPlayer.elapsed)} / ${timeLabel(audioPlayer.duration)}`, "ra-time");
+      header.append(time);
+    }
+    const close = button("×", () => widget?.setVisible(false));
+    close.className = "ra-close";
+    close.setAttribute("aria-label", "Hide floating player");
+    header.append(close);
+    const caption = el("p", phase === "playing" || phase === "paused" ? `${currentSegments[position]?.speaker || "Voice"} · ${currentPassages[currentPassage]?.voice || ""}` : status.textContent ?? "Choose a message.", "ra-caption");
+    caption.title = currentSegments[position]?.text ?? caption.textContent ?? "";
+    const controls = el("div", "", "ra-row");
+    const play = button(phase === "paused" ? "Resume" : phase === "playing" ? "Pause" : phase === "finished" ? "Replay" : "Play", () => safe(playOrPause), true);
+    play.disabled = phase === "preparing" || phase === "idle";
+    controls.append(play);
+    const stopButton = button("Stop", () => stop());
+    stopButton.disabled = phase === "idle";
+    controls.append(stopButton, button("Open player", () => tab.activate()));
+    const progress = el("progress");
+    progress.max = 1;
+    progress.value = phase === "preparing" ? preparedCount / Math.max(1, currentPassages.length) : phase === "finished" ? 1 : phase === "ready" ? 0 : audioPlayer.duration ? audioPlayer.elapsed / audioPlayer.duration : position / Math.max(1, currentSegments.length);
+    progress.setAttribute("aria-label", phase === "preparing" ? "Speech preparation" : "Playback progress");
+    widget.root.replaceChildren(header, caption, controls, progress);
+  }
+  function markSentence(passageIndex, sentenceIndex) {
+    const next = currentPassages.slice(0, passageIndex).reduce((sum, p) => sum + p.segments.length, 0) + sentenceIndex;
+    if (next === markedPosition && currentPassage === passageIndex)
+      return;
+    currentPassage = passageIndex;
+    position = next;
+    markedPosition = next;
+    if (currentMessage) {
+      marker.mark(() => contentRoot(currentMessage.id), currentSegments[position].text);
+      if (settings.follow)
+        marker.follow();
     }
     renderPlayer();
   }
-  function browserSpeech(segment, characterId, previewVoice) {
+  function updateClock() {
+    if (phase !== "playing")
+      return;
+    const at = audioPlayer.position, passage = currentPassages[at.index];
+    if (passage)
+      markSentence(at.index, estimatedSentenceIndex(passage, at.fraction));
+    const progress = widget?.root.querySelector("progress");
+    if (progress)
+      progress.value = at.duration ? at.elapsed / at.duration : 0;
+    const time = widget?.root.querySelector(".ra-time");
+    if (time)
+      time.textContent = `${timeLabel(at.elapsed)} / ${timeLabel(at.duration)}`;
+  }
+  function finished() {
+    playing = false;
+    paused = false;
+    phase = "finished";
+    stopClock();
+    if (currentPassages.length)
+      markSentence(currentPassages.length - 1, currentPassages.at(-1).segments.length - 1);
+    notice(currentPassages[0]?.settings.provider === "browser" ? "Finished. Replay reads this passage again." : "Finished. Replay uses the prepared audio.");
+    renderPlayer();
+  }
+  audioPlayer.onEnded = finished;
+  async function playOrPause() {
+    if (phase === "preparing" || phase === "idle")
+      return;
+    if (phase === "playing") {
+      if (browserQueueActive)
+        speechSynthesis.pause();
+      else {
+        updateClock();
+        audioPlayer.pause();
+      }
+      paused = true;
+      playing = false;
+      phase = "paused";
+      stopClock();
+      notice("Paused. Your place is saved.");
+      renderPlayer();
+      return;
+    }
+    const token = playbackId;
+    if (phase === "paused" && browserQueueActive) {
+      speechSynthesis.resume();
+      paused = false;
+      playing = true;
+      phase = "playing";
+      browserResume?.();
+      browserResume = null;
+      notice("Reading…");
+      renderPlayer();
+      return;
+    }
+    if (phase === "finished") {
+      marker.reset();
+      position = 0;
+      markedPosition = -1;
+      currentPassage = 0;
+      audioPlayer.rewind();
+    }
+    paused = false;
+    if (currentPassages[0]?.settings.provider === "browser") {
+      playing = true;
+      phase = "playing";
+      browserQueueActive = true;
+      notice("Reading…");
+      renderPlayer();
+      try {
+        for (let i = 0;i < currentPassages.length && token === playbackId; i++) {
+          if (paused)
+            await new Promise((resolve) => browserResume = resolve);
+          if (token !== playbackId)
+            return;
+          markSentence(i, 0);
+          await browserSpeech(currentPassages[i], token, i);
+        }
+        if (token === playbackId) {
+          browserQueueActive = false;
+          finished();
+        }
+      } catch (e) {
+        if (token === playbackId) {
+          stop(false);
+          throw e;
+        }
+      }
+      return;
+    }
+    audioPlayer.unlock();
+    const started = await audioPlayer.play();
+    if (token !== playbackId || !started)
+      return;
+    playing = true;
+    phase = "playing";
+    notice("Reading…");
+    updateClock();
+    renderPlayer();
+    stopClock();
+    clockTimer = setInterval(updateClock, 100);
+  }
+  function browserSpeech(passage, token, passageIndex) {
     return new Promise((resolve, reject) => {
       if (!("speechSynthesis" in window)) {
         reject(new Error("Browser voices are unavailable in this browser."));
         return;
       }
-      const u = new SpeechSynthesisUtterance(segment.text);
+      const u = new SpeechSynthesisUtterance(passage.segment.text);
       utterance = u;
-      const voice = previewVoice ?? selectVoice(settings, segment, characterId).voice;
-      u.voice = speechSynthesis.getVoices().find((v) => v.name === voice) ?? null;
+      u.voice = speechSynthesis.getVoices().find((v) => v.name === passage.voice) ?? null;
       u.rate = settings.speed;
       u.volume = settings.volume;
       playbackSettler = resolve;
+      u.onboundary = (e) => {
+        if (token !== playbackId || phase !== "playing")
+          return;
+        let end = 0;
+        for (let i = 0;i < passage.segments.length; i++) {
+          end += passage.segments[i].text.length + 1;
+          if (e.charIndex < end) {
+            markSentence(passageIndex, i);
+            break;
+          }
+        }
+      };
+      const finish = () => {
+        if (utterance === u) {
+          utterance = null;
+          playbackSettler = null;
+        }
+      };
       u.onend = () => {
-        utterance = null;
-        playbackSettler = null;
+        finish();
         resolve();
       };
       u.onerror = (e) => {
-        utterance = null;
-        playbackSettler = null;
-        e.error === "canceled" || e.error === "interrupted" ? resolve() : reject(new Error(`Browser speech failed: ${e.error}`));
+        finish();
+        if (token === playbackId && e.error !== "canceled" && e.error !== "interrupted")
+          reject(new Error(`Browser speech failed: ${e.error}`));
+        else
+          resolve();
       };
       speechSynthesis.speak(u);
-    });
-  }
-  function audioSpeech(data, token) {
-    if (token !== playbackId)
-      return Promise.resolve();
-    const bytes = data.bytes ?? Uint8Array.from(atob(data.audio), (c) => c.charCodeAt(0));
-    audioUrl = URL.createObjectURL(new Blob([bytes], { type: data.mime }));
-    audio = new Audio(audioUrl);
-    audio.playbackRate = settings.speed;
-    audio.volume = settings.volume;
-    const a = audio;
-    return new Promise((resolve, reject) => {
-      playbackSettler = resolve;
-      const finish = () => {
-        if (audio === a)
-          audio = null;
-        playbackSettler = null;
-        a.onended = null;
-        a.onerror = null;
-        URL.revokeObjectURL(a.src);
-        audioUrl = "";
-        resolve();
-      };
-      a.onended = finish;
-      a.onerror = () => {
-        finish();
-        reject(new Error("The speech provider returned audio this browser cannot play."));
-      };
-      if (!paused)
-        a.play().catch(() => {
-          finish();
-          reject(new Error("Audio was blocked. Press Read again to allow playback."));
-        });
     });
   }
   function activeNative(id = settings.connectionId) {
     return nativeConnections.find((c) => c.id === id);
   }
-  async function prepareSpeech(segment, snapshot, characterId) {
+  async function prepareSpeech(segment, snapshot, signal) {
+    signal?.throwIfAborted();
     if (snapshot.provider !== "lumiverse")
-      return rpc("speech", { segment, characterId, previewSettings: snapshot });
+      return rpc("speech", { segment, previewSettings: snapshot });
     const connection = activeNative(snapshot.connectionId);
     if (!connection)
       throw new Error("Choose a saved Lumiverse TTS connection first. Add one in Lumiverse’s voice settings if the list is empty.");
     const controller = new AbortController;
     nativeRequests.add(controller);
     try {
-      return await nativeTts.speech(connection, snapshot, segment, characterId, AbortSignal.any([controller.signal, AbortSignal.timeout(70000)]));
+      return await nativeTts.speech(connection, snapshot, segment, undefined, AbortSignal.any([controller.signal, AbortSignal.timeout(70000), ...signal ? [signal] : []]));
     } finally {
       nativeRequests.delete(controller);
     }
   }
-  async function startMessage(message) {
+  async function startMessage(message, autoStart = false) {
     stop(false);
-    currentMessage = { ...message, characterId: message.characterId ?? speakerCharacterId(message.name, characters, ctx.getActiveChat().characterId ?? undefined) };
-    currentSegments = parseSegments(message.content, message.name);
-    if (!currentSegments.length) {
-      notice("There is no readable text in this message.");
-      return;
-    }
     const token = playbackId;
-    playing = true;
-    paused = false;
-    marker.reset();
+    readingAbort = new AbortController;
+    const signal = readingAbort.signal;
+    currentMessage = { ...message, characterId: message.characterId ?? speakerCharacterId(message.name, characters, ctx.getActiveChat().characterId ?? undefined) };
+    phase = "preparing";
+    preparedCount = 0;
+    showWidget();
+    notice("Preparing the whole message…");
     renderPlayer();
     try {
-      const settingsSnapshot = normalizeSettings(settings);
-      const prepare = (i) => prepareSpeech(currentSegments[i], settingsSnapshot, speakerCharacterId(currentSegments[i].speaker, characters, currentMessage?.characterId));
-      let prepared = settings.provider !== "browser" ? prepare(0) : null;
-      for (let i = 0;i < currentSegments.length && token === playbackId; i++) {
-        position = i;
-        const segment = currentSegments[i];
-        notice(settings.provider === "browser" ? "Reading…" : "Preparing speech…");
-        renderPlayer();
-        const data = prepared ? await prepared : null;
+      const snapshot = normalizeSettings(settings);
+      const context = { characters, characterId: currentMessage.characterId, connections: nativeConnections };
+      let rules;
+      if (snapshot.provider === "lumiverse") {
+        const results = await Promise.allSettled([nativeTts.preferences(), ctx.chats.getActive?.() ?? Promise.resolve(null)]);
+        if (results[0].status === "fulfilled") {
+          rules = results[0].value.rules;
+          context.narrationVoice = results[0].value.narrationVoice;
+        }
+        if (results[1].status === "fulfilled")
+          context.overrides = results[1].value?.metadata?.voiceOverrides;
+      }
+      if (token !== playbackId)
+        return;
+      const parsed = parseSegments(message.content, message.name, rules);
+      currentPassages = planSpeech(parsed, snapshot, context);
+      currentSegments = currentPassages.flatMap((p) => p.segments);
+      if (!currentSegments.length) {
+        stop(false);
+        notice("There is no readable text in this message.");
+        return;
+      }
+      let decodedBytes = 0;
+      if (snapshot.provider !== "browser") {
+        const buffers = await prepareAll(currentPassages, async (p, _index, requestSignal) => {
+          const data = await prepareSpeech(p.segment, p.settings, requestSignal);
+          requestSignal.throwIfAborted();
+          const buffer = await audioPlayer.decode(data);
+          requestSignal.throwIfAborted();
+          decodedBytes += buffer.length * buffer.numberOfChannels * 4;
+          if (decodedBytes > 256 * 1024 * 1024)
+            throw new Error("This message is too long to hold in memory. Read a shorter message.");
+          return buffer;
+        }, signal, (count) => {
+          if (token === playbackId) {
+            preparedCount = count;
+            notice(`Preparing the whole message · ${count} of ${currentPassages.length} passages ready…`);
+            renderPlayer();
+          }
+        }, snapshot.provider === "lumiverse" ? 3 : 2);
         if (token !== playbackId)
           return;
-        prepared = settings.provider !== "browser" && i + 1 < currentSegments.length ? prepare(i + 1) : null;
-        prepared?.catch(() => {});
-        marker.mark(() => contentRoot(message.id), segment.text);
-        if (settings.follow)
-          marker.follow();
-        notice("Reading…");
-        renderPlayer();
-        if (data)
-          await audioSpeech(data, token);
-        else
-          await browserSpeech(segment, speakerCharacterId(segment.speaker, characters, currentMessage?.characterId));
+        audioPlayer.load(buffers);
+        audioPlayer.setSpeed(settings.speed);
+        audioPlayer.setVolume(settings.volume);
       }
-      if (token === playbackId) {
-        playing = false;
-        paused = false;
-        notice("Finished.");
-        renderPlayer();
-      }
+      if (token !== playbackId)
+        return;
+      phase = "ready";
+      notice("The whole message is ready. Press Play.");
+      renderPlayer();
+      if (autoStart)
+        await playOrPause();
     } catch (e) {
       if (token === playbackId) {
         stop(false);
@@ -789,28 +1268,34 @@ function setup(ctx) {
   async function preview(voice, assignment) {
     stop(false);
     const token = playbackId;
-    playing = true;
+    readingAbort = new AbortController;
+    if (settings.provider !== "browser")
+      audioPlayer.unlock();
     const segment = { text: "The door was open. I took a breath, and stepped into the light.", speaker: "Preview", emotion: assignment?.emotion ?? "neutral", delivery: assignment?.delivery ?? "normal" };
+    const snapshot = normalizeSettings({ ...settings, voice, narratorVoice: "", assignments: {}, inheritVoices: false });
+    currentPassages = planSpeech([segment], snapshot, { characters: [] });
     currentSegments = [segment];
     position = 0;
+    phase = "preparing";
+    showWidget();
     renderPlayer();
     notice(`Preparing ${voice}…`);
     try {
-      if (settings.provider === "browser")
-        await browserSpeech(segment, undefined, voice);
-      else {
-        const previewSettings = { ...settings, voice, assignments: {} };
-        const data = await prepareSpeech(segment, normalizeSettings(previewSettings));
+      if (snapshot.provider !== "browser") {
+        const data = await prepareSpeech(currentPassages[0].segment, currentPassages[0].settings, readingAbort.signal);
         if (token !== playbackId)
           return;
-        notice(`Listening to ${voice}…`);
-        await audioSpeech(data, token);
+        const buffer = await audioPlayer.decode(data);
+        if (token !== playbackId)
+          return;
+        audioPlayer.load([buffer]);
+        audioPlayer.setSpeed(settings.speed);
+        audioPlayer.setVolume(settings.volume);
       }
-      if (token === playbackId) {
-        playing = false;
-        notice(`Preview finished: ${voice}.`);
-        renderPlayer();
-      }
+      if (token !== playbackId)
+        return;
+      phase = "ready";
+      await playOrPause();
     } catch (e) {
       if (token === playbackId) {
         stop(false);
@@ -820,7 +1305,7 @@ function setup(ctx) {
   }
   async function saveSettings() {
     const r = await rpc("save", { settings });
-    settings = r.settings;
+    settings = normalizeSettings(r.settings);
     notice("Settings saved.");
   }
   function chooseNative(connection, preserveModel = false) {
@@ -902,12 +1387,14 @@ function setup(ctx) {
     await startMessage(r.message);
   }
   function renderPlayer() {
-    player.replaceChildren(el("h3", playing ? "Now reading" : "Listen to a passage"));
+    player.replaceChildren(el("h3", phase === "preparing" ? "Preparing the whole message" : phase === "ready" ? "Ready to play" : phase === "playing" || phase === "paused" ? "Now reading" : "Listen to a passage"));
     const row = el("div", "", "ra-row");
-    if (playing) {
-      row.append(button(paused ? "Resume" : "Pause", pause, true), button("Stop", () => stop()));
+    if (phase !== "idle") {
+      const play = button(phase === "paused" ? "Resume" : phase === "playing" ? "Pause" : phase === "finished" ? "Replay" : "Play", () => safe(playOrPause), true);
+      play.disabled = phase === "preparing";
+      row.append(play, button("Stop", () => stop()));
     } else {
-      const read = button("Read message", () => safe(async () => {
+      const read = button("Prepare message", () => safe(async () => {
         if (selectedId)
           await readId(selectedId);
         else {
@@ -921,22 +1408,24 @@ function setup(ctx) {
       read.disabled = !ready;
       row.append(read, button("Refresh messages", () => safe(refreshMessages)));
     }
+    if (typeof ctx.ui.createFloatWidget === "function")
+      row.append(button("Floating player", showWidget));
     if (currentMessage)
       row.append(button("Return to passage", () => marker.follow()));
     player.append(row);
-    if (!playing && messages.length)
+    if (phase === "idle" && messages.length)
       player.append(field("Assistant message", select([...messages].reverse().map((m) => ({ value: m.id, label: `${m.name || "Assistant"} · ${plainText(stripCues(m.content)).slice(0, 70)}` })), selectedId, (v) => {
         selectedId = v;
       })));
     if (currentSegments.length) {
       const segment = currentSegments[position], progress = el("progress");
-      progress.max = currentSegments.length;
-      progress.value = playing ? position : position + 1;
-      player.append(el("p", `${segment?.speaker || "Voice"} · Sentence ${position + 1} of ${currentSegments.length}`, "ra-muted"), progress, el("p", segment?.text ?? "", "ra-passage"));
+      progress.max = phase === "preparing" ? currentPassages.length : currentSegments.length;
+      progress.value = phase === "preparing" ? preparedCount : phase === "ready" ? 0 : position + 1;
+      player.append(el("p", `${segment?.speaker || "Voice"} · ${currentPassages[currentPassage]?.voice || ""} · Sentence ${position + 1} of ${currentSegments.length}`, "ra-muted"), progress, el("p", segment?.text ?? "", "ra-passage"));
       if (currentMessage)
-        player.append(el("p", markerVisible ? "The current sentence is highlighted in the passage." : "Keep your place here when the message is offscreen or its formatting differs.", "ra-muted"));
+        player.append(el("p", "The sentence marker estimates your place within continuous audio. Pausing keeps it in place.", "ra-muted"));
     } else
-      player.append(el("p", "The current sentence is highlighted while audio plays. Pausing keeps your place.", "ra-muted"));
+      player.append(el("p", "Prepare the whole message, then press Play. Narration and dialogue use their assigned voices.", "ra-muted"));
     player.append(toggle("Follow the spoken passage as it moves down the page", settings.follow, (v) => {
       settings.follow = v;
       safe(saveSettings);
@@ -950,8 +1439,7 @@ function setup(ctx) {
     slider.oninput = () => {
       settings.speed = Number(slider.value);
       speedLabel.textContent = `Playback speed · ${settings.speed.toFixed(1)}×`;
-      if (audio)
-        audio.playbackRate = settings.speed;
+      audioPlayer.setSpeed(settings.speed);
     };
     slider.onchange = () => {
       safe(saveSettings);
@@ -966,8 +1454,7 @@ function setup(ctx) {
     volume.value = String(settings.volume);
     volume.oninput = () => {
       settings.volume = Number(volume.value);
-      if (audio)
-        audio.volume = settings.volume;
+      audioPlayer.setVolume(settings.volume);
     };
     volume.onchange = () => {
       safe(saveSettings);
@@ -975,6 +1462,7 @@ function setup(ctx) {
     const controls = el("div", "", "ra-grid");
     controls.append(speedField, field("Volume", volume));
     player.append(controls);
+    renderWidget();
   }
   function renderConfig() {
     config.replaceChildren(el("h3", "Speech connection"));
@@ -1150,6 +1638,12 @@ function setup(ctx) {
       settings.narratorVoice = v;
       safe(saveSettings);
     }, true)));
+    if (settings.provider === "lumiverse")
+      voicesCard.append(toggle("Use Lumiverse’s saved character and narrator voices when no Readalong voice is assigned", settings.inheritVoices, (v) => {
+        settings.inheritVoices = v;
+        safe(saveSettings);
+      }));
+    voicesCard.append(el("p", "Quoted dialogue uses the speaking character; surrounding prose uses the narrator. Speaker cues override this detection. Choose different voices to hear the switch.", "ra-muted"));
   }
   function assignmentForm(key, name, container) {
     const assignment = { ...settings.assignments[key] ?? { voice: "", emotion: "neutral", delivery: "normal" } };
@@ -1173,7 +1667,7 @@ function setup(ctx) {
     container.append(actions);
   }
   function renderAssignments() {
-    assignmentsCard.replaceChildren(el("h3", "Character voices"), el("p", "Assignments use this speech connection. Choose a voice again after changing provider or model.", "ra-muted"));
+    assignmentsCard.replaceChildren(el("h3", "Character voices"), el("p", "Readalong assignments use this speech connection and override inherited Lumiverse voices. Choose a voice again after changing provider or model.", "ra-muted"));
     const sub = el("div");
     let character = characters[0];
     if (characters.length)
@@ -1248,11 +1742,14 @@ function setup(ctx) {
     safe(refreshMessages);
   }));
   const action = ctx.ui.registerInputBarAction({ id: "readalong", label: "Readalong", subtitle: "Listen and find your place" });
-  cleanups.push(action.onClick(() => tab.activate()));
+  cleanups.push(action.onClick(() => {
+    showWidget();
+    tab.activate();
+  }));
   function installEditor() {
     if (editorTab || !permissions.includes("characters"))
       return;
-    editorTab = ctx.ui.registerCharacterEditorTab({ id: "readalong-voice", title: "Voice" });
+    editorTab = ctx.ui.registerCharacterEditorTab({ id: "readalong-voice", title: "Readalong voice" });
     editorTab.root.classList.add("ra");
     editorTab.root.dataset.raUi = "true";
     const render = () => {
@@ -1282,7 +1779,7 @@ function setup(ctx) {
     const r = await rpc("init");
     if (disposed)
       return;
-    settings = r.settings;
+    settings = normalizeSettings(r.settings);
     hasKey = r.hasKey;
     permissions = r.permissions;
     ready = true;
@@ -1329,6 +1826,8 @@ function setup(ctx) {
     stop(false);
     disposed = true;
     marker.dispose();
+    audioPlayer.dispose();
+    widget?.destroy();
     for (const fn of cleanups)
       fn();
     editorTab?.destroy();

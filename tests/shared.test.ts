@@ -1,5 +1,15 @@
 import { describe, test, expect } from 'bun:test';
 import { DEFAULTS, CUE_PATTERN, normalizeSettings, parseSegments, selectVoice, speakerCharacterId, speechInput, speechRequest, stripCues, plainText } from '../src/shared';
+import { locateText,normalizeText } from '../src/highlight';
+test('markers match dialogue when hidden cues leave spaces inside quotes',()=>{
+  expect(locateText(normalizeText('“ Hello. ”'),'“Hello.”')).toEqual({offset:2,length:6});
+});
+test('marker fallback advances through repeated dialogue without jumping backward',()=>{
+  const text=normalizeText('“ Hello. ” She paused. “ Hello. ”');
+  const first=locateText(text,'“Hello.”')!,next=locateText(text,'“Hello.”',first.offset+first.length)!;
+  expect(next.offset).toBeGreaterThan(first.offset);expect(locateText(text,'“Hello.”',next.offset+next.length)).toBeNull();
+  expect(locateText(normalizeText('“ Hello. ” Then “Hello.”'),'“Hello.”')?.offset).toBe(2);
+});
 describe('speech cues and passage boundaries',()=>{
   test('cues never enter the visible passage or unsupported TTS',()=>{
     const source='[speaker:Mara][emotion:worried][delivery:whispers] "Are you sure?" [ordinary bracketed text]';
@@ -24,6 +34,7 @@ describe('speech cues and passage boundaries',()=>{
   });
   test('links speak their label and fenced code stays silent',()=>{
     expect(plainText('## Hi\n*Welcome* to [the garden](https://example.com).\n```js\nalert(1)\n```')).toBe('Hi Welcome to the garden.');
+    expect(parseSegments('<p title="hidden">Look at [the garden](https://example.com).</p> ![“hidden image”](image.png)','Mara').map(s=>s.text)).toEqual(['Look at the garden.']);
   });
   test('display rule agrees with the speech parser on newlines',()=>{
     expect('[emotion:happy] Hello.\n[delivery:softly] Bye.'.replace(new RegExp(CUE_PATTERN,'gi'),'')).toBe(' Hello.\n Bye.');

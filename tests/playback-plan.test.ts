@@ -1,0 +1,78 @@
+import { test,expect } from 'bun:test';
+import { DEFAULTS,normalizeSettings,parseSegments,DEFAULT_SPEECH_RULES } from '../src/shared';
+import { planSpeech,prepareAll,estimatedSentenceIndex,MAX_PASSAGE_CHARS } from '../src/playback-plan';
+const characters=[{id:'mara',name:'Mara'},{id:'rowan',name:'Rowan'}];
+const settings=normalizeSettings({...DEFAULTS,provider:'lumiverse',connectionId:'main',narratorVoice:'Charon',assignments:{'id:mara':{voice:'Kore'},'id:rowan':{voice:'Puck'}}});
+const plan=(raw:string,s=settings)=>planSpeech(parseSegments(raw,'Mara'),s,{characters,characterId:'mara'});
+
+test('untagged straight and curly dialogue switches between narrator and character',()=>{
+  const passages=plan('The door opened. Rain swept inside. “Come in. It is warm here.” She stepped aside. "Thank you."');
+  expect(passages.map(p=>p.voice)).toEqual(['Charon','Kore','Charon','Kore']);
+  expect(passages[0].segment.text).toBe('The door opened. Rain swept inside.');
+  expect(passages[1].segments).toHaveLength(2);
+});
+test('explicit speaker cues override quote detection and persist until changed',()=>{
+  expect(plan('[speaker:Rowan] No quotes needed. I am speaking. [speaker:narrator] “A quote in narration.”').map(p=>p.voice)).toEqual(['Puck','Charon']);
+});
+test('emotion cues alone do not prevent automatic narration detection',()=>{
+  expect(plan('[emotion:worried] She frowned. “Is it safe?”').map(p=>p.voice)).toEqual(['Charon','Kore']);
+  const tagged=plan('She frowned. “[emotion:worried] Is it safe? [delivery:softly] Please tell me.” Then she waited.');
+  expect(tagged.map(p=>p.voice)).toEqual(['Charon','Kore','Charon']);
+  expect(tagged[1].segment.text).toBe('“Is it safe? Please tell me.”');
+  expect(tagged.flatMap(p=>p.segments).some(s=>/^["“”]+$/.test(s.text))).toBe(false);
+  expect(plan('"[emotion:"bad"] Hello."')[0].voice).toBe('Kore');
+});
+test('same voice prose batches across sentences, not per sentence',()=>{
+  const passages=plan('She waited. It was late. The room was quiet.');
+  expect(passages).toHaveLength(1);expect(passages[0].segments).toHaveLength(3);
+});
+test('ignored Gemini 3.8 styles do not fragment continuous prose',()=>{
+  expect(plan('[speaker:Mara][emotion:angry] Stop. [emotion:sad] Please stay.')).toHaveLength(1);
+  const legacy=plan('[speaker:Mara][emotion:angry] Stop. [emotion:sad] Please stay.',{...settings,model:'google/gemini-3.1-flash-tts-preview'});
+  expect(legacy).toHaveLength(2);expect(legacy[1].segment.emotion).toBe('sad');
+});
+test('native speech detection rules can skip actions or read plain text as speech',()=>{
+  const segments=parseSegments('*A hidden action.* **A bold description.** “Hello.” Plain words.','Mara',{...DEFAULT_SPEECH_RULES,asterisked:'skip',undecorated:'speech'});
+  expect(segments.map(s=>s.text).join(' ')).toBe('A bold description. “Hello.” Plain words.');
+  expect(segments.every(s=>s.speaker==='Mara')).toBe(true);
+});
+test('long readings are bounded while preserving every sentence',()=>{
+  const raw='The rain fell softly. '.repeat(800),passages=plan(raw);
+  expect(passages.length).toBeGreaterThan(1);
+  expect(passages.every(p=>p.segment.text.length<=MAX_PASSAGE_CHARS)).toBe(true);
+  expect(passages.flatMap(p=>p.segments)).toHaveLength(800);
+});
+test('Lumiverse character and narrator voices may use separate saved connections',()=>{
+  const s={...settings,narratorVoice:'',assignments:{}};
+  const context={characters:[{id:'mara',name:'Mara',ttsVoice:{connectionId:'character',voice:'Leda'}}],characterId:'mara',connections:[{id:'character',name:'Character',provider:'openrouter_tts',model:DEFAULTS.model,voice:'Kore'},{id:'narration',name:'Narrator',provider:'openai_tts',model:'gpt-4o-mini-tts',voice:'alloy'}],narrationVoice:{connectionId:'narration',voice:'echo'}};
+  const passages=planSpeech(parseSegments('Rain fell. “Hello.”','Mara'),s,context);
+  expect(passages.map(p=>[p.voice,p.settings.connectionId])).toEqual([['echo','narration'],['Leda','character']]);
+  const explicit=planSpeech(parseSegments('Rain fell. “Hello.”','Mara'),settings,context);
+  expect(explicit.map(p=>p.voice)).toEqual(['Charon','Kore']);
+  expect(planSpeech(parseSegments('“Hello.”','Mara'),{...s,inheritVoices:false},context)[0].voice).toBe('Kore');
+});
+test('chat voice overrides precede character defaults; unavailable connections fall back',()=>{
+  const s={...settings,narratorVoice:'',assignments:{}};
+  const context={characters:[{id:'mara',name:'Mara',ttsVoice:{connectionId:'main',voice:'Leda'}}],characterId:'mara',connections:[{id:'main',name:'Main',provider:'openrouter_tts',model:DEFAULTS.model,voice:'Kore'}],overrides:{characters:{mara:{connectionId:'main',voice:'Puck'}},narrator:{connectionId:'missing',voice:'missing'}}};
+  expect(planSpeech(parseSegments('“Hello.”','Mara'),s,context)[0].voice).toBe('Puck');
+  expect(planSpeech(parseSegments('Rain fell.','Mara'),s,context)[0].voice).toBe('Kore');
+});
+test('full preparation preserves order when responses arrive out of order',async()=>{
+  const items=plan('Rain. “Hello.” More rain.');let active=0,peak=0;const progress:number[]=[];
+  const results=await prepareAll(items,async(_p,i)=>{active++;peak=Math.max(peak,active);await Bun.sleep(i===0?15:1);active--;return i},new AbortController().signal,n=>progress.push(n),2);
+  expect(results).toEqual([0,1,2]);expect(peak).toBe(2);expect(progress).toEqual([1,2,3]);
+});
+test('stop cancels preparation without starting remaining paid requests',async()=>{
+  const abort=new AbortController();let calls=0;
+  await expect(prepareAll(plan('Rain. “Hello.” More rain.'),async()=>{calls++;abort.abort();return 'audio'},abort.signal,()=>{},1)).rejects.toThrow();
+  expect(calls).toBe(1);
+});
+test('a provider failure aborts siblings and stops dispatching additional requests',async()=>{
+  let calls=0,aborted=false;
+  await expect(prepareAll(plan('Rain. “Hello.” More rain. “Goodbye.”'),async(_p,i,signal)=>{calls++;if(i===0)throw new Error('Provider failed');await new Promise<void>(resolve=>signal.addEventListener('abort',()=>{aborted=true;resolve()},{once:true}));signal.throwIfAborted();return i},new AbortController().signal,()=>{},2)).rejects.toThrow('Provider failed');
+  expect(calls).toBe(2);expect(aborted).toBe(true);
+});
+test('estimated sentence tracking stays in bounds and advances through a batched passage',()=>{
+  const passage=plan('She waited. It was late. The room was quiet.')[0];
+  expect(estimatedSentenceIndex(passage,-1)).toBe(0);expect(estimatedSentenceIndex(passage,.5)).toBe(1);expect(estimatedSentenceIndex(passage,2)).toBe(2);
+});

@@ -1,5 +1,5 @@
 import { pcmToWav } from './audio';
-import { selectVoice, speechInput, type Settings, type SpeechSegment } from './shared';
+import { selectVoice, speechInput, readVoiceRef, DEFAULT_SPEECH_RULES, type SpeechRules, type Settings, type SpeechSegment } from './shared';
 import { providerError, redactSecrets } from './provider-errors';
 export interface NativeConnection { id:string;name:string;provider:string;model:string;voice:string;outputFormat?:string }
 const API = '/api/v1';
@@ -41,6 +41,16 @@ export function createNativeTtsClient(transport:typeof fetch = fetch) {
     if (typeof data.error==='string')throw new Error(redactSecrets(data.error.slice(0,600)));return data;
   }
   return {
+    async preferences() {
+      const result=await readJson(await request('/settings/voiceSettings'));
+      const value=result.value && typeof result.value==='object'?result.value:{};
+      const raw=value.speechDetectionRules??{},rules={...DEFAULT_SPEECH_RULES};
+      for(const key of ['quoted','asterisked','undecorated'] as const) {
+        const allowed=key==='asterisked'?['thought','narration','skip']:['speech','narration','skip'];
+        if(allowed.includes(raw[key]))(rules as Record<string,string>)[key]=raw[key];
+      }
+      return {rules:rules as SpeechRules,narrationVoice:readVoiceRef(value.narrationVoice)};
+    },
     async connections():Promise<NativeConnection[]> {
       const all:NativeConnection[]=[];
       for(let offset=0;offset<2000;offset+=200) {

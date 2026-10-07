@@ -9,17 +9,28 @@ export interface Settings {
   connectionId: string;
   model: string; voice: string; narratorVoice: string; localUrl: string;
   autoPlay: boolean; follow: boolean; promptEmotions: boolean; useEmotions: boolean;
+  inheritVoices: boolean;
   speed: number; volume: number;
   assignments: Record<string, VoiceAssignment>;
 }
 export const DEFAULTS: Settings = {
   provider: 'openrouter', connectionId:'', model: 'google/gemini-3.8-flash-tts', voice: 'Kore', narratorVoice: '',
   localUrl: 'http://localhost:8880/v1', autoPlay: false, follow: false,
-  promptEmotions: true, useEmotions: true, speed: 1, volume: 0.85, assignments: {},
+  promptEmotions: true, useEmotions: true, inheritVoices:true, speed: 1, volume: 0.85, assignments: {},
 };
 export interface SpeechSegment { text: string; speaker: string; emotion: string; delivery: string }
 export interface SpeechModel { id: string; name: string; voices: string[] }
 export interface MessageInfo { id: string; content: string; name: string; isUser: boolean; characterId?: string }
+export interface NativeVoiceRef { connectionId:string;voice:string }
+export interface CharacterInfo { id:string;name:string;ttsVoice?:NativeVoiceRef }
+export interface SpeechRules { quoted:'speech'|'narration'|'skip';asterisked:'thought'|'narration'|'skip';undecorated:'speech'|'narration'|'skip' }
+export const DEFAULT_SPEECH_RULES:SpeechRules = {quoted:'speech',asterisked:'narration',undecorated:'narration'};
+export function readVoiceRef(raw:unknown):NativeVoiceRef|undefined {
+  if(!raw || typeof raw!=='object')return;
+  const v=raw as Record<string,unknown>;
+  if(typeof v.connectionId!=='string' || !v.connectionId || v.connectionId.length>160)return;
+  return {connectionId:v.connectionId,voice:typeof v.voice==='string'?v.voice.slice(0,160):''};
+}
 export function speakerCharacterId(speaker: string, characters: {id:string;name:string}[], fallback?: string): string | undefined {
   const name = speaker.trim().toLowerCase();
   if (name === 'narrator') return undefined;
@@ -40,7 +51,7 @@ export function normalizeSettings(raw: unknown): Settings {
     model: str(r.model, DEFAULTS.model), voice: str(r.voice, DEFAULTS.voice), narratorVoice: str(r.narratorVoice, ''),
     localUrl: str(r.localUrl, DEFAULTS.localUrl, 500),
     autoPlay: r.autoPlay === true, follow: r.follow === true,
-    promptEmotions: r.promptEmotions !== false, useEmotions: r.useEmotions !== false,
+    promptEmotions: r.promptEmotions !== false, useEmotions: r.useEmotions !== false, inheritVoices:r.inheritVoices!==false,
     speed: clamp(r.speed, 0.5, 2, 1), volume: clamp(r.volume, 0, 1, .85), assignments,
   };
 }
@@ -60,25 +71,51 @@ export function splitSentences(text: string): string[] {
   return Array.from(new Intl.Segmenter(undefined, { granularity: 'sentence' }).segment(text), s => s.segment.trim()).filter(Boolean)
     .flatMap(s => s.length <= 650 ? [s] : s.match(/.{1,600}(?:\s|$)|.{1,600}/gu)!.map(x => x.trim()).filter(Boolean));
 }
-export function parseSegments(raw: string, defaultSpeaker = ''): SpeechSegment[] {
-  raw = raw.replace(/```[^]*?```/g, ' ');
+export function parseSegments(raw: string, defaultSpeaker = '', rules:SpeechRules=DEFAULT_SPEECH_RULES): SpeechSegment[] {
+  raw = raw.replace(/```[^]*?```/g, ' ').replace(/!\[[^\]]*\]\([^)]*\)/g,' ')
+    .replace(/\[([^\]]+)\]\([^)]*\)/g,'$1').replace(/<[^>]*>/g,' ').replace(/&quot;/g,'"');
   const cue = new RegExp(`\\[(emotion|delivery|speaker):([^\\]\\r\\n]{1,80})\\]`, 'gi');
-  const segments: SpeechSegment[] = [];
-  let speaker = defaultSpeaker, emotion = '', delivery = '', offset = 0;
-  const flush = (text: string) => {
-    for (const sentence of splitSentences(plainText(text))) segments.push({ text: sentence, speaker, emotion, delivery });
+  const pieces:SpeechSegment[]=[];
+  let speaker=defaultSpeaker,explicitSpeaker=false,emotion='',delivery='';
+  const classify=(text:string,action:string)=>{
+    let offset=0,prefix='',appended=false;
+    const append=(prose:string)=>{
+      if(!explicitSpeaker && action==='skip')return;
+      const text=plainText(prose);if(!text)return;
+      // A cue inside opening quotes must not create a spoken quote-only
+      // request or discard the quote's character classification.
+      if(/^["“”«»]+$/.test(text)){prefix+=text;return}
+      const chosen=explicitSpeaker?speaker:action==='narration'?'narrator':defaultSpeaker;
+      const value={text:prefix+text,speaker:chosen,emotion,delivery};prefix='';
+      appended=true;
+      const last=pieces.at(-1);
+      if(last && last.speaker===value.speaker && last.emotion===emotion && last.delivery===delivery)last.text+=' '+value.text;
+      else pieces.push(value);
+    };
+    for(const match of text.matchAll(cue)) {
+      append(text.slice(offset,match.index));const value=match[2].trim(),kind=match[1].toLowerCase();
+      if(kind==='speaker'){speaker=value;explicitSpeaker=true;emotion='';delivery=''}
+      if(kind==='emotion')emotion=enumValue(value,EMOTIONS,'neutral');
+      if(kind==='delivery')delivery=enumValue(value,DELIVERIES,'normal');
+      offset=match.index!+match[0].length;
+    }
+    append(text.slice(offset));
+    if(prefix && appended)pieces.at(-1)!.text+=prefix;
   };
-  for (const m of raw.matchAll(cue)) {
-    flush(raw.slice(offset, m.index));
-    const value = m[2].trim();
-    if (m[1].toLowerCase() === 'speaker') { speaker = value; emotion = ''; delivery = ''; }
-    if (m[1].toLowerCase() === 'emotion') emotion = enumValue(value, EMOTIONS, 'neutral');
-    if (m[1].toLowerCase() === 'delivery') delivery = enumValue(value, DELIVERIES, 'normal');
-    offset = m.index! + m[0].length;
+  // Classify the complete decorated spans before parsing their cues, so an
+  // emotion/delivery cue inside quotes cannot reset dialogue detection.
+  const pattern=/"[^"\n]*(?:\n[^"\n]*)*"|“[^”]*”|«[^»]*»|(?<!\*)\*(?!\*)([^*]+)\*(?!\*)/g;
+  const detection=raw.replace(new RegExp(CUE_PATTERN,'gi'),match=>' '.repeat(match.length));
+  let cursor=0;
+  for(const match of detection.matchAll(pattern)) {
+    classify(raw.slice(cursor,match.index),rules.undecorated);
+    classify(raw.slice(match.index,match.index!+match[0].length),match[1]===undefined?rules.quoted:rules.asterisked);
+    cursor=match.index!+match[0].length;
   }
-  flush(raw.slice(offset));
-  return segments;
+  classify(raw.slice(cursor),rules.undecorated);
+  return pieces.flatMap(piece=>splitSentences(piece.text).map(text=>({...piece,text})));
 }
+
 export function selectVoice(settings: Settings, segment: SpeechSegment, characterId?: string): VoiceAssignment {
   const byName = settings.assignments[`name:${segment.speaker.toLowerCase()}`];
   const narrator = segment.speaker.toLowerCase() === 'narrator';

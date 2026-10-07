@@ -1,6 +1,18 @@
 export interface TextIndex { text: string; points: { node: Text; offset: number }[] }
 function canon(c: string) { return /\s/.test(c) ? ' ' : c.replace(/[“”]/g, '"').replace(/[‘’]/g, "'").toLowerCase() }
 export function normalizeText(text: string) { return Array.from(text).map(canon).join('').replace(/\s+/g, ' ').trim() }
+export function locateText(text:string,phrase:string,cursor=0):{offset:number;length:number}|null {
+  const exact=normalizeText(phrase);
+  // Display-only cue removal can leave a space just inside quotation marks.
+  // Match the spoken words when the rendered quote spacing differs.
+  const words=exact.replace(/^["'«»\s]+|["'«»\s]+$/g,'');
+  let closest:{offset:number;length:number}|null=null;
+  for(const needle of exact===words?[exact]:[exact,words]) {
+    if(!needle)continue;const offset=text.indexOf(needle,cursor);
+    if(offset>=0 && (!closest || offset<closest.offset))closest={offset,length:needle.length};
+  }
+  return closest;
+}
 export function indexText(root: Element): TextIndex {
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
@@ -26,15 +38,14 @@ export function indexText(root: Element): TextIndex {
   return { text, points };
 }
 export function findTextRange(root: Element, phrase: string, cursor = 0): { range: Range; next: number } | null {
-  const index = indexText(root), needle = normalizeText(phrase);
-  if (!needle) return null;
-  const at = index.text.indexOf(needle, cursor);
+  const index = indexText(root), match=locateText(index.text,phrase,cursor);
   // Never jump backward to a repeated sentence when the rendered message changed.
-  if (at < 0) return null;
-  const a = index.points[at], b = index.points[at + needle.length - 1];
+  if (!match) return null;
+  const {offset:at,length}=match;
+  const a = index.points[at], b = index.points[at + length - 1];
   if (!a || !b) return null;
   const range = document.createRange(); range.setStart(a.node, a.offset); range.setEnd(b.node, b.offset + 1);
-  return { range, next: at + needle.length };
+  return { range, next: at + length };
 }
 type HighlightWindow = Window & typeof globalThis & { Highlight?: new (...ranges: Range[]) => unknown };
 export class PassageMarker {
