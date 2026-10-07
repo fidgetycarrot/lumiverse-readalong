@@ -38,9 +38,10 @@ describe('native Lumiverse TTS',()=>{
     const calls:any[]=[];const samples=new Uint8Array([0,0,0xff,0x7f,0,0x80,1,0]);
     const client=createNativeTtsClient((async(url:any,init:any)=>{calls.push({url,init});return new Response(samples,{headers:{'Content-Type':'audio/pcm'}})}) as unknown as typeof fetch);
     const audio=await client.speech(connection,settings,segment);
+    const bytes=new Uint8Array(await audio.blob.arrayBuffer());
     expect(calls).toHaveLength(1);expect(calls[0].url).toBe('/api/v1/tts/synthesize');expect(calls[0].init.credentials).toBe('include');expect(calls[0].init.headers).toEqual({'Content-Type':'application/json'});
-    expect(JSON.parse(calls[0].init.body).outputFormat).toBe('pcm');expect(audio.mime).toBe('audio/wav');expect(audio.bytes.subarray(44)).toEqual(samples);
-    expect(new TextDecoder().decode(audio.bytes.subarray(0,4))).toBe('RIFF');const view=new DataView(audio.bytes.buffer);expect(view.getUint32(24,true)).toBe(24000);expect(view.getUint16(34,true)).toBe(16);expect(view.getUint32(40,true)).toBe(samples.length);
+    expect(JSON.parse(calls[0].init.body).outputFormat).toBe('pcm');expect(audio.mime).toBe('audio/wav');expect(bytes.subarray(44)).toEqual(samples);
+    expect(new TextDecoder().decode(bytes.subarray(0,4))).toBe('RIFF');const view=new DataView(bytes.buffer);expect(view.getUint32(24,true)).toBe(24000);expect(view.getUint16(34,true)).toBe(16);expect(view.getUint32(40,true)).toBe(samples.length);
   });
   test('JSON errors surface on the first request without a speech retry',async()=>{
     let calls=0;const client=createNativeTtsClient((async()=>{calls++;return Response.json({error:'Gemini voice rejected sk-or-v1-secret'},{status:400})}) as unknown as typeof fetch);
@@ -55,9 +56,9 @@ describe('native Lumiverse TTS',()=>{
     const controller=new AbortController();const client=createNativeTtsClient((async(_url:any,init:any)=>new Promise((_resolve,reject)=>{init.signal.addEventListener('abort',()=>reject(new DOMException('Stopped','AbortError')))})) as unknown as typeof fetch);
     const pending=client.speech(connection,settings,segment,undefined,controller.signal);controller.abort();await expect(pending).rejects.toThrow('Stopped');
   });
-  test('oversized audio and incomplete PCM are rejected',async()=>{
+  test('native audio is no longer rejected by the direct proxy size limit; incomplete PCM is rejected',async()=>{
     const client=createNativeTtsClient((async()=>new Response(new Uint8Array(2),{headers:{'Content-Type':'audio/pcm','Content-Length':String(26*1024*1024)}})) as unknown as typeof fetch);
-    await expect(client.speech(connection,settings,segment)).rejects.toThrow('oversized');expect(()=>pcmToWav(new Uint8Array([0,0,0]))).toThrow('incomplete');expect(()=>pcmToWav(new Uint8Array())).toThrow('empty');
+    expect((await client.speech(connection,settings,segment)).blob.size).toBe(46);expect(()=>pcmToWav(new Uint8Array([0,0,0]))).toThrow('incomplete');expect(()=>pcmToWav(new Uint8Array())).toThrow('empty');
   });
   test('existing WAV data is not wrapped twice; PCM rate parameters are honored',()=>{
     const bytes=new Uint8Array([0,0,1,0]);const wav=pcmToWav(bytes,'audio/pcm;rate=48000');expect(pcmToWav(wav,'audio/wav')).toBe(wav);expect(new DataView(wav.buffer).getUint32(24,true)).toBe(48000);

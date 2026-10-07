@@ -10,7 +10,7 @@ var DEFAULTS = {
   voice: "Kore",
   narratorVoice: "",
   localUrl: "http://localhost:8880/v1",
-  autoPlay: false,
+  enabled: true,
   follow: false,
   promptEmotions: true,
   useEmotions: true,
@@ -52,7 +52,7 @@ function normalizeSettings(raw) {
     voice: str(r.voice, DEFAULTS.voice),
     narratorVoice: str(r.narratorVoice, ""),
     localUrl: str(r.localUrl, DEFAULTS.localUrl, 500),
-    autoPlay: r.autoPlay === true,
+    enabled: r.enabled !== false,
     follow: r.follow === true,
     promptEmotions: r.promptEmotions !== false,
     useEmotions: r.useEmotions !== false,
@@ -313,43 +313,283 @@ class PassageMarker {
   }
 }
 
-// src/audio.ts
-var MAX_AUDIO_BYTES = 25 * 1024 * 1024;
-function pcmToWav(pcm, contentType = "audio/pcm") {
-  const mime = contentType.split(";")[0].trim().toLowerCase();
-  if (pcm.length >= 44 && new TextDecoder().decode(pcm.subarray(0, 4)) === "RIFF" && new TextDecoder().decode(pcm.subarray(8, 12)) === "WAVE")
-    return pcm;
-  if (!["audio/pcm", "audio/x-pcm"].includes(mime))
-    throw new Error("OpenRouter returned an unsupported audio format. Expected Gemini PCM audio.");
-  const parameter = (name, fallback) => {
-    const match = contentType.match(new RegExp(`(?:^|;)\\s*${name}\\s*=\\s*"?([^;"\\s]+)`, "i"));
-    return match ? Number(match[1]) : fallback;
-  };
-  const rate = parameter("rate", 24000), channels = parameter("channels", 1);
-  if (!Number.isInteger(rate) || rate < 8000 || rate > 96000 || channels !== 1)
-    throw new Error("OpenRouter returned unsupported PCM sample settings.");
-  if (!pcm.length || pcm.length % 2 || pcm.length > MAX_AUDIO_BYTES)
-    throw new Error("OpenRouter returned empty, incomplete, or oversized PCM audio.");
-  const wav = new Uint8Array(pcm.length + 44), view = new DataView(wav.buffer);
-  const text = (offset, value) => {
-    for (let i = 0;i < value.length; i++)
-      wav[offset + i] = value.charCodeAt(i);
+// src/prepared-audio.ts
+function waveHeader(size, rate = 24000, channels = 1, bits = 16) {
+  const bytes = new Uint8Array(44), view = new DataView(bytes.buffer);
+  const text = (offset, s) => {
+    for (let i = 0;i < s.length; i++)
+      bytes[offset + i] = s.charCodeAt(i);
   };
   text(0, "RIFF");
-  view.setUint32(4, pcm.length + 36, true);
+  view.setUint32(4, size + 36, true);
   text(8, "WAVE");
   text(12, "fmt ");
   view.setUint32(16, 16, true);
   view.setUint16(20, 1, true);
-  view.setUint16(22, 1, true);
+  view.setUint16(22, channels, true);
   view.setUint32(24, rate, true);
-  view.setUint32(28, rate * 2, true);
-  view.setUint16(32, 2, true);
-  view.setUint16(34, 16, true);
+  view.setUint32(28, rate * channels * bits / 8, true);
+  view.setUint16(32, channels * bits / 8, true);
+  view.setUint16(34, bits, true);
   text(36, "data");
-  view.setUint32(40, pcm.length, true);
-  wav.set(pcm, 44);
-  return wav;
+  view.setUint32(40, size, true);
+  return bytes;
+}
+async function readWave(blob) {
+  const bytes = new Uint8Array(await blob.slice(0, 65536).arrayBuffer());
+  const text = (at) => String.fromCharCode(...bytes.subarray(at, at + 4));
+  if (text(0) !== "RIFF" || text(8) !== "WAVE")
+    return;
+  const view = new DataView(bytes.buffer);
+  let format;
+  for (let at = 12;at + 8 <= bytes.length; ) {
+    const size = view.getUint32(at + 4, true), kind = text(at), offset = at + 8;
+    if (kind === "fmt " && size >= 16 && offset + 16 <= bytes.length && view.getUint16(offset, true) === 1) {
+      const channels = view.getUint16(offset + 2, true), rate = view.getUint32(offset + 4, true), bits = view.getUint16(offset + 14, true);
+      if (channels >= 1 && channels <= 8 && rate >= 8000 && rate <= 192000 && [8, 16, 24, 32].includes(bits))
+        format = { rate, channels, bits };
+    }
+    if (kind === "data" && format) {
+      const frameBytes = format.channels * format.bits / 8;
+      if (!size || offset + size > blob.size || size % frameBytes)
+        throw new Error("The speech provider returned incomplete WAV audio.");
+      return { ...format, offset, size };
+    }
+    at = offset + size + size % 2;
+  }
+}
+async function pcmBlobToWav(blob, type = "audio/pcm") {
+  const first = new Uint8Array(await blob.slice(0, 12).arrayBuffer());
+  if (String.fromCharCode(...first.subarray(0, 4)) === "RIFF" && String.fromCharCode(...first.subarray(8, 12)) === "WAVE")
+    return blob.slice(0, blob.size, "audio/wav");
+  const param = (name, fallback) => {
+    const match = type.match(new RegExp(`(?:^|;)\\s*${name}\\s*=\\s*"?([^;"\\s]+)`, "i"));
+    return match ? Number(match[1]) : fallback;
+  };
+  const rate = param("rate", 24000), channels = param("channels", 1);
+  if (!Number.isInteger(rate) || rate < 8000 || rate > 96000 || channels !== 1)
+    throw new Error("OpenRouter returned unsupported PCM sample settings.");
+  if (!blob.size || blob.size % 2)
+    throw new Error("OpenRouter returned empty or incomplete PCM audio.");
+  if (blob.size > 4294967295 - 36)
+    throw new Error("This audio exceeds the WAV file format limit.");
+  return new Blob([waveHeader(blob.size, rate), blob], { type: "audio/wav" });
+}
+function audioBlob(data) {
+  if (data.blob)
+    return data.blob;
+  const bytes = data.bytes ?? Uint8Array.from(atob(data.audio), (c) => c.charCodeAt(0));
+  return new Blob([bytes], { type: data.mime });
+}
+async function prepareClip(data, signal, createAudio = () => new Audio) {
+  signal?.throwIfAborted();
+  const blob = audioBlob(data), wave = await readWave(blob);
+  signal?.throwIfAborted();
+  if (wave)
+    return { blob, wave, duration: wave.size / (wave.rate * wave.channels * wave.bits / 8) };
+  const audio = createAudio(), url = URL.createObjectURL(blob);
+  try {
+    const duration = await new Promise((resolve, reject) => {
+      const abort = () => done(() => reject(signal?.reason ?? new DOMException("Stopped", "AbortError")));
+      const timer = setTimeout(() => done(() => reject(new Error("Could not read the prepared audio file."))), 15000);
+      const done = (work) => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", abort);
+        work();
+      };
+      audio.onloadedmetadata = () => done(() => Number.isFinite(audio.duration) && audio.duration > 0 ? resolve(audio.duration) : reject(new Error("The provider returned audio without a usable duration.")));
+      audio.onerror = () => done(() => reject(new Error("The speech provider returned audio this browser cannot play.")));
+      signal?.addEventListener("abort", abort, { once: true });
+      audio.preload = "metadata";
+      audio.src = url;
+    });
+    signal?.throwIfAborted();
+    return { blob, duration };
+  } finally {
+    audio.onloadedmetadata = null;
+    audio.onerror = null;
+    audio.removeAttribute("src");
+    audio.load();
+    URL.revokeObjectURL(url);
+  }
+}
+function joinPrepared(clips) {
+  if (!clips.length)
+    return [];
+  const first = clips[0].wave, total = clips.reduce((sum, c) => sum + (c.wave?.size ?? 0), 0);
+  if (first && total <= 4294967295 - 36 && clips.every((c) => c.wave && c.wave.rate === first.rate && c.wave.channels === first.channels && c.wave.bits === first.bits)) {
+    return [{ blob: new Blob([waveHeader(total, first.rate, first.channels, first.bits), ...clips.map((c) => c.blob.slice(c.wave.offset, c.wave.offset + c.wave.size))], { type: "audio/wav" }), duration: clips.reduce((sum, c) => sum + c.duration, 0) }];
+  }
+  return clips;
+}
+
+class PreparedPlayer {
+  factory;
+  urls;
+  audio;
+  next = null;
+  tracks = [];
+  durations = [];
+  index = 0;
+  running = false;
+  finished = false;
+  generation = 0;
+  speed = 1;
+  volume = 0.85;
+  primed = false;
+  onEnded = () => {};
+  onError = () => {};
+  constructor(factory = () => new Audio, urls = { create: URL.createObjectURL.bind(URL), revoke: URL.revokeObjectURL.bind(URL) }) {
+    this.factory = factory;
+    this.urls = urls;
+    this.audio = factory();
+  }
+  unlock() {
+    if (this.primed || this.tracks.length)
+      return;
+    this.primed = true;
+    const silent = new Blob([waveHeader(2), new Uint8Array(2)], { type: "audio/wav" }), url = this.urls.create(silent), audio = this.audio;
+    audio.src = url;
+    const generation = this.generation;
+    audio.play().then(() => {
+      if (generation === this.generation && !this.tracks.length)
+        audio.pause();
+    }).catch(() => {}).finally(() => this.urls.revoke(url));
+  }
+  load(clips) {
+    this.clear();
+    this.durations = clips.map((c) => c.duration);
+    this.tracks = joinPrepared(clips).map((c) => ({ url: this.urls.create(c.blob), duration: c.duration }));
+    if (this.tracks.length)
+      this.activate(0);
+  }
+  configure(audio) {
+    audio.preload = "auto";
+    audio.volume = this.volume;
+    audio.playbackRate = this.speed;
+  }
+  activate(index) {
+    this.index = index;
+    this.configure(this.audio);
+    if (this.audio.src !== this.tracks[index].url)
+      this.audio.src = this.tracks[index].url;
+    const generation = this.generation;
+    this.audio.onended = () => {
+      if (generation !== this.generation || !this.running)
+        return;
+      if (this.index + 1 === this.tracks.length) {
+        this.running = false;
+        this.finished = true;
+        this.onEnded();
+        return;
+      }
+      const old = this.audio;
+      old.onended = null;
+      old.onerror = null;
+      old.removeAttribute("src");
+      old.load();
+      this.audio = this.next ?? this.factory();
+      this.next = null;
+      this.activate(this.index + 1);
+      this.audio.play().catch((e) => {
+        if (generation === this.generation) {
+          this.running = false;
+          this.onError(e instanceof Error ? e : new Error("Audio playback failed."));
+        }
+      });
+    };
+    this.audio.onerror = () => {
+      if (generation === this.generation) {
+        this.running = false;
+        this.onError(new Error("The prepared audio file could not be played."));
+      }
+    };
+    if (this.index + 1 < this.tracks.length) {
+      this.next = this.factory();
+      this.configure(this.next);
+      this.next.src = this.tracks[this.index + 1].url;
+    }
+  }
+  get duration() {
+    return this.durations.reduce((sum, n) => sum + n, 0);
+  }
+  get elapsed() {
+    return this.finished ? this.duration : Math.min(this.duration, this.tracks.slice(0, this.index).reduce((sum, c) => sum + c.duration, 0) + (this.tracks.length ? this.audio.currentTime : 0));
+  }
+  get position() {
+    const elapsed = this.elapsed;
+    let index = 0, start = 0;
+    while (index + 1 < this.durations.length && start + this.durations[index] <= elapsed + 0.0000001)
+      start += this.durations[index++];
+    const seconds = Math.max(0, elapsed - start), length = this.durations[index] ?? 0;
+    return { index, seconds, fraction: length ? Math.min(1, seconds / length) : 0, elapsed, duration: this.duration };
+  }
+  async play() {
+    if (!this.tracks.length)
+      throw new Error("No prepared audio is available.");
+    if (this.finished)
+      this.rewind();
+    const generation = this.generation;
+    try {
+      await this.audio.play();
+    } catch {
+      if (generation !== this.generation)
+        return false;
+      throw new Error("Audio is ready. Press Play to allow playback.");
+    }
+    if (generation !== this.generation)
+      return false;
+    this.running = true;
+    return true;
+  }
+  pause() {
+    this.audio.pause();
+    this.running = false;
+  }
+  setSpeed(speed) {
+    this.speed = Math.max(0.5, Math.min(2, speed));
+    this.audio.playbackRate = this.speed;
+    if (this.next)
+      this.next.playbackRate = this.speed;
+  }
+  setVolume(volume) {
+    this.volume = Math.max(0, Math.min(1, volume));
+    this.audio.volume = this.volume;
+    if (this.next)
+      this.next.volume = this.volume;
+  }
+  rewind() {
+    this.pause();
+    this.finished = false;
+    if (this.index === 0)
+      this.audio.currentTime = 0;
+    else {
+      this.next?.removeAttribute("src");
+      this.next?.load();
+      this.next = null;
+      this.activate(0);
+    }
+  }
+  clear() {
+    this.generation++;
+    this.pause();
+    this.audio.onended = null;
+    this.audio.onerror = null;
+    this.audio.removeAttribute("src");
+    this.audio.load();
+    this.next?.removeAttribute("src");
+    this.next?.load();
+    this.next = null;
+    for (const track of this.tracks)
+      this.urls.revoke(track.url);
+    this.tracks = [];
+    this.durations = [];
+    this.index = 0;
+    this.finished = false;
+  }
+  dispose() {
+    this.clear();
+  }
 }
 
 // src/provider-errors.ts
@@ -497,20 +737,22 @@ function createNativeTtsClient(transport = fetch) {
         const text = new TextDecoder().decode(await boundedBytes(response, 64 * 1024));
         throw new Error(providerError("Lumiverse TTS", response.status, text));
       }
-      const bytes = await boundedBytes(response, 25 * 1024 * 1024);
-      if (!bytes.length)
-        throw new Error("Lumiverse returned no speech audio.");
-      if (mime.startsWith("audio/pcm") || mime.startsWith("audio/x-pcm"))
-        return { bytes: pcmToWav(bytes, mime), mime: "audio/wav" };
       if (!mime.startsWith("audio/") && !mime.startsWith("application/ogg"))
         throw new Error("Lumiverse returned an unsupported speech response.");
-      return { bytes, mime };
+      const blob = await response.blob();
+      signal?.throwIfAborted();
+      if (!blob.size)
+        throw new Error("Lumiverse returned no speech audio.");
+      if (mime.startsWith("audio/pcm") || mime.startsWith("audio/x-pcm"))
+        return { blob: await pcmBlobToWav(blob, mime), mime: "audio/wav" };
+      return { blob, mime };
     }
   };
 }
 
 // src/playback-plan.ts
 var MAX_PASSAGE_CHARS = 3000;
+var MAX_NATIVE_PASSAGE_CHARS = 12000;
 function planSpeech(segments, settings, context) {
   const passages = [];
   let previousKey = "";
@@ -531,7 +773,8 @@ function planSpeech(segments, settings, context) {
     const emotion = styleSupported ? assignment.emotion : "neutral", delivery = styleSupported ? assignment.delivery : "normal";
     const key = JSON.stringify([snapshot.provider, snapshot.connectionId, snapshot.model, snapshot.voice, emotion, delivery]);
     const last = passages.at(-1);
-    if (last && previousKey === key && last.segment.text.length + segment.text.length + 1 <= MAX_PASSAGE_CHARS) {
+    const limit = snapshot.provider === "lumiverse" && /gemini-.*tts/i.test(snapshot.model) ? MAX_NATIVE_PASSAGE_CHARS : MAX_PASSAGE_CHARS;
+    if (last && previousKey === key && last.segment.text.length + segment.text.length + 1 <= limit) {
       last.segment.text += " " + segment.text;
       last.segments.push(segment);
     } else
@@ -576,172 +819,6 @@ function estimatedSentenceIndex(passage, fraction) {
       return i;
   }
   return weights.length - 1;
-}
-
-// src/playback.ts
-class BufferedPlayer {
-  factory;
-  context = null;
-  gain = null;
-  buffers = [];
-  starts = [];
-  sources = [];
-  offset = 0;
-  anchor = 0;
-  speed = 1;
-  volume = 0.85;
-  running = false;
-  generation = 0;
-  primed = false;
-  onEnded = () => {};
-  constructor(factory = () => {
-    const Constructor = window.AudioContext ?? window.webkitAudioContext;
-    if (!Constructor)
-      throw new Error("This browser does not support continuous audio playback. Try Browser voices.");
-    return new Constructor;
-  }) {
-    this.factory = factory;
-  }
-  ensure() {
-    if (!this.context) {
-      this.context = this.factory();
-      this.gain = this.context.createGain();
-      this.gain.gain.value = this.volume;
-      this.gain.connect(this.context.destination);
-    }
-    return this.context;
-  }
-  unlock() {
-    const c = this.ensure();
-    c.resume().catch(() => {});
-    if (this.primed)
-      return;
-    const source = c.createBufferSource();
-    source.buffer = c.createBuffer(1, 1, c.sampleRate);
-    source.connect(this.gain);
-    source.start();
-    this.primed = true;
-  }
-  async decode(data) {
-    const bytes = data.bytes ?? Uint8Array.from(atob(data.audio), (c) => c.charCodeAt(0));
-    try {
-      const buffer = await this.ensure().decodeAudioData(bytes.slice().buffer);
-      if (!Number.isFinite(buffer.duration) || buffer.duration <= 0)
-        throw new Error;
-      return buffer;
-    } catch {
-      throw new Error("The speech provider returned audio this browser cannot play.");
-    }
-  }
-  load(buffers) {
-    this.clear();
-    let offset = 0;
-    this.buffers = buffers;
-    this.starts = buffers.map((b) => {
-      const start = offset;
-      offset += b.duration;
-      return start;
-    });
-  }
-  get duration() {
-    return this.buffers.reduce((sum, b) => sum + b.duration, 0);
-  }
-  get elapsed() {
-    return Math.min(this.duration, this.offset + (this.running ? Math.max(0, this.ensure().currentTime - this.anchor) * this.speed : 0));
-  }
-  get position() {
-    const elapsed = this.elapsed;
-    let index = 0;
-    while (index + 1 < this.starts.length && this.starts[index + 1] <= elapsed + 0.0000001)
-      index++;
-    const seconds = Math.max(0, elapsed - (this.starts[index] ?? 0)), duration = this.buffers[index]?.duration ?? 0;
-    return { index, seconds, fraction: duration ? Math.min(1, seconds / duration) : 0, elapsed, duration: this.duration };
-  }
-  unschedule() {
-    for (const source of this.sources) {
-      source.onended = null;
-      try {
-        source.stop();
-      } catch {}
-      source.disconnect();
-    }
-    this.sources = [];
-  }
-  schedule() {
-    const c = this.ensure(), generation = ++this.generation;
-    this.anchor = c.currentTime + 0.025;
-    this.running = true;
-    for (let i = 0;i < this.buffers.length; i++) {
-      const buffer = this.buffers[i], start = this.starts[i], end = start + buffer.duration;
-      if (end <= this.offset)
-        continue;
-      const source = c.createBufferSource();
-      source.buffer = buffer;
-      source.playbackRate.value = this.speed;
-      source.connect(this.gain);
-      if (i === this.buffers.length - 1)
-        source.onended = () => {
-          if (generation !== this.generation)
-            return;
-          this.offset = this.duration;
-          this.running = false;
-          this.unschedule();
-          this.onEnded();
-        };
-      this.sources.push(source);
-      source.start(this.anchor + Math.max(0, start - this.offset) / this.speed, Math.max(0, this.offset - start));
-    }
-  }
-  async play() {
-    if (!this.buffers.length)
-      throw new Error("Prepare a message first.");
-    const generation = this.generation, c = this.ensure();
-    await c.resume();
-    if (generation !== this.generation)
-      return false;
-    if (c.state !== "running")
-      throw new Error("Press Play to allow audio.");
-    if (this.running)
-      return true;
-    if (this.offset >= this.duration)
-      this.offset = 0;
-    this.schedule();
-    return true;
-  }
-  pause() {
-    this.offset = this.elapsed;
-    this.running = false;
-    this.generation++;
-    this.unschedule();
-  }
-  setSpeed(speed) {
-    const running = this.running;
-    this.pause();
-    this.speed = Math.max(0.5, Math.min(2, speed));
-    if (running)
-      this.schedule();
-  }
-  setVolume(volume) {
-    this.volume = Math.max(0, Math.min(1, volume));
-    if (this.gain)
-      this.gain.gain.value = this.volume;
-  }
-  rewind() {
-    this.pause();
-    this.offset = 0;
-  }
-  clear() {
-    this.pause();
-    this.offset = 0;
-    this.buffers = [];
-    this.starts = [];
-  }
-  dispose() {
-    this.clear();
-    this.context?.close().catch(() => {});
-    this.context = null;
-    this.gain = null;
-  }
 }
 
 // src/frontend.ts
@@ -821,7 +898,7 @@ function timeLabel(seconds) {
   return `${Math.floor(value / 60)}:${String(value % 60).padStart(2, "0")}`;
 }
 function setup(ctx) {
-  let settings = normalizeSettings(DEFAULTS), hasKey = false, ready = false, disposed = false;
+  let settings = normalizeSettings(DEFAULTS), hasKey = false, ready = false, initialized = false, disposed = false;
   let canDiagnoseSpeech = false, diagnosing = false, diagnoseButton = null;
   let diagnoseHint = null;
   let models = [{ id: DEFAULTS.model, name: "Google: Gemini 3.8 Flash TTS", voices: GEMINI_VOICES }];
@@ -832,7 +909,9 @@ function setup(ctx) {
   let playbackId = 0, playing = false, paused = false, currentMessage = null;
   let phase = "idle";
   let utterance = null;
-  const audioPlayer = new BufferedPlayer;
+  const audioPlayer = new PreparedPlayer;
+  const automaticPreparations = new Set;
+  let saveQueue = Promise.resolve(), saveVersion = 0;
   let currentPassages = [], preparedCount = 0, currentPassage = 0;
   let readingAbort = null, clockTimer = null;
   let browserQueueActive = false, browserResume = null;
@@ -916,10 +995,10 @@ function setup(ctx) {
         p.reject(new Error(payload.error));
       else
         p.resolve(payload.data);
-    } else if (payload?.type === "new_message" && ready && settings.autoPlay && payload.chatId === ctx.getActiveChat().chatId && (phase === "idle" || phase === "finished")) {
-      safe(async () => {
-        await startMessage(payload.message, true);
-      });
+    } else if (payload?.type === "new_message" && payload.chatId === ctx.getActiveChat().chatId && payload.message && !payload.message.isUser) {
+      messages = [...messages.filter((m) => m.id !== payload.message.id), payload.message];
+      selectedId = payload.message.id;
+      safe(() => autoPrepareMessage(payload.message));
     }
   }));
   const marker = new PassageMarker(() => {});
@@ -985,7 +1064,11 @@ function setup(ctx) {
     try {
       if (!widget && typeof ctx.ui.createFloatWidget === "function") {
         const width = Math.min(320, Math.max(240, window.innerWidth - 24));
-        widget = ctx.ui.createFloatWidget({ width, height: 146, initialPosition: { x: Math.max(12, window.innerWidth - width - 24), y: Math.max(12, window.innerHeight - 220) }, snapToEdge: true, tooltip: "Readalong · drag to move" });
+        widget = ctx.ui.createFloatWidget({ width, height: 184, initialPosition: { x: Math.max(12, window.innerWidth - width - 24), y: Math.max(12, window.innerHeight - 220) }, snapToEdge: true, tooltip: "Readalong · drag to move" });
+        widget.root.addEventListener("pointerdown", (event) => {
+          if (event.target.closest("button,input,select,a"))
+            event.stopPropagation();
+        });
         widget.root.classList.add("ra-mini");
         widget.root.dataset.raUi = "true";
         widget.root.setAttribute("aria-label", "Readalong floating player");
@@ -1026,12 +1109,15 @@ function setup(ctx) {
     const caption = el("p", phase === "playing" || phase === "paused" ? `${currentSegments[position]?.speaker || "Voice"} · ${currentPassages[currentPassage]?.voice || ""}` : status.textContent ?? "Choose a message.", "ra-caption");
     caption.title = currentSegments[position]?.text ?? caption.textContent ?? "";
     const controls = el("div", "", "ra-row");
-    const play = button(phase === "paused" ? "Resume" : phase === "playing" ? "Pause" : phase === "finished" ? "Replay" : "Play", () => safe(playOrPause), true);
-    play.disabled = phase === "preparing" || phase === "idle";
+    const play = button(!settings.enabled ? "Turn on" : phase === "preparing" ? "Preparing…" : phase === "idle" ? "Play latest" : phase === "paused" ? "Resume" : phase === "playing" ? "Pause" : phase === "finished" ? "Replay" : "Play", () => safe(settings.enabled ? playOrPause : () => setEnabled(true)), true);
+    play.disabled = !ready || settings.enabled && (phase === "preparing" || phase === "idle" && !selectedId);
     controls.append(play);
     const stopButton = button("Stop", () => stop());
     stopButton.disabled = phase === "idle";
     controls.append(stopButton, button("Open player", () => tab.activate()));
+    const power = button(settings.enabled ? "On" : "Off", () => safe(() => setEnabled(!settings.enabled)));
+    power.setAttribute("aria-label", settings.enabled ? "Turn Readalong off" : "Turn Readalong on");
+    header.insertBefore(power, close);
     const progress = el("progress");
     progress.max = 1;
     progress.value = phase === "preparing" ? preparedCount / Math.max(1, currentPassages.length) : phase === "finished" ? 1 : phase === "ready" ? 0 : audioPlayer.duration ? audioPlayer.elapsed / audioPlayer.duration : position / Math.max(1, currentSegments.length);
@@ -1076,9 +1162,26 @@ function setup(ctx) {
     renderPlayer();
   }
   audioPlayer.onEnded = finished;
+  audioPlayer.onError = (error) => {
+    paused = true;
+    playing = false;
+    phase = "paused";
+    stopClock();
+    notice(error.message, true);
+    renderPlayer();
+  };
   async function playOrPause() {
-    if (phase === "preparing" || phase === "idle")
+    if (!settings.enabled)
+      throw new Error("Readalong is off. Turn it on to prepare audio.");
+    if (phase === "preparing")
       return;
+    if (phase === "idle") {
+      if (!selectedId)
+        throw new Error("No assistant message found.");
+      await readId(selectedId);
+      if (phase !== "ready" || !settings.enabled)
+        return;
+    }
     if (phase === "playing") {
       if (browserQueueActive)
         speechSynthesis.pause();
@@ -1210,12 +1313,48 @@ function setup(ctx) {
     const controller = new AbortController;
     nativeRequests.add(controller);
     try {
-      return await nativeTts.speech(connection, snapshot, segment, undefined, AbortSignal.any([controller.signal, AbortSignal.timeout(70000), ...signal ? [signal] : []]));
+      return await nativeTts.speech(connection, snapshot, segment, undefined, AbortSignal.any([controller.signal, AbortSignal.timeout(300000), ...signal ? [signal] : []]));
     } finally {
       nativeRequests.delete(controller);
     }
   }
-  async function startMessage(message, autoStart = false) {
+  async function autoPrepareMessage(message, force = false) {
+    if (!initialized || !settings.enabled || disposed || message.isUser)
+      return;
+    const key = JSON.stringify([ctx.getActiveChat().chatId, message.id, message.content]);
+    if (!force && (automaticPreparations.has(key) || currentMessage?.id === message.id && currentMessage.content === message.content))
+      return;
+    automaticPreparations.add(key);
+    if (automaticPreparations.size > 20)
+      automaticPreparations.delete(automaticPreparations.values().next().value);
+    await startMessage(message);
+  }
+  async function prepareLatest(force = false) {
+    if (!settings.enabled || !initialized)
+      return;
+    const latest = messages.at(-1);
+    if (latest)
+      await autoPrepareMessage(latest, force);
+    else
+      notice("Readalong is on. New assistant replies will prepare automatically.");
+  }
+  async function setEnabled(enabled) {
+    settings.enabled = enabled;
+    if (!enabled)
+      stop(false);
+    renderPlayer();
+    renderVoices();
+    renderAssignments();
+    notice(enabled ? "Readalong is on. Preparing the latest reply…" : "Readalong is off. No speech requests will be started.");
+    await saveSettings();
+    if (enabled && settings.enabled) {
+      await refreshMessages();
+      await prepareLatest(true);
+    }
+  }
+  async function startMessage(message) {
+    if (!settings.enabled)
+      throw new Error("Readalong is off. Turn it on to prepare audio.");
     stop(false);
     const token = playbackId;
     readingAbort = new AbortController;
@@ -1249,17 +1388,13 @@ function setup(ctx) {
         notice("There is no readable text in this message.");
         return;
       }
-      let decodedBytes = 0;
       if (snapshot.provider !== "browser") {
-        const buffers = await prepareAll(currentPassages, async (p, _index, requestSignal) => {
+        const clips = await prepareAll(currentPassages, async (p, _index, requestSignal) => {
           const data = await prepareSpeech(p.segment, p.settings, requestSignal);
           requestSignal.throwIfAborted();
-          const buffer = await audioPlayer.decode(data);
+          const clip = await prepareClip(data, requestSignal);
           requestSignal.throwIfAborted();
-          decodedBytes += buffer.length * buffer.numberOfChannels * 4;
-          if (decodedBytes > 256 * 1024 * 1024)
-            throw new Error("This message is too long to hold in memory. Read a shorter message.");
-          return buffer;
+          return clip;
         }, signal, (count) => {
           if (token === playbackId) {
             preparedCount = count;
@@ -1269,7 +1404,7 @@ function setup(ctx) {
         }, snapshot.provider === "lumiverse" ? 3 : 2);
         if (token !== playbackId)
           return;
-        audioPlayer.load(buffers);
+        audioPlayer.load(clips);
         audioPlayer.setSpeed(settings.speed);
         audioPlayer.setVolume(settings.volume);
       }
@@ -1278,8 +1413,6 @@ function setup(ctx) {
       phase = "ready";
       notice("The whole message is ready. Press Play.");
       renderPlayer();
-      if (autoStart)
-        await playOrPause();
     } catch (e) {
       if (token === playbackId) {
         stop(false);
@@ -1288,6 +1421,8 @@ function setup(ctx) {
     }
   }
   async function preview(voice, assignment) {
+    if (!settings.enabled)
+      throw new Error("Readalong is off. Turn it on to test a voice.");
     stop(false);
     const token = playbackId;
     readingAbort = new AbortController;
@@ -1307,17 +1442,24 @@ function setup(ctx) {
         const data = await prepareSpeech(currentPassages[0].segment, currentPassages[0].settings, readingAbort.signal);
         if (token !== playbackId)
           return;
-        const buffer = await audioPlayer.decode(data);
+        const clip = await prepareClip(data, readingAbort.signal);
         if (token !== playbackId)
           return;
-        audioPlayer.load([buffer]);
+        audioPlayer.load([clip]);
         audioPlayer.setSpeed(settings.speed);
         audioPlayer.setVolume(settings.volume);
       }
       if (token !== playbackId)
         return;
       phase = "ready";
-      await playOrPause();
+      notice("Sample ready. Press Play.");
+      renderPlayer();
+      try {
+        await playOrPause();
+      } catch (e) {
+        notice(e instanceof Error ? e.message : "Sample ready. Press Play.", true);
+        renderPlayer();
+      }
     } catch (e) {
       if (token === playbackId) {
         stop(false);
@@ -1326,9 +1468,15 @@ function setup(ctx) {
     }
   }
   async function saveSettings() {
-    const r = await rpc("save", { settings });
+    const snapshot = normalizeSettings(settings), version = ++saveVersion;
+    const work = saveQueue.then(() => rpc("save", { settings: snapshot }));
+    saveQueue = work.catch(() => {});
+    const r = await work;
+    if (disposed || version !== saveVersion)
+      return;
     settings = normalizeSettings(r.settings);
-    notice("Settings saved.");
+    if (phase === "idle")
+      notice(settings.enabled ? "Readalong is on. New replies prepare automatically." : "Readalong is off. No speech requests will be started.");
   }
   function chooseNative(connection, preserveModel = false) {
     settings.provider = "lumiverse";
@@ -1409,7 +1557,15 @@ function setup(ctx) {
     await startMessage(r.message);
   }
   function renderPlayer() {
+    for (const handle of bubbleHandles.values()) {
+      const read = handle.querySelector("button");
+      if (read)
+        read.disabled = !settings.enabled;
+    }
     player.replaceChildren(el("h3", phase === "preparing" ? "Preparing the whole message" : phase === "ready" ? "Ready to play" : phase === "playing" || phase === "paused" ? "Now reading" : "Listen to a passage"));
+    player.append(toggle("Readalong on · prepare replies automatically", settings.enabled, (v) => {
+      safe(() => setEnabled(v));
+    }), el("p", "When on, the latest reply in this chat and new assistant replies are prepared automatically. Speech providers may charge for preparation. Audio waits for you to press Play. Turn off to stop new requests.", "ra-muted"));
     const row = el("div", "", "ra-row");
     if (phase !== "idle") {
       const play = button(phase === "paused" ? "Resume" : phase === "playing" ? "Pause" : phase === "finished" ? "Replay" : "Play", () => safe(playOrPause), true);
@@ -1427,7 +1583,7 @@ function setup(ctx) {
             throw new Error("No assistant message found.");
         }
       }), true);
-      read.disabled = !ready;
+      read.disabled = !ready || !settings.enabled;
       row.append(read, button("Refresh messages", () => safe(refreshMessages)));
     }
     if (typeof ctx.ui.createFloatWidget === "function")
@@ -1449,7 +1605,7 @@ function setup(ctx) {
       if (currentMessage)
         player.append(el("p", "The sentence marker estimates your place within continuous audio. Pausing keeps it in place.", "ra-muted"));
     } else
-      player.append(el("p", "Prepare the whole message, then press Play. Narration and dialogue use their assigned voices.", "ra-muted"));
+      player.append(el("p", settings.enabled ? "New replies prepare automatically. You can also choose an older message to prepare." : "Readalong is off. Turn it on when you want prepared speech.", "ra-muted"));
     player.append(toggle("Follow the spoken passage as it moves down the page", settings.follow, (v) => {
       settings.follow = v;
       safe(saveSettings);
@@ -1622,17 +1778,19 @@ function setup(ctx) {
       diagnoseButton = null;
       diagnoseHint = null;
     }
-    config.append(toggle("Automatically read new replies after they finish", settings.autoPlay, (v) => settings.autoPlay = v), toggle("Ask the existing chat model for occasional emotion and speaker cues", settings.promptEmotions, (v) => settings.promptEmotions = v), toggle("Use emotion cues when the speech model supports them", settings.useEmotions, (v) => settings.useEmotions = v), button("Save settings", () => safe(saveSettings), true));
+    config.append(toggle("Ask the existing chat model for occasional emotion and speaker cues", settings.promptEmotions, (v) => settings.promptEmotions = v), toggle("Use emotion cues when the speech model supports them", settings.useEmotions, (v) => settings.useEmotions = v), button("Save settings", () => safe(saveSettings), true));
     config.append(el("p", "Emotion cues add a few tokens to normal chat replies. No second LLM is called. Hidden tags remain in the original message.", "ra-muted"));
   }
   function renderVoices() {
     voicesCard.replaceChildren(el("h3", "Choose a voice"));
     const row = el("div", "", "ra-row");
+    const listen = button("Listen", () => safe(() => preview(settings.voice)));
+    listen.disabled = !settings.enabled;
     row.append(field("Default voice", voiceSelect(settings.voice, (v) => {
       settings.voice = v;
       renderVoices();
       safe(saveSettings);
-    })), button("Listen", () => safe(() => preview(settings.voice))));
+    })), listen);
     voicesCard.append(row);
     if (settings.provider === "local")
       voicesCard.append(field("Other voice ID", textInput(settings.voice, (v) => settings.voice = v)), el("p", "The listed voices are common Kokoro defaults. Enter a voice ID for another local server.", "ra-muted"));
@@ -1682,8 +1840,10 @@ function setup(ctx) {
     const row = el("div", "", "ra-grid");
     row.append(field("Default emotion", select(EMOTIONS.map((v) => ({ value: v, label: v })), assignment.emotion, (v) => assignment.emotion = v)), field("Default delivery", select(DELIVERIES.map((v) => ({ value: v, label: v })), assignment.delivery, (v) => assignment.delivery = v)));
     container.append(row);
+    const listen = button("Listen", () => safe(() => preview(assignment.voice || settings.voice, assignment)));
+    listen.disabled = !settings.enabled;
     const actions = el("div", "", "ra-row");
-    actions.append(button("Listen", () => safe(() => preview(assignment.voice || settings.voice, assignment))), button("Save voice", () => safe(update), true), button("Use defaults", () => safe(async () => {
+    actions.append(listen, button("Save voice", () => safe(update), true), button("Use defaults", () => safe(async () => {
       delete settings.assignments[key];
       await saveSettings();
       assignmentForm(key, name, container);
@@ -1725,7 +1885,9 @@ function setup(ctx) {
         continue;
       const handle = ctx.dom.inject(element, '<div class="ra-bubble" data-ra-ui="true"></div>', "beforeend");
       const target = handle.firstElementChild;
-      target.append(button("Read aloud", () => safe(() => readId(messageId))));
+      const read = button("Read aloud", () => safe(() => readId(messageId)));
+      read.disabled = !settings.enabled;
+      target.append(read);
       bubbleHandles.set(messageId, handle);
     }
   }
@@ -1736,11 +1898,15 @@ function setup(ctx) {
     stop(false);
     messages = [];
     selectedId = "";
+    automaticPreparations.clear();
     for (const handle of bubbleHandles.values())
       ctx.dom.uninject(handle);
     bubbleHandles.clear();
-    notice("Choose a message in this chat.");
-    safe(refreshMessages);
+    notice(settings.enabled ? "Preparing this chat’s latest reply…" : "Readalong is off.");
+    safe(async () => {
+      await refreshMessages();
+      await prepareLatest();
+    });
   });
   for (const event of ["MESSAGE_EDITED", "MESSAGE_SWIPED", "SWIPE_EDITED", "MESSAGE_DELETED"])
     onEvent(event, (p) => {
@@ -1836,15 +2002,15 @@ function setup(ctx) {
         renderAssignments();
       } catch {}
     }
-    if (settings.provider === "lumiverse" || permissions.includes("cors_proxy")) {
-      try {
-        await refreshCatalog();
-      } catch {
-        notice("Could not refresh the voice list. Check the saved connection and try Refresh again.", true);
-      }
-    }
-    if (permissions.includes("chat_mutation"))
+    initialized = true;
+    if (settings.provider === "lumiverse" || permissions.includes("cors_proxy"))
+      refreshCatalog().catch(() => {});
+    if (permissions.includes("chat_mutation")) {
       await refreshMessages();
+      await prepareLatest();
+    }
+    if (!settings.enabled)
+      notice("Readalong is off. No speech requests will be started.");
   });
   return () => {
     stop(false);

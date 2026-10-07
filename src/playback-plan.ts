@@ -2,6 +2,7 @@ import { selectVoice, speakerCharacterId, splitSentences, readVoiceRef, type Cha
 import type { NativeConnection } from './native-tts';
 
 export const MAX_PASSAGE_CHARS=3000;
+export const MAX_NATIVE_PASSAGE_CHARS=12000;
 export interface SpeechPassage { segment:SpeechSegment;segments:SpeechSegment[];settings:Settings;voice:string }
 export interface VoiceContext { characters:CharacterInfo[];characterId?:string;connections?:NativeConnection[];narrationVoice?:NativeVoiceRef;overrides?:{narrator?:unknown;characters?:Record<string,unknown>} }
 
@@ -27,7 +28,8 @@ export function planSpeech(segments:SpeechSegment[], settings:Settings, context:
     const emotion=styleSupported?assignment.emotion:'neutral', delivery=styleSupported?assignment.delivery:'normal';
     const key=JSON.stringify([snapshot.provider,snapshot.connectionId,snapshot.model,snapshot.voice,emotion,delivery]);
     const last=passages.at(-1);
-    if(last && previousKey===key && last.segment.text.length+segment.text.length+1<=MAX_PASSAGE_CHARS) {
+    const limit=snapshot.provider==='lumiverse' && /gemini-.*tts/i.test(snapshot.model)?MAX_NATIVE_PASSAGE_CHARS:MAX_PASSAGE_CHARS;
+    if(last && previousKey===key && last.segment.text.length+segment.text.length+1<=limit) {
       last.segment.text+=' '+segment.text;last.segments.push(segment);
     } else passages.push({segment:{...segment,emotion,delivery},segments:[segment],settings:snapshot,voice:snapshot.voice});
     previousKey=key;

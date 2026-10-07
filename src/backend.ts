@@ -145,6 +145,7 @@ spindle.onFrontendMessage(async (payload, userId, sessionId) => {
     } else if (p.type === 'check_connection') {
       reply(await checkConnection(p.settings ? normalizeSettings(p.settings) : settings,userId));
     } else if (p.type === 'diagnose_speech') {
+      if(!settings.enabled)throw new Error('Readalong is off. Turn it on to request speech.');
       reply(await diagnoseSpeech(scope,userId));
     } else if (p.type === 'characters') {
       const characters: CharacterInfo[] = [];
@@ -167,6 +168,7 @@ spindle.onFrontendMessage(async (payload, userId, sessionId) => {
     } else if (p.type === 'cancel') {
       canceled.set(scope, (canceled.get(scope) ?? 0) + 1); reply({});
     } else if (p.type === 'speech') {
+      if(!settings.enabled)throw new Error('Readalong is off. Turn it on to request speech.');
       if ((busy.get(scope) ?? 0) >= 2) throw new Error('Speech is already being prepared. Try again shortly.');
       const s = p.segment;
       if (!s || typeof s.text !== 'string' || s.text.length > MAX_PASSAGE_CHARS || !s.text.trim()) throw new Error('Invalid speech passage.');
@@ -197,7 +199,7 @@ spindle.onFrontendMessage(async (payload, userId, sessionId) => {
 });
 spindle.registerInterceptor(async (messages, context) => {
   const settings = await load(context.userId);
-  if (!settings.promptEmotions || !spindle.permissions.has('regex_scripts')) return messages;
+  if (!settings.enabled || !settings.promptEmotions || !spindle.permissions.has('regex_scripts')) return messages;
   // No LLM call: append a compact instruction to the generation already underway.
   await ensureHideRule(context.userId);
   return [{ role: 'system', content: EMOTION_INSTRUCTION }, ...messages];

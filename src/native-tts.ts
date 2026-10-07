@@ -1,4 +1,4 @@
-import { pcmToWav } from './audio';
+import { pcmBlobToWav } from './prepared-audio';
 import { selectVoice, speechInput, readVoiceRef, DEFAULT_SPEECH_RULES, type SpeechRules, type Settings, type SpeechSegment } from './shared';
 import { providerError, redactSecrets } from './provider-errors';
 export interface NativeConnection { id:string;name:string;provider:string;model:string;voice:string;outputFormat?:string }
@@ -74,18 +74,18 @@ export function createNativeTtsClient(transport:typeof fetch = fetch) {
       if(result.success!==true)throw new Error(typeof result.message==='string'?redactSecrets(result.message.slice(0,600)):'Lumiverse could not connect to this TTS provider.');
       return 'Lumiverse accepts this saved TTS connection. Click Listen to test a voice. No speech was generated.';
     },
-    async speech(connection:NativeConnection, settings:Settings, segment:SpeechSegment, characterId?:string, signal?:AbortSignal):Promise<{bytes:Uint8Array;mime:string}> {
+    async speech(connection:NativeConnection, settings:Settings, segment:SpeechSegment, characterId?:string, signal?:AbortSignal):Promise<{blob:Blob;mime:string}> {
       const body=nativeSpeechRequest(connection,settings,segment,characterId);
       const response=await request('/tts/synthesize',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal});
       const mime=response.headers.get('content-type')?.toLowerCase() ?? '';
       if(!response.ok || mime.includes('json')) {
         const text=new TextDecoder().decode(await boundedBytes(response,64*1024));throw new Error(providerError('Lumiverse TTS',response.status,text));
       }
-      const bytes=await boundedBytes(response,25*1024*1024);
-      if(!bytes.length)throw new Error('Lumiverse returned no speech audio.');
-      if(mime.startsWith('audio/pcm') || mime.startsWith('audio/x-pcm'))return {bytes:pcmToWav(bytes,mime),mime:'audio/wav'};
       if(!mime.startsWith('audio/') && !mime.startsWith('application/ogg'))throw new Error('Lumiverse returned an unsupported speech response.');
-      return {bytes,mime};
+      const blob=await response.blob();signal?.throwIfAborted();
+      if(!blob.size)throw new Error('Lumiverse returned no speech audio.');
+      if(mime.startsWith('audio/pcm') || mime.startsWith('audio/x-pcm'))return {blob:await pcmBlobToWav(blob,mime),mime:'audio/wav'};
+      return {blob,mime};
     },
   };
 }

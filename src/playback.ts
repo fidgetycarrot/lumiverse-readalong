@@ -1,4 +1,4 @@
-export interface SpeechAudio {audio?:string;bytes?:Uint8Array;mime:string}
+export interface SpeechAudio {audio?:string;bytes?:Uint8Array;blob?:Blob;mime:string}
 export interface PlaybackPosition {index:number;seconds:number;fraction:number;elapsed:number;duration:number}
 
 /** A private audio clock for Readalong, independent of the host's player. */

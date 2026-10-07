@@ -8,14 +8,14 @@ export interface Settings {
   provider: 'lumiverse' | 'openrouter' | 'browser' | 'local';
   connectionId: string;
   model: string; voice: string; narratorVoice: string; localUrl: string;
-  autoPlay: boolean; follow: boolean; promptEmotions: boolean; useEmotions: boolean;
+  enabled: boolean; follow: boolean; promptEmotions: boolean; useEmotions: boolean;
   inheritVoices: boolean;
   speed: number; volume: number;
   assignments: Record<string, VoiceAssignment>;
 }
 export const DEFAULTS: Settings = {
   provider: 'openrouter', connectionId:'', model: 'google/gemini-3.8-flash-tts', voice: 'Kore', narratorVoice: '',
-  localUrl: 'http://localhost:8880/v1', autoPlay: false, follow: false,
+  localUrl: 'http://localhost:8880/v1', enabled: true, follow: false,
   promptEmotions: true, useEmotions: true, inheritVoices:true, speed: 1, volume: 0.85, assignments: {},
 };
 export interface SpeechSegment { text: string; speaker: string; emotion: string; delivery: string }
@@ -50,7 +50,7 @@ export function normalizeSettings(raw: unknown): Settings {
     provider: ['lumiverse','openrouter','browser','local'].includes(r.provider ?? '') ? r.provider! : DEFAULTS.provider,
     model: str(r.model, DEFAULTS.model), voice: str(r.voice, DEFAULTS.voice), narratorVoice: str(r.narratorVoice, ''),
     localUrl: str(r.localUrl, DEFAULTS.localUrl, 500),
-    autoPlay: r.autoPlay === true, follow: r.follow === true,
+    enabled: r.enabled !== false, follow: r.follow === true,
     promptEmotions: r.promptEmotions !== false, useEmotions: r.useEmotions !== false, inheritVoices:r.inheritVoices!==false,
     speed: clamp(r.speed, 0.5, 2, 1), volume: clamp(r.volume, 0, 1, .85), assignments,
   };

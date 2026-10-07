@@ -3,7 +3,7 @@ import { DEFAULTS, GEMINI_VOICES, EMOTIONS, DELIVERIES, needsPcm, normalizeSetti
 import { PassageMarker } from './highlight';
 import { createNativeTtsClient, type NativeConnection } from './native-tts';
 import { planSpeech, prepareAll, estimatedSentenceIndex, type SpeechPassage, type VoiceContext } from './playback-plan';
-import { BufferedPlayer } from './playback';
+import { PreparedPlayer, prepareClip } from './prepared-audio';
 
 const STYLE = `
 ::highlight(lumiverse-readalong){background:rgba(245,190,80,.30);color:inherit;text-decoration:underline;text-decoration-color:#e7b24c;text-decoration-thickness:2px;}
@@ -38,7 +38,7 @@ function toggle(label: string, value: boolean, change: (v: boolean) => void) { c
 function timeLabel(seconds:number){const value=Math.floor(seconds);return `${Math.floor(value/60)}:${String(value%60).padStart(2,'0')}`}
 
 export function setup(ctx: SpindleFrontendContext) {
-  let settings = normalizeSettings(DEFAULTS), hasKey = false, ready = false, disposed = false;
+  let settings = normalizeSettings(DEFAULTS), hasKey = false, ready = false, initialized = false, disposed = false;
   let canDiagnoseSpeech = false, diagnosing = false, diagnoseButton: HTMLButtonElement | null = null;
   let diagnoseHint: HTMLElement | null = null;
   let models: SpeechModel[] = [{ id:DEFAULTS.model, name:'Google: Gemini 3.8 Flash TTS', voices:GEMINI_VOICES }];
@@ -49,7 +49,9 @@ export function setup(ctx: SpindleFrontendContext) {
   let playbackId = 0, playing = false, paused = false, currentMessage: MessageInfo | null = null;
   let phase:'idle'|'preparing'|'ready'|'playing'|'paused'|'finished'='idle';
   let utterance: SpeechSynthesisUtterance | null = null;
-  const audioPlayer=new BufferedPlayer();
+  const audioPlayer=new PreparedPlayer();
+  const automaticPreparations=new Set<string>();
+  let saveQueue:Promise<unknown>=Promise.resolve(),saveVersion=0;
   let currentPassages:SpeechPassage[]=[],preparedCount=0,currentPassage=0;
   let readingAbort:AbortController|null=null,clockTimer:ReturnType<typeof setInterval>|null=null;
   let browserQueueActive=false,browserResume:(()=>void)|null=null;
@@ -91,8 +93,9 @@ export function setup(ctx: SpindleFrontendContext) {
       const p = pending.get(payload.requestId); if (!p) return; clearTimeout(p.timer); pending.delete(payload.requestId);
       if (typeof payload.canDiagnoseSpeech === 'boolean') showDiagnostics(payload.canDiagnoseSpeech);
       if (payload.error) p.reject(new Error(payload.error)); else p.resolve(payload.data);
-    } else if (payload?.type === 'new_message' && ready && settings.autoPlay && payload.chatId === ctx.getActiveChat().chatId && (phase==='idle' || phase==='finished')) {
-      void safe(async () => { await startMessage(payload.message,true) });
+    } else if (payload?.type === 'new_message' && payload.chatId === ctx.getActiveChat().chatId && payload.message && !payload.message.isUser) {
+      messages=[...messages.filter(m=>m.id!==payload.message.id),payload.message];selectedId=payload.message.id;
+      void safe(()=>autoPrepareMessage(payload.message));
     }
   }));
   const marker = new PassageMarker(()=>{});
@@ -128,7 +131,8 @@ export function setup(ctx: SpindleFrontendContext) {
     try {
       if(!widget && typeof ctx.ui.createFloatWidget==='function') {
         const width=Math.min(320,Math.max(240,window.innerWidth-24));
-        widget=ctx.ui.createFloatWidget({width,height:146,initialPosition:{x:Math.max(12,window.innerWidth-width-24),y:Math.max(12,window.innerHeight-220)},snapToEdge:true,tooltip:'Readalong · drag to move'});
+        widget=ctx.ui.createFloatWidget({width,height:184,initialPosition:{x:Math.max(12,window.innerWidth-width-24),y:Math.max(12,window.innerHeight-220)},snapToEdge:true,tooltip:'Readalong · drag to move'});
+        widget.root.addEventListener('pointerdown',event=>{if((event.target as Element).closest('button,input,select,a'))event.stopPropagation()});
         widget.root.classList.add('ra-mini');widget.root.dataset.raUi='true';widget.root.setAttribute('aria-label','Readalong floating player');
       }
       widget?.setVisible(true);renderWidget();widgetError='';
@@ -152,9 +156,10 @@ export function setup(ctx: SpindleFrontendContext) {
     const caption=el('p',phase==='playing' || phase==='paused' ? `${currentSegments[position]?.speaker || 'Voice'} · ${currentPassages[currentPassage]?.voice || ''}` : status.textContent ?? 'Choose a message.','ra-caption');
     caption.title=currentSegments[position]?.text ?? caption.textContent ?? '';
     const controls=el('div','', 'ra-row');
-    const play=button(phase==='paused'?'Resume':phase==='playing'?'Pause':phase==='finished'?'Replay':'Play',()=>safe(playOrPause),true);
-    play.disabled=phase==='preparing' || phase==='idle';controls.append(play);
+    const play=button(!settings.enabled?'Turn on':phase==='preparing'?'Preparing…':phase==='idle'?'Play latest':phase==='paused'?'Resume':phase==='playing'?'Pause':phase==='finished'?'Replay':'Play',()=>safe(settings.enabled?playOrPause:()=>setEnabled(true)),true);
+    play.disabled=!ready || settings.enabled && (phase==='preparing' || phase==='idle' && !selectedId);controls.append(play);
     const stopButton=button('Stop',()=>stop());stopButton.disabled=phase==='idle';controls.append(stopButton,button('Open player',()=>tab.activate()));
+    const power=button(settings.enabled?'On':'Off',()=>safe(()=>setEnabled(!settings.enabled)));power.setAttribute('aria-label',settings.enabled?'Turn Readalong off':'Turn Readalong on');header.insertBefore(power,close);
     const progress=el('progress');progress.max=1;progress.value=phase==='preparing'?preparedCount/Math.max(1,currentPassages.length):phase==='finished'?1:phase==='ready'?0:audioPlayer.duration?audioPlayer.elapsed/audioPlayer.duration:position/Math.max(1,currentSegments.length);progress.setAttribute('aria-label',phase==='preparing'?'Speech preparation':'Playback progress');
     widget.root.replaceChildren(header,caption,controls,progress);
   }
@@ -178,8 +183,11 @@ export function setup(ctx: SpindleFrontendContext) {
     notice(currentPassages[0]?.settings.provider==='browser'?'Finished. Replay reads this passage again.':'Finished. Replay uses the prepared audio.');renderPlayer();
   }
   audioPlayer.onEnded=finished;
+  audioPlayer.onError=error=>{paused=true;playing=false;phase='paused';stopClock();notice(error.message,true);renderPlayer()};
   async function playOrPause() {
-    if(phase==='preparing' || phase==='idle')return;
+    if(!settings.enabled)throw new Error('Readalong is off. Turn it on to prepare audio.');
+    if(phase==='preparing')return;
+    if(phase==='idle'){if(!selectedId)throw new Error('No assistant message found.');await readId(selectedId);if((phase as string)!=='ready' || !settings.enabled)return;}
     if(phase==='playing') {
       if(browserQueueActive)speechSynthesis.pause();else{updateClock();audioPlayer.pause()}
       paused=true;playing=false;phase='paused';stopClock();notice('Paused. Your place is saved.');renderPlayer();return;
@@ -226,10 +234,30 @@ export function setup(ctx: SpindleFrontendContext) {
     const connection=activeNative(snapshot.connectionId);
     if(!connection)throw new Error('Choose a saved Lumiverse TTS connection first. Add one in Lumiverse’s voice settings if the list is empty.');
     const controller=new AbortController();nativeRequests.add(controller);
-    try{return await nativeTts.speech(connection,snapshot,segment,undefined,AbortSignal.any([controller.signal,AbortSignal.timeout(70000),...(signal?[signal]:[])]))}
+    try{return await nativeTts.speech(connection,snapshot,segment,undefined,AbortSignal.any([controller.signal,AbortSignal.timeout(300000),...(signal?[signal]:[])]))}
     finally{nativeRequests.delete(controller)}
   }
-  async function startMessage(message: MessageInfo, autoStart=false) {
+  async function autoPrepareMessage(message:MessageInfo,force=false) {
+    if(!initialized || !settings.enabled || disposed || message.isUser)return;
+    const key=JSON.stringify([ctx.getActiveChat().chatId,message.id,message.content]);
+    if(!force && (automaticPreparations.has(key) || currentMessage?.id===message.id && currentMessage.content===message.content))return;
+    automaticPreparations.add(key);if(automaticPreparations.size>20)automaticPreparations.delete(automaticPreparations.values().next().value!);
+    await startMessage(message);
+  }
+  async function prepareLatest(force=false) {
+    if(!settings.enabled || !initialized)return;
+    const latest=messages.at(-1);if(latest)await autoPrepareMessage(latest,force);
+    else notice('Readalong is on. New assistant replies will prepare automatically.');
+  }
+  async function setEnabled(enabled:boolean) {
+    settings.enabled=enabled;if(!enabled)stop(false);
+    renderPlayer();renderVoices();renderAssignments();
+    notice(enabled?'Readalong is on. Preparing the latest reply…':'Readalong is off. No speech requests will be started.');
+    await saveSettings();
+    if(enabled && settings.enabled){await refreshMessages();await prepareLatest(true)}
+  }
+  async function startMessage(message: MessageInfo) {
+    if(!settings.enabled)throw new Error('Readalong is off. Turn it on to prepare audio.');
     stop(false);
     const token=playbackId;readingAbort=new AbortController();const signal=readingAbort.signal;
     currentMessage={...message,characterId:message.characterId ?? speakerCharacterId(message.name,characters,ctx.getActiveChat().characterId ?? undefined)};
@@ -247,24 +275,21 @@ export function setup(ctx: SpindleFrontendContext) {
       const parsed=parseSegments(message.content,message.name,rules);
       currentPassages=planSpeech(parsed,snapshot,context);currentSegments=currentPassages.flatMap(p=>p.segments);
       if(!currentSegments.length){stop(false);notice('There is no readable text in this message.');return}
-      let decodedBytes=0;
       if(snapshot.provider!=='browser') {
-        const buffers=await prepareAll(currentPassages,async(p,_index,requestSignal)=>{
+        const clips=await prepareAll(currentPassages,async(p,_index,requestSignal)=>{
           const data=await prepareSpeech(p.segment,p.settings,requestSignal);requestSignal.throwIfAborted();
-          const buffer=await audioPlayer.decode(data);requestSignal.throwIfAborted();
-          decodedBytes+=buffer.length*buffer.numberOfChannels*4;
-          if(decodedBytes>256*1024*1024)throw new Error('This message is too long to hold in memory. Read a shorter message.');
-          return buffer;
+          const clip=await prepareClip(data,requestSignal);requestSignal.throwIfAborted();
+          return clip;
         },signal,count=>{if(token===playbackId){preparedCount=count;notice(`Preparing the whole message · ${count} of ${currentPassages.length} passages ready…`);renderPlayer()}},snapshot.provider==='lumiverse'?3:2);
         if(token!==playbackId)return;
-        audioPlayer.load(buffers);audioPlayer.setSpeed(settings.speed);audioPlayer.setVolume(settings.volume);
+        audioPlayer.load(clips);audioPlayer.setSpeed(settings.speed);audioPlayer.setVolume(settings.volume);
       }
       if(token!==playbackId)return;
       phase='ready';notice('The whole message is ready. Press Play.');renderPlayer();
-      if(autoStart)await playOrPause();
     } catch(e) {if(token===playbackId){stop(false);throw e}}
   }
   async function preview(voice: string, assignment?: Partial<VoiceAssignment>) {
+    if(!settings.enabled)throw new Error('Readalong is off. Turn it on to test a voice.');
     stop(false);const token=playbackId;readingAbort=new AbortController();
     if(settings.provider!=='browser')audioPlayer.unlock();
     const segment={text:'The door was open. I took a breath, and stepped into the light.',speaker:'Preview',emotion:assignment?.emotion ?? 'neutral',delivery:assignment?.delivery ?? 'normal'};
@@ -274,14 +299,18 @@ export function setup(ctx: SpindleFrontendContext) {
       if(snapshot.provider!=='browser') {
         const data=await prepareSpeech(currentPassages[0].segment,currentPassages[0].settings,readingAbort.signal);
         if(token!==playbackId)return;
-        const buffer=await audioPlayer.decode(data);if(token!==playbackId)return;
-        audioPlayer.load([buffer]);audioPlayer.setSpeed(settings.speed);audioPlayer.setVolume(settings.volume);
+        const clip=await prepareClip(data,readingAbort!.signal);if(token!==playbackId)return;
+        audioPlayer.load([clip]);audioPlayer.setSpeed(settings.speed);audioPlayer.setVolume(settings.volume);
       }
-      if(token!==playbackId)return;phase='ready';await playOrPause();
+      if(token!==playbackId)return;phase='ready';notice('Sample ready. Press Play.');renderPlayer();
+      try{await playOrPause()}catch(e){notice(e instanceof Error?e.message:'Sample ready. Press Play.',true);renderPlayer()}
     } catch(e) {if(token===playbackId){stop(false);throw e}}
   }
   async function saveSettings() {
-    const r = await rpc('save',{settings}); settings = normalizeSettings(r.settings); notice('Settings saved.');
+    const snapshot=normalizeSettings(settings),version=++saveVersion;
+    const work=saveQueue.then(()=>rpc('save',{settings:snapshot}));saveQueue=work.catch(()=>{});
+    const r=await work;if(disposed || version!==saveVersion)return;
+    settings=normalizeSettings(r.settings);if(phase==='idle')notice(settings.enabled?'Readalong is on. New replies prepare automatically.':'Readalong is off. No speech requests will be started.');
   }
   function chooseNative(connection:NativeConnection, preserveModel=false) {
     settings.provider='lumiverse';settings.connectionId=connection.id;
@@ -324,14 +353,16 @@ export function setup(ctx: SpindleFrontendContext) {
     await startMessage(r.message);
   }
   function renderPlayer() {
+    for(const handle of bubbleHandles.values()){const read=handle.querySelector('button');if(read)read.disabled=!settings.enabled}
     player.replaceChildren(el('h3',phase==='preparing'?'Preparing the whole message':phase==='ready'?'Ready to play':phase==='playing' || phase==='paused'?'Now reading':'Listen to a passage'));
+    player.append(toggle('Readalong on · prepare replies automatically',settings.enabled,v=>{void safe(()=>setEnabled(v))}),el('p','When on, the latest reply in this chat and new assistant replies are prepared automatically. Speech providers may charge for preparation. Audio waits for you to press Play. Turn off to stop new requests.','ra-muted'));
     const row = el('div','', 'ra-row');
     if (phase !== 'idle') {
       const play=button(phase==='paused'?'Resume':phase==='playing'?'Pause':phase==='finished'?'Replay':'Play',()=>safe(playOrPause),true);play.disabled=phase==='preparing';
       row.append(play,button('Stop',()=>stop()));
     } else {
       const read = button('Prepare message',()=>safe(async()=>{ if (selectedId) await readId(selectedId); else { await refreshMessages(); if (selectedId) await readId(selectedId); else throw new Error('No assistant message found.') } }),true);
-      read.disabled = !ready; row.append(read,button('Refresh messages',()=>safe(refreshMessages)));
+      read.disabled = !ready || !settings.enabled; row.append(read,button('Refresh messages',()=>safe(refreshMessages)));
     }
     if(typeof ctx.ui.createFloatWidget==='function')row.append(button('Floating player',()=>safe(openWidget)));
     if (currentMessage) row.append(button('Return to passage',()=>marker.follow()));
@@ -342,7 +373,7 @@ export function setup(ctx: SpindleFrontendContext) {
       const segment = currentSegments[position], progress = el('progress');progress.max=phase==='preparing'?currentPassages.length:currentSegments.length;progress.value=phase==='preparing'?preparedCount:phase==='ready'?0:position+1;
       player.append(el('p',`${segment?.speaker || 'Voice'} · ${currentPassages[currentPassage]?.voice || ''} · Sentence ${position+1} of ${currentSegments.length}`,'ra-muted'),progress,el('p',segment?.text ?? '', 'ra-passage'));
       if (currentMessage) player.append(el('p','The sentence marker estimates your place within continuous audio. Pausing keeps it in place.','ra-muted'));
-    } else player.append(el('p','Prepare the whole message, then press Play. Narration and dialogue use their assigned voices.','ra-muted'));
+    } else player.append(el('p',settings.enabled?'New replies prepare automatically. You can also choose an older message to prepare.':'Readalong is off. Turn it on when you want prepared speech.','ra-muted'));
     player.append(toggle('Follow the spoken passage as it moves down the page',settings.follow,v=>{settings.follow=v;void safe(saveSettings)}));
     const slider = el('input'); slider.type='range'; slider.min='.5'; slider.max='2'; slider.step='.1'; slider.value=String(settings.speed);
     slider.oninput=()=>{settings.speed=Number(slider.value);speedLabel.textContent=`Playback speed · ${settings.speed.toFixed(1)}×`;audioPlayer.setSpeed(settings.speed)};
@@ -392,13 +423,14 @@ export function setup(ctx: SpindleFrontendContext) {
     } else {
       diagnoseButton=null;diagnoseHint=null;
     }
-    config.append(toggle('Automatically read new replies after they finish',settings.autoPlay,v=>settings.autoPlay=v),toggle('Ask the existing chat model for occasional emotion and speaker cues',settings.promptEmotions,v=>settings.promptEmotions=v),toggle('Use emotion cues when the speech model supports them',settings.useEmotions,v=>settings.useEmotions=v),button('Save settings',()=>safe(saveSettings),true));
+    config.append(toggle('Ask the existing chat model for occasional emotion and speaker cues',settings.promptEmotions,v=>settings.promptEmotions=v),toggle('Use emotion cues when the speech model supports them',settings.useEmotions,v=>settings.useEmotions=v),button('Save settings',()=>safe(saveSettings),true));
     config.append(el('p','Emotion cues add a few tokens to normal chat replies. No second LLM is called. Hidden tags remain in the original message.','ra-muted'));
   }
   function renderVoices() {
     voicesCard.replaceChildren(el('h3','Choose a voice'));
     const row=el('div','', 'ra-row');
-    row.append(field('Default voice',voiceSelect(settings.voice,v=>{settings.voice=v;renderVoices();void safe(saveSettings)})),button('Listen',()=>safe(()=>preview(settings.voice))));voicesCard.append(row);
+    const listen=button('Listen',()=>safe(()=>preview(settings.voice)));listen.disabled=!settings.enabled;
+    row.append(field('Default voice',voiceSelect(settings.voice,v=>{settings.voice=v;renderVoices();void safe(saveSettings)})),listen);voicesCard.append(row);
     if(settings.provider==='local')voicesCard.append(field('Other voice ID',textInput(settings.voice,v=>settings.voice=v)),el('p','The listed voices are common Kokoro defaults. Enter a voice ID for another local server.','ra-muted'));
     const names=voiceNames();const search=textInput('',v=>drawList(v));search.placeholder='Search voices';search.setAttribute('aria-label','Search voices');
     const list=el('div','', 'ra-voice-list');
@@ -417,7 +449,8 @@ export function setup(ctx: SpindleFrontendContext) {
     container.append(field('Voice',voiceSelect(assignment.voice,v=>assignment.voice=v,true)));
     if(settings.provider==='local')container.append(field('Custom voice ID',textInput(assignment.voice,v=>assignment.voice=v)));
     const row=el('div','', 'ra-grid');row.append(field('Default emotion',select(EMOTIONS.map(v=>({value:v,label:v})),assignment.emotion,v=>assignment.emotion=v)),field('Default delivery',select(DELIVERIES.map(v=>({value:v,label:v})),assignment.delivery,v=>assignment.delivery=v)));container.append(row);
-    const actions=el('div','', 'ra-row');actions.append(button('Listen',()=>safe(()=>preview(assignment.voice||settings.voice,assignment))),button('Save voice',()=>safe(update),true),button('Use defaults',()=>safe(async()=>{delete settings.assignments[key];await saveSettings();assignmentForm(key,name,container)})));container.append(actions);
+    const listen=button('Listen',()=>safe(()=>preview(assignment.voice||settings.voice,assignment)));listen.disabled=!settings.enabled;
+    const actions=el('div','', 'ra-row');actions.append(listen,button('Save voice',()=>safe(update),true),button('Use defaults',()=>safe(async()=>{delete settings.assignments[key];await saveSettings();assignmentForm(key,name,container)})));container.append(actions);
   }
   function renderAssignments() {
     assignmentsCard.replaceChildren(el('h3','Character voices'),el('p','Readalong assignments use this speech connection and override inherited Lumiverse voices. Choose a voice again after changing provider or model.','ra-muted'));
@@ -432,14 +465,14 @@ export function setup(ctx: SpindleFrontendContext) {
     for(const {messageId,element} of ctx.dom.listMessageElements()) {
       if(bubbleHandles.has(messageId))continue;
       const handle=ctx.dom.inject(element,'<div class="ra-bubble" data-ra-ui="true"></div>','beforeend');const target=handle.firstElementChild!;
-      target.append(button('Read aloud',()=>safe(()=>readId(messageId))));bubbleHandles.set(messageId,handle);
+      const read=button('Read aloud',()=>safe(()=>readId(messageId)));read.disabled=!settings.enabled;target.append(read);bubbleHandles.set(messageId,handle);
     }
   }
   function onEvent(name:string,fn:(payload:any)=>void) {cleanups.push(ctx.events.on(name,p=>fn(p)))}
   onEvent('CHAT_SWITCHED',()=>{
-    stop(false); messages=[]; selectedId='';
+    stop(false); messages=[]; selectedId='';automaticPreparations.clear();
     for (const handle of bubbleHandles.values()) ctx.dom.uninject(handle);
-    bubbleHandles.clear(); notice('Choose a message in this chat.'); void safe(refreshMessages);
+    bubbleHandles.clear(); notice(settings.enabled?'Preparing this chat’s latest reply…':'Readalong is off.'); void safe(async()=>{await refreshMessages();await prepareLatest()});
   });
   for(const event of ['MESSAGE_EDITED','MESSAGE_SWIPED','SWIPE_EDITED','MESSAGE_DELETED'])onEvent(event,p=>{
     const id=p?.message?.id??p?.messageId;if(currentMessage?.id===id)stop();
@@ -470,8 +503,10 @@ export function setup(ctx: SpindleFrontendContext) {
     renderPlayer();renderConfig();renderVoices();renderAssignments();installEditor();
     if(r.cueStatus)notice(r.cueStatus,true);else notice('Ready. Choose a voice and listen to a sample.');
     if(permissions.includes('characters')){try{const r=await rpc('characters');characters=r.characters;renderAssignments()}catch{}}
-    if(settings.provider==='lumiverse' || permissions.includes('cors_proxy')){try{await refreshCatalog()}catch{notice('Could not refresh the voice list. Check the saved connection and try Refresh again.',true)}}
-    if(permissions.includes('chat_mutation'))await refreshMessages();
+    initialized=true;
+    if(settings.provider==='lumiverse' || permissions.includes('cors_proxy'))void refreshCatalog().catch(()=>{});
+    if(permissions.includes('chat_mutation')){await refreshMessages();await prepareLatest()}
+    if(!settings.enabled)notice('Readalong is off. No speech requests will be started.');
   });
   return()=>{
     stop(false);disposed=true;marker.dispose();audioPlayer.dispose();widget?.destroy();for(const fn of cleanups)fn();editorTab?.destroy();action.destroy();tab.destroy();

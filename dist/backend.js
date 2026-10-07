@@ -11,7 +11,7 @@ var DEFAULTS = {
   voice: "Kore",
   narratorVoice: "",
   localUrl: "http://localhost:8880/v1",
-  autoPlay: false,
+  enabled: true,
   follow: false,
   promptEmotions: true,
   useEmotions: true,
@@ -45,7 +45,7 @@ function normalizeSettings(raw) {
     voice: str(r.voice, DEFAULTS.voice),
     narratorVoice: str(r.narratorVoice, ""),
     localUrl: str(r.localUrl, DEFAULTS.localUrl, 500),
-    autoPlay: r.autoPlay === true,
+    enabled: r.enabled !== false,
     follow: r.follow === true,
     promptEmotions: r.promptEmotions !== false,
     useEmotions: r.useEmotions !== false,
@@ -334,6 +334,8 @@ spindle.onFrontendMessage(async (payload, userId, sessionId) => {
     } else if (p.type === "check_connection") {
       reply(await checkConnection(p.settings ? normalizeSettings(p.settings) : settings, userId));
     } else if (p.type === "diagnose_speech") {
+      if (!settings.enabled)
+        throw new Error("Readalong is off. Turn it on to request speech.");
       reply(await diagnoseSpeech(scope, userId));
     } else if (p.type === "characters") {
       const characters = [];
@@ -361,6 +363,8 @@ spindle.onFrontendMessage(async (payload, userId, sessionId) => {
       canceled.set(scope, (canceled.get(scope) ?? 0) + 1);
       reply({});
     } else if (p.type === "speech") {
+      if (!settings.enabled)
+        throw new Error("Readalong is off. Turn it on to request speech.");
       if ((busy.get(scope) ?? 0) >= 2)
         throw new Error("Speech is already being prepared. Try again shortly.");
       const s = p.segment;
@@ -397,7 +401,7 @@ spindle.onFrontendMessage(async (payload, userId, sessionId) => {
 });
 spindle.registerInterceptor(async (messages, context) => {
   const settings = await load(context.userId);
-  if (!settings.promptEmotions || !spindle.permissions.has("regex_scripts"))
+  if (!settings.enabled || !settings.promptEmotions || !spindle.permissions.has("regex_scripts"))
     return messages;
   await ensureHideRule(context.userId);
   return [{ role: "system", content: EMOTION_INSTRUCTION }, ...messages];

@@ -1,6 +1,6 @@
 import { test,expect } from 'bun:test';
 import { DEFAULTS,normalizeSettings,parseSegments,DEFAULT_SPEECH_RULES } from '../src/shared';
-import { planSpeech,prepareAll,estimatedSentenceIndex,MAX_PASSAGE_CHARS } from '../src/playback-plan';
+import { planSpeech,prepareAll,estimatedSentenceIndex,MAX_PASSAGE_CHARS,MAX_NATIVE_PASSAGE_CHARS } from '../src/playback-plan';
 const characters=[{id:'mara',name:'Mara'},{id:'rowan',name:'Rowan'}];
 const settings=normalizeSettings({...DEFAULTS,provider:'lumiverse',connectionId:'main',narratorVoice:'Charon',assignments:{'id:mara':{voice:'Kore'},'id:rowan':{voice:'Puck'}}});
 const plan=(raw:string,s=settings)=>planSpeech(parseSegments(raw,'Mara'),s,{characters,characterId:'mara'});
@@ -39,8 +39,14 @@ test('native speech detection rules can skip actions or read plain text as speec
 test('long readings are bounded while preserving every sentence',()=>{
   const raw='The rain fell softly. '.repeat(800),passages=plan(raw);
   expect(passages.length).toBeGreaterThan(1);
-  expect(passages.every(p=>p.segment.text.length<=MAX_PASSAGE_CHARS)).toBe(true);
+  expect(passages.every(p=>p.segment.text.length<=MAX_NATIVE_PASSAGE_CHARS)).toBe(true);
   expect(passages.flatMap(p=>p.segments)).toHaveLength(800);
+});
+test('native Gemini batches long narration into fewer requests while direct models stay bounded',()=>{
+  const raw='The rain fell softly. '.repeat(400);
+  const native=plan(raw),direct=plan(raw,{...settings,provider:'openrouter'});
+  expect(native).toHaveLength(1);expect(direct.length).toBeGreaterThan(native.length);
+  expect(direct.every(p=>p.segment.text.length<=MAX_PASSAGE_CHARS)).toBe(true);
 });
 test('Lumiverse character and narrator voices may use separate saved connections',()=>{
   const s={...settings,narratorVoice:'',assignments:{}};

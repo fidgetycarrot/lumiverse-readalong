@@ -95,6 +95,13 @@ describe('backend provider and session integration',()=>{
     const result=await interceptor(messages,{userId:'one'});expect(result[0].role).toBe('system');expect(result[0].content).toContain('[emotion:');expect(requests.length).toBe(n);
     await call('save',{settings:{...DEFAULTS,promptEmotions:false}});expect(await interceptor(messages,{userId:'one'})).toEqual(messages);
   });
+  test('turning Readalong off blocks speech and cue injection without a provider request',async()=>{
+    await call('save',{settings:{...DEFAULTS,enabled:false,promptEmotions:true}});const before=requests.length;
+    expect((await call('speech',{segment:{text:'Do not synthesize.'},previewSettings:{...DEFAULTS,enabled:true}})).p.error).toContain('Readalong is off');
+    expect((await call('diagnose_speech')).p.error).toContain('Readalong is off');
+    const messages=[{role:'user',content:'Hello'}];expect(await interceptor(messages,{userId:'one'})).toEqual(messages);expect(requests.length).toBe(before);
+    await call('save',{settings:DEFAULTS});
+  });
   test('failed request errors redact secrets',async()=>{
     failure=true;const r=await call('speech',{segment:{text:'Hi.'}});failure=false;
     expect(r.p.error).not.toContain('sk-or-v1-secret');expect(r.p.error).toContain('[redacted]');
