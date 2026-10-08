@@ -63,6 +63,8 @@ var DEFAULTS = {
   promptEmotions: true,
   useEmotions: true,
   inheritVoices: true,
+  widgetMinimized: false,
+  widgetPosition: null,
   speed: 1,
   volume: 0.85,
   assignments: {}
@@ -85,6 +87,8 @@ function speakerCharacterId(speaker, characters, fallback) {
 }
 function normalizeSettings(raw) {
   const r = raw && typeof raw === "object" ? raw : {};
+  const p = r.widgetPosition;
+  const widgetPosition = p && typeof p === "object" && typeof p.x === "number" && typeof p.y === "number" && Number.isFinite(p.x) && Number.isFinite(p.y) && p.x >= 0 && p.y >= 0 ? { x: p.x, y: p.y } : null;
   const str = (v, fallback, max = 200) => typeof v === "string" ? v.trim().slice(0, max) : fallback;
   const assignments = {};
   if (r.assignments && typeof r.assignments === "object")
@@ -105,6 +109,8 @@ function normalizeSettings(raw) {
     promptEmotions: r.promptEmotions !== false,
     useEmotions: r.useEmotions !== false,
     inheritVoices: r.inheritVoices !== false,
+    widgetMinimized: r.widgetMinimized === true,
+    widgetPosition,
     speed: clamp(r.speed, 0.5, 2, 1),
     volume: clamp(r.volume, 0, 1, 0.85),
     assignments
@@ -1046,7 +1052,13 @@ var STYLE = `
 .ra-mini .ra-row{display:flex;gap:7px;align-items:center}.ra-mini .ra-caption{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin:7px 0;color:var(--lumiverse-text-muted,#aaa);}
 .ra-mini button{font:inherit;border:1px solid var(--lumiverse-border,#555);border-radius:7px;background:var(--lumiverse-fill,#292932);color:inherit;padding:6px 10px;cursor:pointer;}
 .ra-mini button:disabled{opacity:.5;cursor:default}.ra-mini .ra-primary{background:var(--lumiverse-primary,#ac8b4f);color:var(--lumiverse-on-primary,#fff);}
-.ra-mini .ra-close{margin-left:auto;padding:2px 7px;}.ra-mini progress{width:100%;height:4px;accent-color:#e7b24c;}
+.ra-mini .ra-widget-tools{margin-left:auto;gap:5px}.ra-mini .ra-icon{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;padding:0;flex-shrink:0;}
+.ra-mini .ra-time{font-size:11px;white-space:nowrap;font-variant-numeric:tabular-nums}.ra-mini progress{width:100%;height:4px;accent-color:#e7b24c;}
+.ra-mini.ra-collapsed{position:relative;padding:8px;display:flex;align-items:center;gap:6px;}
+.ra-collapsed .ra-compact-play{width:34px;height:34px;padding:0;flex-shrink:0;font-size:16px;}
+.ra-collapsed .ra-compact-info{flex:1;min-width:0;display:flex;flex-direction:column;line-height:1.25;}
+.ra-collapsed .ra-compact-info strong{font-size:11px}.ra-collapsed .ra-compact-status{font-size:10px;color:var(--lumiverse-text-muted,#aaa);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.ra-collapsed .ra-power{font-size:11px;padding:4px;flex-shrink:0;}.ra-collapsed progress{position:absolute;bottom:3px;left:8px;width:calc(100% - 16px);height:3px;pointer-events:none;}
 `;
 function el(tag, text = "", className = "") {
   const node = document.createElement(tag);
@@ -1121,6 +1133,8 @@ function setup(ctx) {
   let readingAbort = null, clockTimer = null;
   let browserQueueActive = false, browserResume = null;
   let widget = null;
+  let widgetSize = "";
+  let widgetDragCleanup = null;
   let widgetError = "";
   const widgetPermissionHint = "Enable the UI panels permission (ui_panels) in Readalong’s extension settings to use the floating player. You can play and pause here in the meantime.";
   let currentSegments = [], position = 0, markedPosition = -1;
@@ -1269,8 +1283,17 @@ function setup(ctx) {
       return;
     try {
       if (!widget && typeof ctx.ui.createFloatWidget === "function") {
-        const width = Math.min(320, Math.max(240, window.innerWidth - 24));
-        widget = ctx.ui.createFloatWidget({ width, height: 184, initialPosition: { x: Math.max(12, window.innerWidth - width - 24), y: Math.max(12, window.innerHeight - 220) }, snapToEdge: true, tooltip: "Readalong · drag to move" });
+        const { width, height } = widgetDimensions();
+        const viewport = widgetViewport(), saved = settings.widgetPosition;
+        const initialPosition = { x: Math.max(12, Math.min(saved?.x ?? viewport.width - width - 24, viewport.width - width - 12)), y: Math.max(12, Math.min(saved?.y ?? viewport.height - height - 36, viewport.height - height - 12)) };
+        widget = ctx.ui.createFloatWidget({ width, height, initialPosition, snapToEdge: true, tooltip: "Readalong · drag to move" });
+        widgetSize = `${width}:${height}`;
+        widgetDragCleanup = widget.onDragEnd((pos) => {
+          if (disposed)
+            return;
+          settings.widgetPosition = { x: pos.x, y: pos.y };
+          safe(saveSettings);
+        });
         widget.root.addEventListener("pointerdown", (event) => {
           if (event.target.closest("button,input,select,a"))
             event.stopPropagation();
@@ -1283,10 +1306,13 @@ function setup(ctx) {
       renderWidget();
       widgetError = "";
     } catch (error) {
+      widgetDragCleanup?.();
+      widgetDragCleanup = null;
       try {
         widget?.destroy();
       } catch {}
       widget = null;
+      widgetSize = "";
       widgetError = error instanceof Error && /PERMISSION_DENIED.*ui_panels/.test(error.message) ? widgetPermissionHint : "The floating player is unavailable. You can play and pause here in the Readalong drawer.";
     }
   }
@@ -1299,9 +1325,27 @@ function setup(ctx) {
     showWidget();
     renderPlayer();
   }
+  function widgetViewport() {
+    return ctx.ui.geometry?.layoutViewportSize() ?? { width: window.innerWidth, height: window.innerHeight };
+  }
+  function widgetDimensions() {
+    const viewport = widgetViewport();
+    return { width: Math.min(settings.widgetMinimized ? 240 : 320, Math.max(1, viewport.width - 24)), height: Math.min(settings.widgetMinimized ? 56 : 184, Math.max(1, viewport.height - 24)) };
+  }
+  async function setWidgetMinimized(minimized) {
+    settings.widgetMinimized = minimized;
+    renderWidget();
+    await saveSettings();
+  }
   function renderWidget() {
     if (!widget || disposed)
       return;
+    const { width, height } = widgetDimensions(), size = `${width}:${height}`;
+    if (widgetSize !== size) {
+      widget.setSize(width, height);
+      widgetSize = size;
+    }
+    widget.root.classList.toggle("ra-collapsed", settings.widgetMinimized);
     const header = el("div", "", "ra-row");
     header.append(el("strong", "Readalong"));
     if (audioPlayer.duration) {
@@ -1309,26 +1353,49 @@ function setup(ctx) {
       header.append(time);
     }
     const close = button("×", () => widget?.setVisible(false));
-    close.className = "ra-close";
+    close.className = "ra-icon";
     close.setAttribute("aria-label", "Hide floating player");
-    header.append(close);
+    close.title = "Hide floating player";
+    const resize = button(settings.widgetMinimized ? "↗" : "−", () => safe(() => setWidgetMinimized(!settings.widgetMinimized)));
+    resize.className = "ra-icon";
+    resize.setAttribute("aria-label", settings.widgetMinimized ? "Expand floating player" : "Minimize floating player");
+    resize.title = resize.getAttribute("aria-label");
+    resize.setAttribute("aria-expanded", String(!settings.widgetMinimized));
     const caption = el("p", phase === "playing" || phase === "paused" ? `${currentSegments[position]?.speaker || "Voice"} · ${currentPassages[currentPassage]?.voice || ""}` : status.textContent ?? "Choose a message.", "ra-caption");
     caption.title = plainText(currentSegments[position]?.text ?? caption.textContent ?? "");
     const controls = el("div", "", "ra-row");
-    const play = button(!settings.enabled ? "Turn on" : phase === "preparing" ? checkingSavedAudio ? "Loading…" : "Preparing…" : phase === "idle" ? "Play latest" : phase === "paused" ? "Resume" : phase === "playing" ? "Pause" : phase === "finished" ? "Replay" : "Play", () => safe(settings.enabled ? playOrPause : () => setEnabled(true)), true);
+    const playLabel = !settings.enabled ? "Turn on" : phase === "preparing" ? checkingSavedAudio ? "Loading…" : "Preparing…" : phase === "idle" ? "Play latest" : phase === "paused" ? "Resume" : phase === "playing" ? "Pause" : phase === "finished" ? "Replay" : "Play";
+    const play = button(playLabel, () => safe(settings.enabled ? playOrPause : () => setEnabled(true)), true);
+    play.title = playLabel;
     play.disabled = !ready || settings.enabled && (phase === "preparing" || phase === "idle" && !selectedId);
     controls.append(play);
     const stopButton = button("Stop", () => stop());
     stopButton.disabled = phase === "idle";
     controls.append(stopButton, button("Open player", () => tab.activate()));
     const power = button(settings.enabled ? "On" : "Off", () => safe(() => setEnabled(!settings.enabled)));
+    power.className = "ra-power";
     power.setAttribute("aria-label", settings.enabled ? "Turn Readalong off" : "Turn Readalong on");
-    header.insertBefore(power, close);
+    power.title = power.getAttribute("aria-label");
     const progress = el("progress");
     progress.max = 1;
     progress.value = phase === "preparing" ? preparedCount / Math.max(1, currentPassages.length) : phase === "finished" ? 1 : phase === "ready" ? 0 : audioPlayer.duration ? audioPlayer.elapsed / audioPlayer.duration : position / Math.max(1, currentSegments.length);
     progress.setAttribute("aria-label", phase === "preparing" ? "Speech preparation" : "Playback progress");
-    widget.root.replaceChildren(header, caption, controls, progress);
+    if (settings.widgetMinimized) {
+      play.textContent = phase === "preparing" ? "…" : phase === "playing" ? "Ⅱ" : phase === "finished" ? "↻" : "▶";
+      play.setAttribute("aria-label", playLabel);
+      play.classList.add("ra-compact-play");
+      const info = el("div", "", "ra-compact-info");
+      info.append(el("strong", "Readalong"));
+      const detail = el("span", !settings.enabled ? "Off" : audioPlayer.duration && ["playing", "paused", "ready", "finished"].includes(phase) ? `${timeLabel(audioPlayer.elapsed)} / ${timeLabel(audioPlayer.duration)}` : playLabel, audioPlayer.duration && settings.enabled && phase !== "preparing" ? "ra-compact-status ra-time" : "ra-compact-status");
+      detail.title = status.textContent ?? "";
+      info.append(detail);
+      widget.root.replaceChildren(play, info, power, resize, close, progress);
+    } else {
+      const tools = el("div", "", "ra-row ra-widget-tools");
+      tools.append(power, resize, close);
+      header.append(tools);
+      widget.root.replaceChildren(header, caption, controls, progress);
+    }
   }
   function markSentence(passageIndex, sentenceIndex) {
     const next = currentPassages.slice(0, passageIndex).reduce((sum, p) => sum + p.segments.length, 0) + sentenceIndex;
@@ -2269,6 +2336,7 @@ function setup(ctx) {
     disposed = true;
     marker.dispose();
     audioPlayer.dispose();
+    widgetDragCleanup?.();
     widget?.destroy();
     for (const fn of cleanups)
       fn();

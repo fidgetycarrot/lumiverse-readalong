@@ -11,14 +11,14 @@ export interface Settings {
   connectionId: string;
   model: string; voice: string; narratorVoice: string; localUrl: string;
   enabled: boolean; follow: boolean; promptEmotions: boolean; useEmotions: boolean;
-  inheritVoices: boolean;
+  inheritVoices: boolean; widgetMinimized: boolean; widgetPosition: {x:number;y:number}|null;
   speed: number; volume: number;
   assignments: Record<string, VoiceAssignment>;
 }
 export const DEFAULTS: Settings = {
   provider: 'openrouter', connectionId:'', model: 'google/gemini-3.8-flash-tts', voice: 'Kore', narratorVoice: '',
   localUrl: 'http://localhost:8880/v1', enabled: true, follow: false,
-  promptEmotions: true, useEmotions: true, inheritVoices:true, speed: 1, volume: 0.85, assignments: {},
+  promptEmotions: true, useEmotions: true, inheritVoices:true, widgetMinimized:false, widgetPosition:null, speed: 1, volume: 0.85, assignments: {},
 };
 export interface SpeechSegment { text: string; speaker: string; emotion: string; delivery: string }
 export interface SpeechModel { id: string; name: string; voices: string[] }
@@ -41,6 +41,8 @@ export function speakerCharacterId(speaker: string, characters: {id:string;name:
 }
 export function normalizeSettings(raw: unknown): Settings {
   const r = raw && typeof raw === 'object' ? raw as Partial<Settings> : {};
+  const p=r.widgetPosition;
+  const widgetPosition=p && typeof p==='object' && typeof p.x==='number' && typeof p.y==='number' && Number.isFinite(p.x) && Number.isFinite(p.y) && p.x>=0 && p.y>=0?{x:p.x,y:p.y}:null;
   const str = (v: unknown, fallback: string, max = 200) => typeof v === 'string' ? v.trim().slice(0, max) : fallback;
   const assignments: Settings['assignments'] = {};
   if (r.assignments && typeof r.assignments === 'object') for (const [key, v] of Object.entries(r.assignments).slice(0, 500)) {
@@ -53,7 +55,7 @@ export function normalizeSettings(raw: unknown): Settings {
     model: str(r.model, DEFAULTS.model), voice: str(r.voice, DEFAULTS.voice), narratorVoice: str(r.narratorVoice, ''),
     localUrl: str(r.localUrl, DEFAULTS.localUrl, 500),
     enabled: r.enabled !== false, follow: r.follow === true,
-    promptEmotions: r.promptEmotions !== false, useEmotions: r.useEmotions !== false, inheritVoices:r.inheritVoices!==false,
+    promptEmotions: r.promptEmotions !== false, useEmotions: r.useEmotions !== false, inheritVoices:r.inheritVoices!==false, widgetMinimized:r.widgetMinimized===true, widgetPosition,
     speed: clamp(r.speed, 0.5, 2, 1), volume: clamp(r.volume, 0, 1, .85), assignments,
   };
 }

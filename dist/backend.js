@@ -30,6 +30,8 @@ var DEFAULTS = {
   promptEmotions: true,
   useEmotions: true,
   inheritVoices: true,
+  widgetMinimized: false,
+  widgetPosition: null,
   speed: 1,
   volume: 0.85,
   assignments: {}
@@ -44,6 +46,8 @@ function readVoiceRef(raw) {
 }
 function normalizeSettings(raw) {
   const r = raw && typeof raw === "object" ? raw : {};
+  const p = r.widgetPosition;
+  const widgetPosition = p && typeof p === "object" && typeof p.x === "number" && typeof p.y === "number" && Number.isFinite(p.x) && Number.isFinite(p.y) && p.x >= 0 && p.y >= 0 ? { x: p.x, y: p.y } : null;
   const str = (v, fallback, max = 200) => typeof v === "string" ? v.trim().slice(0, max) : fallback;
   const assignments = {};
   if (r.assignments && typeof r.assignments === "object")
@@ -64,6 +68,8 @@ function normalizeSettings(raw) {
     promptEmotions: r.promptEmotions !== false,
     useEmotions: r.useEmotions !== false,
     inheritVoices: r.inheritVoices !== false,
+    widgetMinimized: r.widgetMinimized === true,
+    widgetPosition,
     speed: clamp(r.speed, 0.5, 2, 1),
     volume: clamp(r.volume, 0, 1, 0.85),
     assignments
