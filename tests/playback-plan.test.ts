@@ -1,9 +1,45 @@
 import { test,expect } from 'bun:test';
 import { DEFAULTS,normalizeSettings,parseSegments,DEFAULT_SPEECH_RULES } from '../src/shared';
-import { planSpeech,prepareAll,estimatedSentenceIndex,MAX_PASSAGE_CHARS,MAX_NATIVE_PASSAGE_CHARS } from '../src/playback-plan';
+import { planSpeech,planMessageSpeech,prepareAll,estimatedSentenceIndex,MAX_PASSAGE_CHARS,MAX_NATIVE_PASSAGE_CHARS } from '../src/playback-plan';
+import {nativeSpeechRequest} from '../src/native-tts';
 const characters=[{id:'mara',name:'Mara'},{id:'rowan',name:'Rowan'}];
 const settings=normalizeSettings({...DEFAULTS,provider:'lumiverse',connectionId:'main',narratorVoice:'Charon',assignments:{'id:mara':{voice:'Kore'},'id:rowan':{voice:'Puck'}}});
 const plan=(raw:string,s=settings)=>planSpeech(parseSegments(raw,'Mara'),s,{characters,characterId:'mara'});
+
+test('plain and quoted user messages use the configured You voice despite a longer persona name',()=>{
+  const s=normalizeSettings({...settings,voice:'Autonoe',personaName:'Jason',npcVoice:'Orus',assignments:{...settings.assignments,'name:jason':{voice:'Fenrir'}}});
+  const context={characters,characterId:'mara',connections:[{id:'main',name:'Main',provider:'openrouter_tts',model:s.model,voice:'Leda'}],overrides:{characters:{mara:{connectionId:'main',voice:'Leda'}}}};
+  const connection=context.connections[0];
+  for(const content of ['What did you find?','“What did you find?”','“[speaker:Jason Slatz] What did you find?”']){
+    const passages=planMessageSpeech({id:'user',name:'Jason Slatz',isUser:true,content,characterId:'mara'},s,context);
+    expect(passages).toHaveLength(1);expect(passages[0].voice).toBe('Fenrir');
+    expect(passages[0].segments.every(segment=>segment.speaker==='Jason')).toBe(true);
+    expect(nativeSpeechRequest(connection,passages[0].settings,passages[0].segment)).toMatchObject({voice:'Fenrir',text:passages[0].segment.text});
+  }
+});
+test('user actions stay narrated, explicit cast speakers retain their voices, and skip rules are respected',()=>{
+  const s=normalizeSettings({...settings,personaName:'Jason',assignments:{...settings.assignments,'name:jason':{voice:'Fenrir'}}}),context={characters,characterId:'mara'};
+  const message={id:'user',name:'Jason Slatz',isUser:true,content:'*I cross the room.* What did you find? “ [speaker:Rowan] A photograph.” I look closer.'};
+  const passages=planMessageSpeech(message,s,context);
+  expect(passages.map(p=>p.voice)).toEqual(['Charon','Fenrir','Puck','Fenrir']);
+  expect(passages.map(p=>p.segment.text).join(' ')).toBe('I cross the room. What did you find? “A photograph.” I look closer.');
+  const skipped=planMessageSpeech(message,s,context,{...DEFAULT_SPEECH_RULES,asterisked:'skip',undecorated:'skip'});
+  expect(skipped.map(p=>p.voice)).toEqual(['Puck']);expect(skipped[0].segment.text).toBe('“A photograph.”');
+});
+test('a user with no You voice cannot borrow the assistant voice or everyone-else voice',()=>{
+  for(const personaName of ['', 'Jason']){
+    const s=normalizeSettings({...settings,voice:'Autonoe',personaName,npcVoice:'Orus'});
+    const passages=planMessageSpeech({id:'user',name:'Jason Slatz',isUser:true,content:'Tell me more.'},s,{characters,characterId:'mara'});
+    expect(passages[0].voice).toBe('Autonoe');
+  }
+  const s=normalizeSettings({...settings,voice:'Fenrir',personaName:'Jason',assignments:{...settings.assignments,'name:jason':{voice:'Fenrir'}}});
+  expect(planMessageSpeech({id:'user',name:'Jason Slatz',isUser:true,content:'Tell me more.'},s,{characters,characterId:'mara'})[0].voice).toBe('Fenrir');
+});
+test('assistant messages keep their narration and side-character choices after persona support',()=>{
+  const s=normalizeSettings({...settings,personaName:'Jason',npcVoice:'Orus',assignments:{...settings.assignments,'name:jason':{voice:'Fenrir'}}});
+  const message={id:'assistant',name:'Mara',isUser:false,content:'Rain fell. “Hello.” “ [speaker:Jason] Wait.” “ [speaker:Innkeeper] Welcome.”'};
+  expect(planMessageSpeech(message,s,{characters,characterId:'mara'}).map(p=>p.voice)).toEqual(['Charon','Kore','Fenrir','Orus']);
+});
 
 test('untagged straight and curly dialogue switches between narrator and character',()=>{
   const passages=plan('The door opened. Rain swept inside. “Come in. It is warm here.” She stepped aside. "Thank you."');

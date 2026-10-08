@@ -1015,6 +1015,18 @@ function isUnvoicedExtra(speaker, settings, context) {
     return false;
   return true;
 }
+function planMessageSpeech(message, settings, context, rules = DEFAULT_SPEECH_RULES) {
+  const speaker = message.isUser ? settings.personaName || message.name : message.name;
+  const effectiveRules = message.isUser && rules.undecorated !== "skip" ? { ...rules, undecorated: "speech" } : rules;
+  const segments = parseSegments(message.content, speaker, effectiveRules);
+  if (message.isUser && settings.personaName) {
+    for (const segment of segments) {
+      if (segment.speaker.trim().toLowerCase() === message.name.trim().toLowerCase() && !settings.assignments[`name:${segment.speaker.toLowerCase()}`])
+        segment.speaker = speaker;
+    }
+  }
+  return planSpeech(segments, settings, { ...context, mainSpeaker: speaker, ...message.isUser ? { characterId: undefined } : {} });
+}
 function planSpeech(segments, settings, context) {
   const passages = [];
   let previousKey = "";
@@ -2218,7 +2230,7 @@ function setup(ctx) {
     const token = playbackId;
     readingAbort = new AbortController;
     const signal = readingAbort.signal;
-    currentMessage = { ...message, characterId: message.characterId ?? speakerCharacterId(message.name, characters, ctx.getActiveChat().characterId ?? undefined) };
+    currentMessage = { ...message, characterId: message.isUser ? undefined : message.characterId ?? speakerCharacterId(message.name, characters, ctx.getActiveChat().characterId ?? undefined) };
     phase = "preparing";
     preparingAudio = true;
     checkingSavedAudio = true;
@@ -2248,8 +2260,7 @@ function setup(ctx) {
       }
       if (token !== playbackId)
         return;
-      const parsed = parseSegments(message.content, message.name, rules);
-      currentPassages = planSpeech(parsed, snapshot, context);
+      currentPassages = planMessageSpeech(message, snapshot, context, rules);
       currentSegments = currentPassages.flatMap((p) => p.segments);
       if (!currentSegments.length) {
         stop(false);
@@ -3092,7 +3103,7 @@ function setup(ctx) {
         notice("Narrator voice saved.");
       });
     }, true)), narratorListen);
-    narrator.body.append(narratorRow, el("p", "Reads everything that is not inside quotes.", "ra-muted"));
+    narrator.body.append(narratorRow, el("p", "Reads narrative prose and actions. Your own message text uses your You voice.", "ra-muted"));
     assignmentsCard.append(narrator.details);
     if (!settings.personaName) {
       const you = disclosure([el("strong", "You"), el("span", "Add your character")], openCast.has("you"));
@@ -3119,7 +3130,7 @@ function setup(ctx) {
         await saveSettings();
         renderAssignments();
       }), true));
-      you.body.append(youRow, el("p", "Gives your own character a voice when a reply speaks for them.", "ra-muted"));
+      you.body.append(youRow, el("p", "Gives your own messages a voice, and voices your character when a reply speaks for them. Your Lumiverse persona can use a longer name.", "ra-muted"));
       assignmentsCard.append(you.details);
     }
     for (const row of rows) {

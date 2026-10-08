@@ -1,8 +1,8 @@
 import type { SpindleFrontendContext, SpindleCharacterEditorTabHandle, SpindleFloatWidgetHandle } from 'lumiverse-spindle-types';
-import { DEFAULTS, GEMINI_VOICES, EMOTIONS, DELIVERIES, needsPcm, normalizeSettings, parseSegments, speakerCharacterId, plainText, stripCues, speechRequest, type CharacterInfo, type Settings, type SpeechSegment, type SpeechModel, type MessageInfo, type VoiceAssignment } from './shared';
+import { DEFAULTS, GEMINI_VOICES, EMOTIONS, DELIVERIES, needsPcm, normalizeSettings, speakerCharacterId, plainText, stripCues, speechRequest, type CharacterInfo, type Settings, type SpeechSegment, type SpeechModel, type MessageInfo, type VoiceAssignment } from './shared';
 import { PassageMarker } from './highlight';
 import { createNativeTtsClient, nativeSpeechRequest, type NativeConnection } from './native-tts';
-import { planSpeech, prepareAll, estimatedSentenceIndex, type SpeechPassage, type VoiceContext } from './playback-plan';
+import { planSpeech, planMessageSpeech, prepareAll, estimatedSentenceIndex, type SpeechPassage, type VoiceContext } from './playback-plan';
 import { PreparedPlayer, prepareClip, type PreparedClip } from './prepared-audio';
 import { AudioCache, preparationHash } from './audio-cache';
 import {widgetDimensions as resolveWidgetDimensions,widgetPosition} from './widget-layout';
@@ -490,7 +490,7 @@ export function setup(ctx: SpindleFrontendContext) {
     }
     stop(false);
     const token=playbackId;readingAbort=new AbortController();const signal=readingAbort.signal;
-    currentMessage={...message,characterId:message.characterId ?? speakerCharacterId(message.name,characters,ctx.getActiveChat().characterId ?? undefined)};
+    currentMessage={...message,characterId:message.isUser?undefined:message.characterId ?? speakerCharacterId(message.name,characters,ctx.getActiveChat().characterId ?? undefined)};
     phase='preparing';preparingAudio=true;checkingSavedAudio=true;preparedCount=0;showWidget();notice('Looking for saved audio…');renderPlayer();
     try {
       const snapshot=normalizeSettings(settings);
@@ -504,8 +504,7 @@ export function setup(ctx: SpindleFrontendContext) {
         if(results[1].status==='fulfilled')context.overrides=results[1].value?.metadata?.voiceOverrides as VoiceContext['overrides'];
       }
       if(token!==playbackId)return;
-      const parsed=parseSegments(message.content,message.name,rules);
-      currentPassages=planSpeech(parsed,snapshot,context);currentSegments=currentPassages.flatMap(p=>p.segments);
+      currentPassages=planMessageSpeech(message,snapshot,context,rules);currentSegments=currentPassages.flatMap(p=>p.segments);
       if(!currentSegments.length){stop(false);notice('There is no readable text in this message.');return}
       let restored=false,saved=true,openingCount=0;
       if(snapshot.provider!=='browser') {
@@ -883,7 +882,7 @@ export function setup(ctx: SpindleFrontendContext) {
     narrator.details.addEventListener('toggle',()=>{if(narrator.details.isConnected){if(narrator.details.open)openCast.add('narrator');else openCast.delete('narrator')}});
     const narratorListen=withIcon(button('Listen',()=>safe(()=>preview(settings.narratorVoice||settings.voice))),'speaker');narratorListen.disabled=!settings.enabled;
     const narratorRow=el('div','', 'ra-row ra-end');narratorRow.append(field('Voice',voiceSelect(settings.narratorVoice,v=>{settings.narratorVoice=v;void safe(async()=>{await saveSettings();renderAssignments();notice('Narrator voice saved.')})},true)),narratorListen);
-    narrator.body.append(narratorRow,el('p','Reads everything that is not inside quotes.','ra-muted'));assignmentsCard.append(narrator.details);
+    narrator.body.append(narratorRow,el('p','Reads narrative prose and actions. Your own message text uses your You voice.','ra-muted'));assignmentsCard.append(narrator.details);
     if(!settings.personaName) {
       const you=disclosure([el('strong','You'),el('span','Add your character')],openCast.has('you'));
       you.details.addEventListener('toggle',()=>{if(you.details.isConnected){if(you.details.open)openCast.add('you');else openCast.delete('you')}});
@@ -892,7 +891,7 @@ export function setup(ctx: SpindleFrontendContext) {
         const name=mine.trim();if(!validSpeaker(name))throw new Error('Type the name you play as, up to 80 letters.');
         settings.personaName=name;openCast.delete('you');openCast.add(`name:${name.toLowerCase()}`);await saveSettings();renderAssignments();
       }),true));
-      you.body.append(youRow,el('p','Gives your own character a voice when a reply speaks for them.','ra-muted'));assignmentsCard.append(you.details);
+      you.body.append(youRow,el('p','Gives your own messages a voice, and voices your character when a reply speaks for them. Your Lumiverse persona can use a longer name.','ra-muted'));assignmentsCard.append(you.details);
     }
     for(const row of rows){
       const saved=settings.assignments[row.key],known=sayingFor(baseName(row.name));

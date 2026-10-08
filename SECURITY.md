@@ -1,6 +1,6 @@
 # Readalong security and privacy notes
 
-Review date: 2026-10-08. Applies to Readalong **0.2.0–0.2.5**. The 0.2.4 update adds per-story pronunciation metadata; 0.2.5 adds previews for individual/all aliases. Both preserve the reviewed playback and credential protections. Pronunciation previews remain explicit, single speech requests and never save form edits automatically. This is a source review and automated/mock verification, not an independent security certification or a guarantee against every possible compromise.
+Review date: 2026-10-08. Applies to Readalong **0.2.0–0.2.6**. The 0.2.4 update adds per-story pronunciation metadata; 0.2.5 adds previews for individual/all aliases. The 0.2.6 update uses the owned message’s existing user-role metadata to apply the saved You voice. These updates preserve the reviewed playback and credential protections. Pronunciation previews remain explicit, single speech requests and never save form edits automatically. This is a source review and automated/mock verification, not an independent security certification or a guarantee against every possible compromise.
 
 ## Where credentials go
 
@@ -22,7 +22,7 @@ Direct errors redact the known credential and common encoded/escaped forms befor
 
 ## Story and audio privacy
 
-Cloud or remote synthesis sends the selected passage to the chosen speech provider, together with voice/model choices and any supported vocal cues. Provider retention and billing policies apply. There is no analytics service, voice cloning, additional emotion-analysis model or telemetry endpoint. The public OpenRouter catalog may be fetched to list models/voices. Optional cue prompting adds instructions and assigned speaker names to the existing chat generation.
+Cloud or remote synthesis sends the selected passage to the chosen speech provider, together with voice/model choices and any supported vocal cues. Provider retention and billing policies apply. There is no analytics service, voice cloning, additional emotion-analysis model or telemetry endpoint. The public OpenRouter catalog may be fetched to list models/voices. Optional cue prompting adds instructions and assigned speaker names to the existing chat generation. Reading a user message is a manual choice; it does not add user-message catch-up, persona API access, or a new permission. Saving the You voice does not synthesize speech.
 
 Completed audio is cached in this browser profile, scoped by authenticated user ID, for up to three recent recordings and 256 MiB per user. It can contain private story content. This cache is ordinary browser storage, **not an encrypted vault** or a defense against someone who controls that browser profile, developer tools, or the same origin. It is not exported with the extension, synced by Readalong or placed in chat messages. Extension settings and the server's attempt history stay in per-user Lumiverse storage.
 

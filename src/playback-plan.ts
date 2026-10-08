@@ -1,4 +1,4 @@
-import { selectVoice, speakerCharacterId, splitSentences, readVoiceRef, type CharacterInfo, type NativeVoiceRef, type Settings, type SpeechSegment } from './shared';
+import { selectVoice, speakerCharacterId, splitSentences, readVoiceRef, parseSegments, DEFAULT_SPEECH_RULES, type CharacterInfo, type NativeVoiceRef, type Settings, type SpeechSegment, type MessageInfo, type SpeechRules } from './shared';
 import type { NativeConnection } from './native-tts';
 import { stripVocalTags } from './speech-text';
 import {applyPronunciations,type Pronunciations} from './pronunciation';
@@ -16,6 +16,20 @@ export function isUnvoicedExtra(speaker:string,settings:Settings,context:VoiceCo
   if(context.mainSpeaker && firstName(context.mainSpeaker)===name)return false;
   if(context.characters.some(c=>firstName(c.name)===name || c.name.trim().toLowerCase()===name))return false;
   return true;
+}
+/** A user's message belongs to their configured You row, even if the host uses their full persona name. */
+export function planMessageSpeech(message:MessageInfo,settings:Settings,context:VoiceContext,rules:SpeechRules=DEFAULT_SPEECH_RULES):SpeechPassage[] {
+  const speaker=message.isUser?settings.personaName||message.name:message.name;
+  // Plain user input is their own speech. Keep explicit skips, narrated actions,
+  // and speaker cues; assistant narration still follows the host's rules.
+  const effectiveRules=message.isUser && rules.undecorated!=='skip'?{...rules,undecorated:'speech' as const}:rules;
+  const segments=parseSegments(message.content,speaker,effectiveRules);
+  if(message.isUser && settings.personaName){
+    for(const segment of segments){
+      if(segment.speaker.trim().toLowerCase()===message.name.trim().toLowerCase() && !settings.assignments[`name:${segment.speaker.toLowerCase()}`])segment.speaker=speaker;
+    }
+  }
+  return planSpeech(segments,settings,{...context,mainSpeaker:speaker,...(message.isUser?{characterId:undefined}:{})});
 }
 /** Resolve voices before batching, so narrator/character boundaries survive. */
 export function planSpeech(segments:SpeechSegment[], settings:Settings, context:VoiceContext):SpeechPassage[] {
