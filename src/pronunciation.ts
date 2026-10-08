@@ -44,6 +44,13 @@ export function applyPronunciations(text:string,entries:Pronunciations):string {
   // Never rewrite a vocal token (a character named Sigh must not alter <sigh>).
   return text.split(/(<[^<>]*>)/g).map(s=>s.startsWith('<')?s:replace(s)).join('');
 }
+/** One bounded preview, with original spellings kept in the reading marker. */
+export function pronunciationSample(entry:PronunciationEntry,spelling?:string):string {
+  const names=[entry.name,...entry.aliases];
+  const chosen=spelling===undefined?names:names.filter(name=>name===spelling);
+  if(!chosen.length)throw new Error('Choose a name or alternative from this pronunciation.');
+  return chosen.length===1?`${chosen[0]} arrived. I looked at ${chosen[0]}. ${chosen[0]}'s voice was calm.`:chosen.map(name=>`${name} arrived.`).join(' ');
+}
 export function learnPronunciations(entries:Pronunciations,raw:string):Pronunciations {
   const result=normalizePronunciations(entries),safe=sanitizeSpeechText(raw,true),prose=stripPronunciationCues(safe);
   const claimed=tokens(result);

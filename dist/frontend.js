@@ -97,6 +97,13 @@ function applyPronunciations(text, entries) {
   const replace = (s) => s.replace(new RegExp(`(?<!${boundary})(?:${pattern})(?!${boundary})`, "giu"), (name) => map.get(normalized(name)) ?? name);
   return text.split(/(<[^<>]*>)/g).map((s) => s.startsWith("<") ? s : replace(s)).join("");
 }
+function pronunciationSample(entry, spelling) {
+  const names = [entry.name, ...entry.aliases];
+  const chosen = spelling === undefined ? names : names.filter((name) => name === spelling);
+  if (!chosen.length)
+    throw new Error("Choose a name or alternative from this pronunciation.");
+  return chosen.length === 1 ? `${chosen[0]} arrived. I looked at ${chosen[0]}. ${chosen[0]}'s voice was calm.` : chosen.map((name) => `${name} arrived.`).join(" ");
+}
 
 // src/shared.ts
 var EMOTIONS = ["neutral", "happy", "sad", "angry", "worried", "curious", "excited", "sarcastic", "tender", "afraid"];
@@ -2648,17 +2655,41 @@ function setup(ctx) {
   function pronunciationForm(container, initialName, voice = settings.voice, assignment, saved) {
     const chatId = ctx.getActiveChat().chatId;
     const known = saved ?? Object.values(pronunciationEntries).find((e) => [e.name, ...e.aliases].some((n) => n.toLowerCase() === initialName.toLowerCase()));
-    let name = known?.name ?? initialName, spokenAs = known?.spokenAs ?? "", aliases = (known?.aliases ?? []).join(", ");
-    const nameInput = textInput(name, (v) => name = v);
+    let name = known?.name ?? initialName, spokenAs = known?.spokenAs ?? "", aliases = (known?.aliases ?? []).join(", "), testSpelling = "";
+    const testChoices = el("select");
+    testChoices.onchange = () => testSpelling = testChoices.value;
+    const testField = field("Name to test", testChoices);
+    const refreshTestChoices = () => {
+      const names = [...new Set([name.trim(), ...aliases.split(",").map((s) => s.trim())].filter(Boolean))];
+      if (testSpelling && !names.includes(testSpelling))
+        testSpelling = "";
+      testChoices.replaceChildren();
+      for (const choice of [{ value: "", label: "Main name and all alternatives" }, ...names.map((value, index) => ({ value, label: `${value} (${index === 0 ? "main name" : "alternative"})` }))]) {
+        const option = el("option", choice.label);
+        option.value = choice.value;
+        testChoices.append(option);
+      }
+      testChoices.value = testSpelling;
+      testField.hidden = names.length < 2;
+      testField.style.display = names.length < 2 ? "none" : "";
+    };
+    const nameInput = textInput(name, (v) => {
+      name = v;
+      refreshTestChoices();
+    });
     nameInput.maxLength = 80;
     nameInput.readOnly = !!saved;
     const soundInput = textInput(spokenAs, (v) => spokenAs = v);
     soundInput.maxLength = 100;
     soundInput.placeholder = "For example, Eleese";
-    const aliasInput = textInput(aliases, (v) => aliases = v);
+    const aliasInput = textInput(aliases, (v) => {
+      aliases = v;
+      refreshTestChoices();
+    });
     aliasInput.maxLength = 810;
     aliasInput.placeholder = "For example, Elys-04";
-    container.append(field("Name in the story", nameInput), field("Pronounce as", soundInput), field("Other spellings or nicknames (comma separated)", aliasInput));
+    refreshTestChoices();
+    container.append(field("Name in the story", nameInput), field("Pronounce as", soundInput), field("Other spellings or nicknames (comma separated)", aliasInput), testField);
     const candidate = () => {
       const entry = pronunciationEntry({ name, spokenAs, aliases: aliases.split(",").map((s) => s.trim()).filter(Boolean) }, "manual");
       if (!entry)
@@ -2669,7 +2700,7 @@ function setup(ctx) {
     };
     const test = button("Test pronunciation", () => safe(async () => {
       const entry = candidate();
-      await preview(voice, assignment, { text: `${entry.name} arrived. I looked at ${entry.name}. ${entry.name}'s voice was calm.`, entries: normalizePronunciations({ [entry.name]: entry }) });
+      await preview(voice, assignment, { text: pronunciationSample(entry, testSpelling || undefined), entries: normalizePronunciations({ [entry.name]: entry }) });
     }));
     test.disabled = !settings.enabled || !chatId;
     const save = button("Save pronunciation", () => safe(async () => {
@@ -2698,7 +2729,7 @@ function setup(ctx) {
         renderAssignments();
         notice(`Pronunciation removed for ${saved.name}. Existing audio was not regenerated.`);
       })));
-    container.append(actions, el("p", "Saving changes future speech only. Test pronunciation uses one short speech request and may incur a provider charge.", "ra-muted"));
+    container.append(actions, el("p", "Alternatives use the same pronunciation. Choose one spelling or test them all in one preview. Saving changes future speech only. Test pronunciation uses one short speech request and may incur a provider charge.", "ra-muted"));
   }
   function renderPronunciations() {
     pronunciationsCard.replaceChildren(el("h3", "Story pronunciations"));

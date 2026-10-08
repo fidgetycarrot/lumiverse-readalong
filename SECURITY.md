@@ -1,6 +1,6 @@
 # Readalong security and privacy notes
 
-Review date: 2026-10-08. Applies to Readalong **0.2.0–0.2.4**. The 0.2.4 update adds per-story pronunciation metadata and preserves the reviewed playback and credential protections. This is a source review and automated/mock verification, not an independent security certification or a guarantee against every possible compromise.
+Review date: 2026-10-08. Applies to Readalong **0.2.0–0.2.5**. The 0.2.4 update adds per-story pronunciation metadata; 0.2.5 adds previews for individual/all aliases. Both preserve the reviewed playback and credential protections. Pronunciation previews remain explicit, single speech requests and never save form edits automatically. This is a source review and automated/mock verification, not an independent security certification or a guarantee against every possible compromise.
 
 ## Where credentials go
 

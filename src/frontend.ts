@@ -9,7 +9,7 @@ import {widgetDimensions as resolveWidgetDimensions,widgetPosition} from './widg
 import {patchPlaybackChildren} from './playback-ui';
 import {earlyPlaybackPrefix} from './early-playback';
 import {CompletionInbox,type CompletedReply} from './auto-preparation';
-import {normalizePronunciations,pronunciationEntry,type Pronunciations,type PronunciationEntry} from './pronunciation';
+import {normalizePronunciations,pronunciationEntry,pronunciationSample,type Pronunciations,type PronunciationEntry} from './pronunciation';
 
 const STYLE = `
 ::highlight(lumiverse-readalong){background:rgba(245,190,80,.30);color:inherit;text-decoration:underline;text-decoration-color:#e7b24c;text-decoration-thickness:2px;}
@@ -615,18 +615,30 @@ export function setup(ctx: SpindleFrontendContext) {
   function pronunciationForm(container:HTMLElement,initialName:string,voice=settings.voice,assignment?:Partial<VoiceAssignment>,saved?:PronunciationEntry){
     const chatId=ctx.getActiveChat().chatId;
     const known=saved??Object.values(pronunciationEntries).find(e=>[e.name,...e.aliases].some(n=>n.toLowerCase()===initialName.toLowerCase()));
-    let name=known?.name??initialName,spokenAs=known?.spokenAs??'',aliases=(known?.aliases??[]).join(', ');
-    const nameInput=textInput(name,v=>name=v);nameInput.maxLength=80;nameInput.readOnly=!!saved;
+    let name=known?.name??initialName,spokenAs=known?.spokenAs??'',aliases=(known?.aliases??[]).join(', '),testSpelling='';
+    const testChoices=el('select');testChoices.onchange=()=>testSpelling=testChoices.value;
+    const testField=field('Name to test',testChoices);
+    const refreshTestChoices=()=>{
+      const names=[...new Set([name.trim(),...aliases.split(',').map(s=>s.trim())].filter(Boolean))];
+      if(testSpelling && !names.includes(testSpelling))testSpelling='';
+      testChoices.replaceChildren();
+      for(const choice of [{value:'',label:'Main name and all alternatives'},...names.map((value,index)=>({value,label:`${value} (${index===0?'main name':'alternative'})`}))]){
+        const option=el('option',choice.label);option.value=choice.value;testChoices.append(option);
+      }
+      testChoices.value=testSpelling;testField.hidden=names.length<2;testField.style.display=names.length<2?'none':'';
+    };
+    const nameInput=textInput(name,v=>{name=v;refreshTestChoices()});nameInput.maxLength=80;nameInput.readOnly=!!saved;
     const soundInput=textInput(spokenAs,v=>spokenAs=v);soundInput.maxLength=100;soundInput.placeholder='For example, Eleese';
-    const aliasInput=textInput(aliases,v=>aliases=v);aliasInput.maxLength=810;aliasInput.placeholder='For example, Elys-04';
-    container.append(field('Name in the story',nameInput),field('Pronounce as',soundInput),field('Other spellings or nicknames (comma separated)',aliasInput));
+    const aliasInput=textInput(aliases,v=>{aliases=v;refreshTestChoices()});aliasInput.maxLength=810;aliasInput.placeholder='For example, Elys-04';
+    refreshTestChoices();
+    container.append(field('Name in the story',nameInput),field('Pronounce as',soundInput),field('Other spellings or nicknames (comma separated)',aliasInput),testField);
     const candidate=()=>{
       const entry=pronunciationEntry({name,spokenAs,aliases:aliases.split(',').map(s=>s.trim()).filter(Boolean)},'manual');
       if(!entry)throw new Error('Enter a name and its spoken spelling first.');
       if(!chatId || ctx.getActiveChat().chatId!==chatId)throw new Error('Select this story again before saving its pronunciation.');
       return entry;
     };
-    const test=button('Test pronunciation',()=>safe(async()=>{const entry=candidate();await preview(voice,assignment,{text:`${entry.name} arrived. I looked at ${entry.name}. ${entry.name}'s voice was calm.`,entries:normalizePronunciations({[entry.name]:entry})})}));test.disabled=!settings.enabled || !chatId;
+    const test=button('Test pronunciation',()=>safe(async()=>{const entry=candidate();await preview(voice,assignment,{text:pronunciationSample(entry,testSpelling||undefined),entries:normalizePronunciations({[entry.name]:entry})})}));test.disabled=!settings.enabled || !chatId;
     const save=button('Save pronunciation',()=>safe(async()=>{
       const entry=candidate(),r=await rpc('save_pronunciation',{chatId,entry});
       if(disposed || ctx.getActiveChat().chatId!==chatId)return;
@@ -639,7 +651,7 @@ export function setup(ctx: SpindleFrontendContext) {
       if(disposed || ctx.getActiveChat().chatId!==chatId)return;
       pronunciationEntries=normalizePronunciations(r.entries);openPronunciations.delete(saved.name);renderPronunciations();renderAssignments();notice(`Pronunciation removed for ${saved.name}. Existing audio was not regenerated.`);
     })));
-    container.append(actions,el('p','Saving changes future speech only. Test pronunciation uses one short speech request and may incur a provider charge.','ra-muted'));
+    container.append(actions,el('p','Alternatives use the same pronunciation. Choose one spelling or test them all in one preview. Saving changes future speech only. Test pronunciation uses one short speech request and may incur a provider charge.','ra-muted'));
   }
   function renderPronunciations(){
     pronunciationsCard.replaceChildren(el('h3','Story pronunciations'));
