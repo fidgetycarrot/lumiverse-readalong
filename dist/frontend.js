@@ -120,6 +120,7 @@ var DEFAULTS = {
   enabled: false,
   follow: false,
   earlyPlayback: true,
+  automaticPlayback: false,
   promptEmotions: true,
   useEmotions: true,
   promptPronunciations: true,
@@ -171,6 +172,7 @@ function normalizeSettings(raw) {
     enabled: typeof r.enabled === "boolean" ? r.enabled : DEFAULTS.enabled,
     follow: r.follow === true,
     earlyPlayback: r.earlyPlayback !== false,
+    automaticPlayback: r.automaticPlayback === true,
     promptEmotions: r.promptEmotions !== false,
     useEmotions: r.useEmotions !== false,
     promptPronunciations: r.promptPronunciations !== false,
@@ -1298,6 +1300,23 @@ function earlyPlaybackPrefix(texts, clips) {
   return total > 0 && chars / total >= EARLY_PLAYBACK_FRACTION && seconds >= EARLY_PLAYBACK_SECONDS ? count : 0;
 }
 
+// src/automatic-playback.ts
+class AutomaticPlayback {
+  armed = false;
+  arm(eligible = true) {
+    this.armed = eligible;
+  }
+  cancel() {
+    this.armed = false;
+  }
+  take(state) {
+    if (!this.armed || !state.enabled || !state.automatic || !state.ready || state.busy)
+      return false;
+    this.armed = false;
+    return true;
+  }
+}
+
 // src/auto-preparation.ts
 class CompletionInbox {
   pending = new Map;
@@ -1558,6 +1577,8 @@ function setup(ctx) {
   let checkingSavedAudio = false;
   let preparingAudio = false, waitingForAudio = false;
   let playAttempt = null, messageLoad = null;
+  const automaticPlayback = new AutomaticPlayback;
+  let automaticPlaybackError = "";
   let utterance = null;
   const audioPlayer = new PreparedPlayer;
   const audioCache = new AudioCache;
@@ -1713,6 +1734,8 @@ function setup(ctx) {
     clockTimer = null;
   }
   function stop(showStatus = true) {
+    automaticPlayback.cancel();
+    automaticPlaybackError = "";
     playbackId++;
     playing = false;
     paused = false;
@@ -1958,7 +1981,26 @@ function setup(ctx) {
       notice(waiting ? "Waiting for the rest of the audio…" : "Reading…");
     renderPlayer();
   };
-  async function playOrPause() {
+  function tryAutomaticPlayback() {
+    if (!automaticPlayback.take({ enabled: settings.enabled, automatic: settings.automaticPlayback, ready: phase === "ready", busy: !!playAttempt || !!messageLoad }))
+      return;
+    const token = playbackId;
+    playOrPause(true).catch((error) => {
+      if (disposed || token !== playbackId)
+        return;
+      automaticPlaybackError = error instanceof Error ? error.message : "Automatic playback could not start. Press Play to use the prepared audio.";
+      notice(automaticPlaybackError, true);
+      renderPlayer();
+    });
+  }
+  function preparationNotice(text) {
+    notice(automaticPlaybackError || text, !!automaticPlaybackError);
+  }
+  async function playOrPause(automatic = false) {
+    if (!automatic) {
+      automaticPlayback.cancel();
+      automaticPlaybackError = "";
+    }
     if (!settings.enabled)
       throw new Error("Readalong is off. Turn it on to prepare audio.");
     if (playAttempt || messageLoad)
@@ -2027,7 +2069,14 @@ function setup(ctx) {
         }
       } catch (e) {
         if (token === playbackId) {
-          stop(false);
+          browserQueueActive = false;
+          playing = false;
+          paused = false;
+          phase = "ready";
+          stopClock();
+          speechSynthesis.cancel();
+          utterance = null;
+          renderPlayer();
           throw e;
         }
       }
@@ -2209,6 +2258,8 @@ function setup(ctx) {
     settings.enabled = enabled;
     if (!enabled)
       stop(false);
+    else if (settings.automaticPlayback && settings.provider !== "browser")
+      audioPlayer.unlock();
     renderPlayer();
     renderVoices();
     renderAssignments();
@@ -2219,6 +2270,20 @@ function setup(ctx) {
       await prepareLatest(true);
     }
   }
+  async function setAutomaticPlayback(enabled) {
+    settings.automaticPlayback = enabled;
+    if (enabled) {
+      if (currentMessage && (phase === "preparing" || phase === "ready"))
+        automaticPlayback.arm();
+      if (settings.enabled && settings.provider !== "browser")
+        audioPlayer.unlock();
+    } else
+      automaticPlayback.cancel();
+    renderOptions();
+    renderPlayer();
+    tryAutomaticPlayback();
+    await saveSettings();
+  }
   async function startMessage(message, options = {}) {
     if (!settings.enabled)
       throw new Error("Readalong is off. Turn it on to prepare audio.");
@@ -2228,6 +2293,7 @@ function setup(ctx) {
         automaticPreparations.delete(automaticPreparations.values().next().value);
     }
     stop(false);
+    automaticPlayback.arm(!options.restoreOnly);
     const token = playbackId;
     readingAbort = new AbortController;
     const signal = readingAbort.signal;
@@ -2326,8 +2392,9 @@ function setup(ctx) {
                 phase = "ready";
               }
             }
-            notice(phase === "playing" ? `Reading… ${count} of ${currentPassages.length} parts ready. The rest is on its way.` : phase === "paused" ? `Paused. ${count} of ${currentPassages.length} parts ready. The rest is on its way.` : openingCount ? `You can press Play now. ${count} of ${currentPassages.length} parts ready.` : `Preparing: ${count} of ${currentPassages.length} parts ready…`);
+            preparationNotice(phase === "playing" ? `Reading… ${count} of ${currentPassages.length} parts ready. The rest is on its way.` : phase === "paused" ? `Paused. ${count} of ${currentPassages.length} parts ready. The rest is on its way.` : openingCount ? `You can press Play now. ${count} of ${currentPassages.length} parts ready.` : `Preparing: ${count} of ${currentPassages.length} parts ready…`);
             renderPlayer();
+            tryAutomaticPlayback();
           }, snapshot.provider === "lumiverse" ? 3 : 2);
           if (token !== playbackId)
             return;
@@ -2340,8 +2407,9 @@ function setup(ctx) {
           audioPlayer.setVolume(settings.volume);
           if (phase === "preparing")
             phase = "ready";
-          notice(phase === "playing" ? "Reading… The whole message is ready." : phase === "paused" ? "Paused. The whole message is ready." : "The whole message is ready. Press Play.");
+          preparationNotice(phase === "playing" ? "Reading… The whole message is ready." : phase === "paused" ? "Paused. The whole message is ready." : "The whole message is ready. Press Play.");
           renderPlayer();
+          tryAutomaticPlayback();
           try {
             saved = await audioCache.put(cacheUserId, audioKey, clips);
           } catch {
@@ -2362,8 +2430,9 @@ function setup(ctx) {
         phase = "ready";
       preparingAudio = false;
       checkingSavedAudio = false;
-      notice(restored ? "Saved audio is ready, at no new cost. Press Play." : !saved ? "This audio could not be saved. It will be gone after a reload." : phase === "playing" ? "Reading… The whole message is ready." : phase === "paused" ? "Paused. The whole message is ready." : phase === "finished" ? "Finished. Replay is free." : "The whole message is ready. Press Play.");
+      preparationNotice(restored ? "Saved audio is ready, at no new cost. Press Play." : !saved ? "This audio could not be saved. It will be gone after a reload." : phase === "playing" ? "Reading… The whole message is ready." : phase === "paused" ? "Paused. The whole message is ready." : phase === "finished" ? "Finished. Replay is free." : "The whole message is ready. Press Play.");
       renderPlayer();
+      tryAutomaticPlayback();
     } catch (e) {
       if (token === playbackId) {
         stop(false);
@@ -2517,6 +2586,7 @@ function setup(ctx) {
       if (messageLoad === operation) {
         messageLoad = null;
         renderPlayer();
+        tryAutomaticPlayback();
       }
     }
   }
@@ -2528,7 +2598,7 @@ function setup(ctx) {
     }
     powerInput.checked = settings.enabled;
     powerLabel.textContent = settings.enabled ? "On" : "Off";
-    intro.textContent = settings.enabled ? "New replies get audio on their own and wait for Play. Your voice service may charge for each one." : "Turn on to hear replies read aloud.";
+    intro.textContent = settings.enabled ? settings.automaticPlayback ? "New replies get audio on their own and play when enough is ready. Your voice service may charge for each one." : "New replies get audio on their own and wait for Play. Your voice service may charge for each one." : "Turn on to hear replies read aloud.";
     root.dataset.raPhase = settings.enabled ? phase : "off";
     const content = el("section"), canFloat = typeof ctx.ui.createFloatWidget === "function";
     const float = () => iconButton("float", "Floating player", () => safe(openWidget), "ra-icon ra-quiet ra-push");
@@ -2621,14 +2691,16 @@ function setup(ctx) {
     const sliders = el("div", "", "ra-grid");
     sliders.append(speedField, volumeField);
     const about = disclosure([el("strong", "About cost and saved audio")]);
-    about.body.append(el("p", "While Readalong is on, each new reply gets audio as soon as it is written. Nothing plays until you press Play.", "ra-muted"), el("p", "Audio is saved on this device. Reloading or switching chats brings it back for free. If nothing is saved, press Prepare message to make it.", "ra-muted"), el("p", "Changing a voice, or how a name is said, only changes new audio.", "ra-muted"), el("p", "The highlighted sentence is a close guess of where the voice is.", "ra-muted"));
-    options.replaceChildren(sliders, toggle("Scroll the chat to follow the voice", settings.follow, (v) => {
+    about.body.append(el("p", "While Readalong is on, each new reply gets audio as soon as it is written. Automatic playback can start it for you; otherwise press Play.", "ra-muted"), el("p", "Audio is saved on this device. Reloading or switching chats brings it back for free. If nothing is saved, press Prepare message to make it.", "ra-muted"), el("p", "Changing a voice, or how a name is said, only changes new audio.", "ra-muted"), el("p", "The highlighted sentence is a close guess of where the voice is.", "ra-muted"));
+    options.replaceChildren(sliders, toggle("Play replies automatically", settings.automaticPlayback, (v) => {
+      safe(() => setAutomaticPlayback(v));
+    }, "Start when enough audio is ready. Pause waits for Resume. Reloading or switching chats does not start old audio."), toggle("Scroll the chat to follow the voice", settings.follow, (v) => {
       settings.follow = v;
       safe(saveSettings);
-    }), toggle("Let me press Play early", settings.earlyPlayback, (v) => {
+    }), toggle("Allow playback before the whole message is ready", settings.earlyPlayback, (v) => {
       settings.earlyPlayback = v;
       safe(saveSettings);
-    }, "Play unlocks when about three quarters of the audio is ready."), about.details);
+    }, "Manual and automatic playback can start with about three quarters of the text and at least 30 seconds of opening audio. Turn off to wait for the whole message."), about.details);
   }
   function nextStep(label, to) {
     const b = button(label, () => showView(to, true));

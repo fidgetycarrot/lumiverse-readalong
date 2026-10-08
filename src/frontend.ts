@@ -8,6 +8,7 @@ import { AudioCache, preparationHash } from './audio-cache';
 import {widgetDimensions as resolveWidgetDimensions,widgetPosition} from './widget-layout';
 import {patchPlaybackChildren} from './playback-ui';
 import {earlyPlaybackPrefix} from './early-playback';
+import {AutomaticPlayback} from './automatic-playback';
 import {CompletionInbox,type CompletedReply} from './auto-preparation';
 import {normalizePronunciations,pronunciationEntry,pronunciationSample,type Pronunciations,type PronunciationEntry} from './pronunciation';
 
@@ -155,6 +156,7 @@ export function setup(ctx: SpindleFrontendContext) {
   let checkingSavedAudio=false;
   let preparingAudio=false,waitingForAudio=false;
   let playAttempt:object|null=null,messageLoad:object|null=null;
+  const automaticPlayback=new AutomaticPlayback();let automaticPlaybackError='';
   let utterance: SpeechSynthesisUtterance | null = null;
   const audioPlayer=new PreparedPlayer();
   const audioCache=new AudioCache();let cacheUserId='';
@@ -247,6 +249,7 @@ export function setup(ctx: SpindleFrontendContext) {
   }
   function stopClock() { if(clockTimer)clearInterval(clockTimer);clockTimer=null }
   function stop(showStatus = true) {
+    automaticPlayback.cancel();automaticPlaybackError='';
     playbackId++; playing = false; paused = false; phase='idle';checkingSavedAudio=false;preparingAudio=false;waitingForAudio=false;playAttempt=null;messageLoad=null;stopClock();
     if(showStatus)completionInbox.reset();
     readingAbort?.abort();readingAbort=null;
@@ -369,7 +372,20 @@ export function setup(ctx: SpindleFrontendContext) {
   audioPlayer.onEnded=finished;
   audioPlayer.onError=error=>{paused=true;playing=false;phase='paused';stopClock();notice(error.message,true);renderPlayer()};
   audioPlayer.onWaiting=waiting=>{waitingForAudio=waiting;if(phase==='playing')notice(waiting?'Waiting for the rest of the audio…':'Reading…');renderPlayer()};
-  async function playOrPause() {
+  function tryAutomaticPlayback() {
+    if(!automaticPlayback.take({enabled:settings.enabled,automatic:settings.automaticPlayback,ready:phase==='ready',busy:!!playAttempt || !!messageLoad}))return;
+    const token=playbackId;
+    void playOrPause(true).catch(error=>{
+      if(disposed || token!==playbackId)return;
+      automaticPlaybackError=error instanceof Error?error.message:'Automatic playback could not start. Press Play to use the prepared audio.';
+      notice(automaticPlaybackError,true);renderPlayer();
+    });
+  }
+  function preparationNotice(text:string){notice(automaticPlaybackError || text,!!automaticPlaybackError)}
+  async function playOrPause(automatic=false) {
+    // Any manual playback action owns this reading from now on. Preparation
+    // updates must never undo a pause or retry a blocked automatic start.
+    if(!automatic){automaticPlayback.cancel();automaticPlaybackError=''}
     if(!settings.enabled)throw new Error('Readalong is off. Turn it on to prepare audio.');
     if(playAttempt || messageLoad)return;
     if(phase==='preparing')return;
@@ -392,7 +408,10 @@ export function setup(ctx: SpindleFrontendContext) {
           markSentence(i,0);await browserSpeech(currentPassages[i],token,i);
         }
         if(token===playbackId){browserQueueActive=false;finished()}
-      } catch(e){if(token===playbackId){stop(false);throw e}}
+      } catch(e){if(token===playbackId){
+        browserQueueActive=false;playing=false;paused=false;phase='ready';stopClock();
+        speechSynthesis.cancel();utterance=null;renderPlayer();throw e;
+      }}
       return;
     }
     const attempt={};playAttempt=attempt;
@@ -479,10 +498,22 @@ export function setup(ctx: SpindleFrontendContext) {
     if(settings.enabled===enabled)return;
     completionInbox.setEnabled(enabled);knownCompletions.clear();localGenerations.clear();
     settings.enabled=enabled;if(!enabled)stop(false);
+    else if(settings.automaticPlayback && settings.provider!=='browser')audioPlayer.unlock();
     renderPlayer();renderVoices();renderAssignments();
     notice(enabled?'Readalong is on. Preparing the latest reply…':'Readalong is off. Nothing is sent to your voice service.');
     await saveSettings();
     if(enabled && settings.enabled){await refreshMessages();await prepareLatest(true)}
+  }
+  async function setAutomaticPlayback(enabled:boolean) {
+    settings.automaticPlayback=enabled;
+    if(enabled){
+      if(currentMessage && (phase==='preparing' || phase==='ready'))automaticPlayback.arm();
+      if(settings.enabled && settings.provider!=='browser')audioPlayer.unlock();
+    }else automaticPlayback.cancel();
+    renderOptions();renderPlayer();
+    // Enabling this option is an explicit playback choice, including for the
+    // currently loaded message. It never loads or synthesizes a message.
+    tryAutomaticPlayback();await saveSettings();
   }
   async function startMessage(message: MessageInfo,options:{automatic?:boolean;restoreOnly?:boolean}={}) {
     if(!settings.enabled)throw new Error('Readalong is off. Turn it on to prepare audio.');
@@ -491,6 +522,7 @@ export function setup(ctx: SpindleFrontendContext) {
       if(automaticPreparations.size>20)automaticPreparations.delete(automaticPreparations.values().next().value!);
     }
     stop(false);
+    automaticPlayback.arm(!options.restoreOnly);
     const token=playbackId;readingAbort=new AbortController();const signal=readingAbort.signal;
     currentMessage={...message,characterId:message.isUser?undefined:message.characterId ?? speakerCharacterId(message.name,characters,ctx.getActiveChat().characterId ?? undefined)};
     phase='preparing';preparingAudio=true;checkingSavedAudio=true;preparedCount=0;showWidget();notice('Looking for saved audio…');renderPlayer();
@@ -540,7 +572,7 @@ export function setup(ctx: SpindleFrontendContext) {
                 openingCount=prefix;audioPlayer.begin(partial.slice(0,prefix) as PreparedClip[]);audioPlayer.setSpeed(settings.speed);audioPlayer.setVolume(settings.volume);phase='ready';
               }
             }
-            notice(phase==='playing'?`Reading… ${count} of ${currentPassages.length} parts ready. The rest is on its way.`:phase==='paused'?`Paused. ${count} of ${currentPassages.length} parts ready. The rest is on its way.`:openingCount?`You can press Play now. ${count} of ${currentPassages.length} parts ready.`:`Preparing: ${count} of ${currentPassages.length} parts ready…`);renderPlayer();
+            preparationNotice(phase==='playing'?`Reading… ${count} of ${currentPassages.length} parts ready. The rest is on its way.`:phase==='paused'?`Paused. ${count} of ${currentPassages.length} parts ready. The rest is on its way.`:openingCount?`You can press Play now. ${count} of ${currentPassages.length} parts ready.`:`Preparing: ${count} of ${currentPassages.length} parts ready…`);renderPlayer();tryAutomaticPlayback();
           },snapshot.provider==='lumiverse'?3:2);
           if(token!==playbackId)return;
           // Preserve an active/paused opening buffer. Otherwise join everything
@@ -549,7 +581,7 @@ export function setup(ctx: SpindleFrontendContext) {
           else audioPlayer.load(clips);
           preparingAudio=false;audioPlayer.setSpeed(settings.speed);audioPlayer.setVolume(settings.volume);
           if(phase==='preparing')phase='ready';
-          notice((phase as string)==='playing'?'Reading… The whole message is ready.':(phase as string)==='paused'?'Paused. The whole message is ready.':'The whole message is ready. Press Play.');renderPlayer();
+          preparationNotice((phase as string)==='playing'?'Reading… The whole message is ready.':(phase as string)==='paused'?'Paused. The whole message is ready.':'The whole message is ready. Press Play.');renderPlayer();tryAutomaticPlayback();
           try{saved=await audioCache.put(cacheUserId,audioKey,clips)}catch{saved=false}
         }
         if(token!==playbackId)return;
@@ -557,7 +589,7 @@ export function setup(ctx: SpindleFrontendContext) {
       }
       if(token!==playbackId)return;
       if(phase==='preparing')phase='ready';preparingAudio=false;checkingSavedAudio=false;
-      notice(restored?'Saved audio is ready, at no new cost. Press Play.':!saved?'This audio could not be saved. It will be gone after a reload.':(phase as string)==='playing'?'Reading… The whole message is ready.':(phase as string)==='paused'?'Paused. The whole message is ready.':(phase as string)==='finished'?'Finished. Replay is free.':'The whole message is ready. Press Play.');renderPlayer();
+      preparationNotice(restored?'Saved audio is ready, at no new cost. Press Play.':!saved?'This audio could not be saved. It will be gone after a reload.':(phase as string)==='playing'?'Reading… The whole message is ready.':(phase as string)==='paused'?'Paused. The whole message is ready.':(phase as string)==='finished'?'Finished. Replay is free.':'The whole message is ready. Press Play.');renderPlayer();tryAutomaticPlayback();
     } catch(e) {if(token===playbackId){stop(false);throw e}}
   }
   async function preview(voice: string, assignment?: Partial<VoiceAssignment>,sample?:{text:string;entries:Pronunciations}) {
@@ -626,12 +658,12 @@ export function setup(ctx: SpindleFrontendContext) {
       const r = await rpc('message',{chatId,messageId:id});
       if (ctx.getActiveChat().chatId !== chatId || token!==playbackId || messageLoad!==operation)return;
       await startMessage(r.message,{restoreOnly});
-    }finally{if(messageLoad===operation){messageLoad=null;renderPlayer()}}
+    }finally{if(messageLoad===operation){messageLoad=null;renderPlayer();tryAutomaticPlayback()}}
   }
   function renderPlayer() {
     for(const handle of bubbleHandles.values()){const read=handle.querySelector('button');if(read)read.disabled=!settings.enabled}
     powerInput.checked=settings.enabled;powerLabel.textContent=settings.enabled?'On':'Off';
-    intro.textContent=settings.enabled?'New replies get audio on their own and wait for Play. Your voice service may charge for each one.':'Turn on to hear replies read aloud.';
+    intro.textContent=settings.enabled?settings.automaticPlayback?'New replies get audio on their own and play when enough is ready. Your voice service may charge for each one.':'New replies get audio on their own and wait for Play. Your voice service may charge for each one.':'Turn on to hear replies read aloud.';
     root.dataset.raPhase=settings.enabled?phase:'off';
     const content=el('section'),canFloat=typeof ctx.ui.createFloatWidget==='function';
     const float=()=>iconButton('float','Floating player',()=>safe(openWidget),'ra-icon ra-quiet ra-push');
@@ -672,13 +704,14 @@ export function setup(ctx: SpindleFrontendContext) {
     const sliders=el('div','', 'ra-grid');sliders.append(speedField,volumeField);
     const about=disclosure([el('strong','About cost and saved audio')]);
     about.body.append(
-      el('p','While Readalong is on, each new reply gets audio as soon as it is written. Nothing plays until you press Play.','ra-muted'),
+      el('p','While Readalong is on, each new reply gets audio as soon as it is written. Automatic playback can start it for you; otherwise press Play.','ra-muted'),
       el('p','Audio is saved on this device. Reloading or switching chats brings it back for free. If nothing is saved, press Prepare message to make it.','ra-muted'),
       el('p','Changing a voice, or how a name is said, only changes new audio.','ra-muted'),
       el('p','The highlighted sentence is a close guess of where the voice is.','ra-muted'));
     options.replaceChildren(sliders,
+      toggle('Play replies automatically',settings.automaticPlayback,v=>{void safe(()=>setAutomaticPlayback(v))},'Start when enough audio is ready. Pause waits for Resume. Reloading or switching chats does not start old audio.'),
       toggle('Scroll the chat to follow the voice',settings.follow,v=>{settings.follow=v;void safe(saveSettings)}),
-      toggle('Let me press Play early',settings.earlyPlayback,v=>{settings.earlyPlayback=v;void safe(saveSettings)},'Play unlocks when about three quarters of the audio is ready.'),
+      toggle('Allow playback before the whole message is ready',settings.earlyPlayback,v=>{settings.earlyPlayback=v;void safe(saveSettings)},'Manual and automatic playback can start with about three quarters of the text and at least 30 seconds of opening audio. Turn off to wait for the whole message.'),
       about.details);
   }
   function nextStep(label:string,to:View) { const b=button(label,()=>showView(to,true));b.classList.add('ra-quiet','ra-next');return b }
