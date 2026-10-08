@@ -82,6 +82,12 @@ describe('voice selection and settings',()=>{
     expect(current.response_format).toBe('pcm');expect(legacy.response_format).toBe('pcm');
     expect(speechRequest({...DEFAULTS,model:'openai/gpt-4o-mini-tts'},segment).response_format).toBe('mp3');
   });
+  test('provider inputs preserve Gemini 3.8 vocal events and strip them for other models',()=>{
+    const segment={text:'Wait. <gasp> You heard that too? <long pause> Listen.',speaker:'Mara',emotion:'worried',delivery:'whispers'};
+    expect(speechRequest(DEFAULTS,segment).input).toBe(segment.text);
+    expect(speechRequest({...DEFAULTS,model:'openai/gpt-4o-mini-tts'},segment).input).toBe('Wait. You heard that too? Listen.');
+    expect(speechRequest({...DEFAULTS,model:'google/gemini-3.1-flash-tts-preview'},segment).input).toBe('[worried] [whispers] Wait. You heard that too? Listen.');
+  });
   test('bad numeric settings and object keys are rejected',()=>{
     const s=normalizeSettings(JSON.parse('{"speed":999,"volume":-1,"provider":"bad","assignments":{"__proto__":{"voice":"x"}}}'));
     expect(s.speed).toBe(2);expect(s.volume).toBe(0);expect(s.provider).toBe('openrouter');expect(Object.keys(s.assignments)).toHaveLength(0);

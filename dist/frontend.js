@@ -2,6 +2,16 @@
 var PROSE_TAGS = new Set(`p div span section article header footer main aside nav address blockquote q cite figure figcaption hgroup ul ol li dl dt dd menu br hr wbr h1 h2 h3 h4 h5 h6 b strong i em u s strike del ins mark small big sub sup abbr acronym dfn kbd samp var time font tt bdi bdo data ruby rb rp rt rtc a table thead tbody tfoot tr td th caption col colgroup label legend fieldset`.split(" "));
 var VOID_TAGS = new Set("area base br col embed hr img input link meta param source track wbr".split(" "));
 var ENTITIES = { nbsp: " ", amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", ldquo: "“", rdquo: "”", lsquo: "‘", rsquo: "’" };
+var VOCAL_TAGS = ["laugh", "laughter", "chuckle", "chuckles", "giggle", "snicker", "cackle", "cheer", "gasp", "sigh", "sighs", "groan", "grunt", "grr", "growl", "hiss", "moan", "pant", "pff", "phew", "tsk", "whispers", "whispering", "shout", "argh", "whimper", "cry", "sob", "scream", "shriek", "snort", "breath", "heavy breath", "exhales", "cough", "throat-clearing", "sneeze", "yawn", "short pause", "long pause"];
+var vocalTags = new Set(VOCAL_TAGS);
+function vocalTag(tag) {
+  const match = /^<([a-z][a-z\s-]*?)\s*\/?>$/i.exec(tag);
+  const name = match?.[1].toLowerCase().trim().replace(/\s+/g, " ");
+  return name && vocalTags.has(name) ? `<${name}>` : undefined;
+}
+function stripVocalTags(text, preserveOffsets = false) {
+  return text.replace(/<[^<>]*>/g, (tag) => vocalTag(tag) ? " ".repeat(preserveOffsets ? tag.length : 1) : tag);
+}
 function decodeEntities(text) {
   return text.replace(/&(#x[\da-f]+|#\d+|[a-z]+);/gi, (entity, name) => {
     if (name[0] !== "#")
@@ -10,7 +20,7 @@ function decodeEntities(text) {
     return code > 0 && code <= 1114111 && !(code >= 55296 && code <= 57343) ? String.fromCodePoint(code) : entity;
   });
 }
-function sanitizeSpeechText(raw) {
+function sanitizeSpeechText(raw, keepVocalTags = false) {
   const text = decodeEntities(raw).replace(/<!--\s*([a-z0-9_]+)_START\s*-->[\s\S]*?(?:<!--\s*\1_END\s*-->|$)/gi, " ").replace(/<!--[\s\S]*?(?:-->|$)/g, " ").replace(/```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)/g, " ").replace(/(`+)[\s\S]*?\1/g, " ");
   const tags = /<(\/?)([a-z][a-z0-9:_-]*)(?=[\s/>])(?:[^<>"']|"[^"]*"|'[^']*')*>/gi;
   const blocked = [], parts = [];
@@ -19,7 +29,11 @@ function sanitizeSpeechText(raw) {
     if (!blocked.length)
       parts.push(text.slice(cursor, match.index), " ");
     const tag = match[2].toLowerCase();
-    if (match[1]) {
+    const vocal = vocalTag(match[0]);
+    if (vocal) {
+      if (!blocked.length && keepVocalTags)
+        parts.push(vocal, " ");
+    } else if (match[1]) {
       const index = blocked.lastIndexOf(tag);
       if (index !== -1)
         blocked.splice(index);
@@ -105,14 +119,32 @@ function enumValue(v, values, fallback) {
 function stripCues(text) {
   return text.replace(new RegExp(CUE_PATTERN, "gi"), "");
 }
-function plainText(text) {
-  return sanitizeSpeechText(text).replace(/!\[[^\]]*\]\([^)]*\)/g, " ").replace(/\[([^\]]+)\]\([^)]*\)/g, "$1").replace(/^[ \t]*(?:#{1,6}\s+|>\s*|[-+]\s+|\d+\.\s+)/gm, "").replace(/[*_`~]/g, "").replace(/&quot;/g, '"').replace(/&amp;/g, "&").replace(/&#39;/g, "'").replace(/\s+/g, " ").trim();
+function plainText(text, keepVocalTags = false) {
+  return sanitizeSpeechText(text, keepVocalTags).replace(/!\[[^\]]*\]\([^)]*\)/g, " ").replace(/\[([^\]]+)\]\([^)]*\)/g, "$1").replace(/^[ \t]*(?:#{1,6}\s+|>\s*|[-+]\s+|\d+\.\s+)/gm, "").replace(/[*_`~]/g, "").replace(/&quot;/g, '"').replace(/&amp;/g, "&").replace(/&#39;/g, "'").replace(/\s+/g, " ").trim();
 }
 function splitSentences(text) {
-  return Array.from(new Intl.Segmenter(undefined, { granularity: "sentence" }).segment(text), (s) => s.segment.trim()).filter(Boolean).flatMap((s) => s.length <= 650 ? [s] : s.match(/.{1,600}(?:\s|$)|.{1,600}/gu).map((x) => x.trim()).filter(Boolean));
+  const detection = stripVocalTags(text, true);
+  return Array.from(new Intl.Segmenter(undefined, { granularity: "sentence" }).segment(detection), (s) => text.slice(s.index, s.index + s.segment.length).trim()).filter(Boolean).flatMap((s) => {
+    if (s.length <= 650)
+      return [s];
+    const chunks = [];
+    let chunk = "";
+    for (const token of s.match(/<[^<>]+>|\S+/gu) ?? []) {
+      for (const word of token.match(/.{1,600}/gu) ?? []) {
+        if (chunk && chunk.length + word.length + 1 > 600) {
+          chunks.push(chunk);
+          chunk = "";
+        }
+        chunk += (chunk ? " " : "") + word;
+      }
+    }
+    if (chunk)
+      chunks.push(chunk);
+    return chunks;
+  });
 }
 function parseSegments(raw, defaultSpeaker = "", rules = DEFAULT_SPEECH_RULES) {
-  raw = sanitizeSpeechText(raw).replace(/!\[[^\]]*\]\([^)]*\)/g, " ").replace(/\[([^\]]+)\]\([^)]*\)/g, "$1");
+  raw = sanitizeSpeechText(raw, true).replace(/!\[[^\]]*\]\([^)]*\)/g, " ").replace(/\[([^\]]+)\]\([^)]*\)/g, "$1");
   const cue = new RegExp(`\\[(emotion|delivery|speaker):([^\\]\\r\\n]{1,80})\\]`, "gi");
   const pieces = [];
   let speaker = defaultSpeaker, explicitSpeaker = false, emotion = "", delivery = "";
@@ -121,7 +153,7 @@ function parseSegments(raw, defaultSpeaker = "", rules = DEFAULT_SPEECH_RULES) {
       return;
     let offset = 0, prefix = "", appended = false;
     const append = (prose) => {
-      const text = plainText(prose);
+      const text = plainText(prose, true);
       if (!text)
         return;
       if (/^["“”«»]+$/.test(text)) {
@@ -186,16 +218,17 @@ function selectVoice(settings, segment, characterId) {
     delivery: settings.useEmotions ? segment.delivery || assigned?.delivery || "normal" : "normal"
   };
 }
-function speechInput(segment, assignment, supportsTags) {
+function speechInput(segment, assignment, supportsTags, supportsVocalTags = false) {
+  const text = supportsVocalTags ? segment.text : stripVocalTags(segment.text).replace(/\s+/g, " ").trim();
   if (!supportsTags)
-    return segment.text;
+    return text;
   const emotionTag = { happy: "happy", sad: "sad", angry: "angry", worried: "worried", curious: "curious", excited: "excited", sarcastic: "sarcastic", tender: "warmly", afraid: "scared" };
   const cues = [];
   if (emotionTag[assignment.emotion])
     cues.push(`[${emotionTag[assignment.emotion]}]`);
   if (assignment.delivery !== "normal")
     cues.push(`[${assignment.delivery}]`);
-  return [...cues, segment.text].join(" ");
+  return [...cues, text].join(" ");
 }
 function needsPcm(settings) {
   return settings.provider === "openrouter" && /^google\/gemini-.*tts/i.test(settings.model);
@@ -205,7 +238,7 @@ function speechRequest(settings, segment, characterId) {
   const openrouter = settings.provider === "openrouter";
   const gemini38 = openrouter && /^google\/gemini-3\.8.*tts/.test(settings.model);
   const legacyTags = openrouter && /^google\/gemini-3\.1.*tts/.test(settings.model);
-  const body = { model: settings.model, voice: assignment.voice, input: speechInput(segment, assignment, legacyTags), response_format: needsPcm(settings) ? "pcm" : "mp3" };
+  const body = { model: settings.model, voice: assignment.voice, input: speechInput(segment, assignment, legacyTags, gemini38), response_format: needsPcm(settings) ? "pcm" : "mp3" };
   if (gemini38) {
     const emotions = { happy: "happy and cheerful", sad: "sad", angry: "angry", worried: "worried", curious: "curious", excited: "excited", sarcastic: "sarcastic", tender: "warm and tender", afraid: "afraid" };
     const deliveries = { whispers: "whispering", shouts: "shouting", softly: "soft-spoken", slowly: "slow and deliberate", laughs: "with a light laugh", sighs: "with a sigh" };
@@ -720,7 +753,7 @@ function nativeSpeechRequest(connection, settings, segment, characterId) {
     parameters.instructions = `Speak ${direction}.`;
   return {
     connectionId: connection.id,
-    text: speechInput(segment, assignment, legacyTags),
+    text: speechInput(segment, assignment, legacyTags, gemini && /gemini-3\.8/i.test(model)),
     voice: assignment.voice || connection.voice,
     model,
     parameters,
@@ -812,7 +845,8 @@ var MAX_NATIVE_PASSAGE_CHARS = 12000;
 function planSpeech(segments, settings, context) {
   const passages = [];
   let previousKey = "";
-  for (const segment of segments) {
+  for (const source of segments) {
+    let segment = source;
     const characterId = speakerCharacterId(segment.speaker, context.characters, context.characterId);
     const assignment = selectVoice(settings, segment, characterId);
     const narrator = segment.speaker.trim().toLowerCase() === "narrator";
@@ -824,6 +858,11 @@ function planSpeech(segments, settings, context) {
       const connection = context.connections?.find((c) => c.id === inherited?.connectionId);
       if (connection && inherited)
         snapshot = { ...snapshot, connectionId: connection.id, model: connection.model || settings.model, voice: inherited.voice || connection.voice || assignment.voice };
+    }
+    if (snapshot.provider === "browser" || !/gemini-3\.8.*tts/i.test(snapshot.model)) {
+      segment = { ...source, text: stripVocalTags(source.text).replace(/\s+/g, " ").trim() };
+      if (!segment.text || /^["“”«»\s]+$/.test(segment.text))
+        continue;
     }
     const styleSupported = /gemini-3\.1.*tts|gpt-4o-mini-tts/i.test(snapshot.model) && snapshot.provider !== "browser";
     const emotion = styleSupported ? assignment.emotion : "neutral", delivery = styleSupported ? assignment.delivery : "normal";
@@ -866,7 +905,7 @@ async function prepareAll(items, prepare, signal, progress, concurrency = 3) {
   return results;
 }
 function estimatedSentenceIndex(passage, fraction) {
-  const weights = passage.segments.map((s) => Math.max(1, s.text.replace(/[^\p{L}\p{N}]/gu, "").length) + 12 * splitSentences(s.text).length);
+  const weights = passage.segments.map((s) => Math.max(1, stripVocalTags(s.text).replace(/[^\p{L}\p{N}]/gu, "").length) + 12 * splitSentences(s.text).length);
   const target = Math.max(0, Math.min(0.999999, fraction)) * weights.reduce((a, b) => a + b, 0);
   let sum = 0;
   for (let i = 0;i < weights.length; i++) {
@@ -1274,7 +1313,7 @@ function setup(ctx) {
     close.setAttribute("aria-label", "Hide floating player");
     header.append(close);
     const caption = el("p", phase === "playing" || phase === "paused" ? `${currentSegments[position]?.speaker || "Voice"} · ${currentPassages[currentPassage]?.voice || ""}` : status.textContent ?? "Choose a message.", "ra-caption");
-    caption.title = currentSegments[position]?.text ?? caption.textContent ?? "";
+    caption.title = plainText(currentSegments[position]?.text ?? caption.textContent ?? "");
     const controls = el("div", "", "ra-row");
     const play = button(!settings.enabled ? "Turn on" : phase === "preparing" ? checkingSavedAudio ? "Loading…" : "Preparing…" : phase === "idle" ? "Play latest" : phase === "paused" ? "Resume" : phase === "playing" ? "Pause" : phase === "finished" ? "Replay" : "Play", () => safe(settings.enabled ? playOrPause : () => setEnabled(true)), true);
     play.disabled = !ready || settings.enabled && (phase === "preparing" || phase === "idle" && !selectedId);
@@ -1299,7 +1338,7 @@ function setup(ctx) {
     position = next;
     markedPosition = next;
     if (currentMessage) {
-      marker.mark(() => contentRoot(currentMessage.id), currentSegments[position].text);
+      marker.mark(() => contentRoot(currentMessage.id), plainText(currentSegments[position].text));
       if (settings.follow)
         marker.follow();
     }
@@ -1813,7 +1852,7 @@ function setup(ctx) {
       const segment = currentSegments[position], progress = el("progress");
       progress.max = phase === "preparing" ? currentPassages.length : currentSegments.length;
       progress.value = phase === "preparing" ? preparedCount : phase === "ready" ? 0 : position + 1;
-      player.append(el("p", `${segment?.speaker || "Voice"} · ${currentPassages[currentPassage]?.voice || ""} · Sentence ${position + 1} of ${currentSegments.length}`, "ra-muted"), progress, el("p", segment?.text ?? "", "ra-passage"));
+      player.append(el("p", `${segment?.speaker || "Voice"} · ${currentPassages[currentPassage]?.voice || ""} · Sentence ${position + 1} of ${currentSegments.length}`, "ra-muted"), progress, el("p", plainText(segment?.text ?? ""), "ra-passage"));
       if (currentMessage)
         player.append(el("p", "The sentence marker estimates your place within continuous audio. Pausing keeps it in place.", "ra-muted"));
     } else
@@ -1917,7 +1956,7 @@ function setup(ctx) {
         notice(await nativeTts.check(settings.connectionId));
       })));
       if (/gemini-3\.8.*tts/i.test(settings.model))
-        config.append(el("p", "Gemini 3.8 reads clean dialogue through this connection. Lumiverse’s current TTS endpoint does not pass its per-sentence emotion directions.", "ra-muted"));
+        config.append(el("p", "Gemini 3.8 supports your preset’s inline vocal sounds and pauses. Separate Readalong emotion directions are not yet supported through this connection.", "ra-muted"));
       diagnoseButton = null;
       diagnoseHint = null;
     }

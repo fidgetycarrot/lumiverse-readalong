@@ -1,5 +1,40 @@
 import {test,expect} from 'bun:test';
 import {parseSegments,plainText,DEFAULT_SPEECH_RULES} from '../src/shared';
+import {locateText,normalizeText} from '../src/highlight';
+
+test('Threadbare inline gasp preserves the entire dialogue and following narration',()=>{
+  const segments=parseSegments('She paused. "Wait. <gasp> You heard that too?" He nodded.','Mara');
+  expect(segments.map(s=>s.text).join(' ')).toBe('She paused. "Wait. <gasp> You heard that too?" He nodded.');
+  expect(segments.map(s=>s.speaker)).toEqual(['narrator','Mara','Mara','narrator']);
+  expect(plainText('"Wait. <gasp> You heard that too?"')).toBe('"Wait. You heard that too?"');
+});
+test('Threadbare vocal menu, aliases and multiword events survive prose wrappers',()=>{
+  const menu='laugh laughter chuckle chuckles giggle snicker cackle cheer gasp sigh sighs groan grunt grr growl hiss moan pant pff phew tsk whispers whispering shout argh whimper cry sob scream shriek snort breath exhales cough throat-clearing sneeze yawn'.split(' ').concat(['heavy breath','short pause','long pause']);
+  for(const name of menu) {
+    const raw=`<font color="blue">"Before <${name}> after."</font> Then she waited.`;
+    expect(parseSegments(raw,'Mara').map(s=>s.text)).toEqual([`"Before <${name}> after."`,'Then she waited.']);
+    expect(plainText(raw)).toBe('"Before after." Then she waited.');
+  }
+});
+test('recognized vocal tokens are normalized without acting as XML containers',()=>{
+  expect(parseSegments('"A <GASP/> B <heavy   breath> C <short pause> D."','Mara')[0].text).toBe('"A <gasp> B <heavy breath> C <short pause> D."');
+  expect(plainText('A <gasp> B <long pause> C')).toBe('A B C');
+});
+test('vocal events inside hidden blocks, comments and code remain excluded',()=>{
+  expect(parseSegments('Before. <scenecard><gasp> Hidden. </scenecard><dt-image>"<laugh> Photo."</dt-image> `"<sigh> Code."` <!-- <cry> --> After.','Mara').map(s=>s.text)).toEqual(['Before.','After.']);
+});
+test('vocal-looking tags with attributes do not bypass metadata exclusion',()=>{
+  expect(plainText('Before. <gasp request="hidden">Private text.</gasp> After.')).toBe('Before. After.');
+});
+test('dialogue marker matches rendered text with the vocal token hidden',()=>{
+  const segments=parseSegments('“Wait. <gasp> You heard that too?”','Mara');
+  const rendered=normalizeText('“Wait.  You heard that too?”');
+  expect(segments).toHaveLength(2);
+  const first=locateText(rendered,plainText(segments[0].text))!;
+  expect(first).not.toBeNull();
+  const next=locateText(rendered,plainText(segments[1].text),first.offset+first.length)!;
+  expect(next.offset).toBeGreaterThan(first.offset);
+});
 
 const controls=`<flair scene="clear" light="monitor" mood="exposed"></flair>
 <flair-choice>Cross the room and hand him the phone</flair-choice>

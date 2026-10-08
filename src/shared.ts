@@ -1,4 +1,4 @@
-import { sanitizeSpeechText } from './speech-text';
+import { sanitizeSpeechText,stripVocalTags } from './speech-text';
 
 export const EMOTIONS = ['neutral', 'happy', 'sad', 'angry', 'worried', 'curious', 'excited', 'sarcastic', 'tender', 'afraid'] as const;
 export const DELIVERIES = ['normal', 'whispers', 'shouts', 'softly', 'slowly', 'laughs', 'sighs'] as const;
@@ -61,8 +61,8 @@ function clamp(v: unknown, min: number, max: number, fallback: number) { return 
 function enumValue(v: unknown, values: readonly string[], fallback: string) { return typeof v === 'string' && values.includes(v.toLowerCase()) ? v.toLowerCase() : fallback }
 export function stripCues(text: string) { return text.replace(new RegExp(CUE_PATTERN, 'gi'), '') }
 // Match rendered prose without depending on React's DOM structure or changing stored messages.
-export function plainText(text: string): string {
-  return sanitizeSpeechText(text).replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
+export function plainText(text: string,keepVocalTags=false): string {
+  return sanitizeSpeechText(text,keepVocalTags).replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
     .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
     .replace(/^[ \t]*(?:#{1,6}\s+|>\s*|[-+]\s+|\d+\.\s+)/gm, '')
     .replace(/[*_`~]/g, '').replace(/&quot;/g, '"').replace(/&amp;/g, '&').replace(/&#39;/g, "'")
@@ -70,11 +70,25 @@ export function plainText(text: string): string {
 }
 export function splitSentences(text: string): string[] {
   // Intl keeps abbreviations and Unicode punctuation substantially better than a period regex.
-  return Array.from(new Intl.Segmenter(undefined, { granularity: 'sentence' }).segment(text), s => s.segment.trim()).filter(Boolean)
-    .flatMap(s => s.length <= 650 ? [s] : s.match(/.{1,600}(?:\s|$)|.{1,600}/gu)!.map(x => x.trim()).filter(Boolean));
+  // Vocal tokens have no linguistic content. Mask them for boundary detection
+  // but retain their original positions in the text sent to Gemini.
+  const detection=stripVocalTags(text,true);
+  return Array.from(new Intl.Segmenter(undefined, { granularity: 'sentence' }).segment(detection), s => text.slice(s.index,s.index+s.segment.length).trim()).filter(Boolean)
+    .flatMap(s => {
+      if(s.length<=650)return [s];
+      const chunks:string[]=[];let chunk='';
+      // Multiword vocal events remain atomic even at long passage boundaries.
+      for(const token of s.match(/<[^<>]+>|\S+/gu) ?? []) {
+        for(const word of token.match(/.{1,600}/gu) ?? []) {
+          if(chunk && chunk.length+word.length+1>600){chunks.push(chunk);chunk=''}
+          chunk+=(chunk?' ':'')+word;
+        }
+      }
+      if(chunk)chunks.push(chunk);return chunks;
+    });
 }
 export function parseSegments(raw: string, defaultSpeaker = '', rules:SpeechRules=DEFAULT_SPEECH_RULES): SpeechSegment[] {
-  raw = sanitizeSpeechText(raw).replace(/!\[[^\]]*\]\([^)]*\)/g,' ')
+  raw = sanitizeSpeechText(raw,true).replace(/!\[[^\]]*\]\([^)]*\)/g,' ')
     .replace(/\[([^\]]+)\]\([^)]*\)/g,'$1');
   const cue = new RegExp(`\\[(emotion|delivery|speaker):([^\\]\\r\\n]{1,80})\\]`, 'gi');
   const pieces:SpeechSegment[]=[];
@@ -83,7 +97,7 @@ export function parseSegments(raw: string, defaultSpeaker = '', rules:SpeechRule
     if(action==='skip')return;
     let offset=0,prefix='',appended=false;
     const append=(prose:string)=>{
-      const text=plainText(prose);if(!text)return;
+      const text=plainText(prose,true);if(!text)return;
       // A cue inside opening quotes must not create a spoken quote-only
       // request or discard the quote's character classification.
       if(/^["“”«»]+$/.test(text)){prefix+=text;return}
@@ -133,13 +147,14 @@ export function selectVoice(settings: Settings, segment: SpeechSegment, characte
     delivery: settings.useEmotions ? segment.delivery || assigned?.delivery || 'normal' : 'normal',
   };
 }
-export function speechInput(segment: SpeechSegment, assignment: VoiceAssignment, supportsTags: boolean): string {
-  if (!supportsTags) return segment.text;
+export function speechInput(segment: SpeechSegment, assignment: VoiceAssignment, supportsTags: boolean, supportsVocalTags=false): string {
+  const text=supportsVocalTags?segment.text:stripVocalTags(segment.text).replace(/\s+/g,' ').trim();
+  if (!supportsTags) return text;
   const emotionTag: Record<string,string> = { happy:'happy', sad:'sad', angry:'angry', worried:'worried', curious:'curious', excited:'excited', sarcastic:'sarcastic', tender:'warmly', afraid:'scared' };
   const cues: string[] = [];
   if (emotionTag[assignment.emotion]) cues.push(`[${emotionTag[assignment.emotion]}]`);
   if (assignment.delivery !== 'normal') cues.push(`[${assignment.delivery}]`);
-  return [...cues, segment.text].join(' ');
+  return [...cues, text].join(' ');
 }
 export function needsPcm(settings: Settings): boolean {
   return settings.provider === 'openrouter' && /^google\/gemini-.*tts/i.test(settings.model);
@@ -147,10 +162,10 @@ export function needsPcm(settings: Settings): boolean {
 export function speechRequest(settings: Settings, segment: SpeechSegment, characterId?: string): Record<string,unknown> {
   const assignment = selectVoice(settings,segment,characterId);
   const openrouter = settings.provider === 'openrouter';
-  // Gemini 3.8 reads text verbatim; never put performance directions in its input.
+  // Gemini 3.8 accepts inline vocal events; sustained directions stay separate.
   const gemini38 = openrouter && /^google\/gemini-3\.8.*tts/.test(settings.model);
   const legacyTags = openrouter && /^google\/gemini-3\.1.*tts/.test(settings.model);
-  const body: Record<string,unknown> = { model:settings.model, voice:assignment.voice, input:speechInput(segment,assignment,legacyTags), response_format:needsPcm(settings) ? 'pcm' : 'mp3' };
+  const body: Record<string,unknown> = { model:settings.model, voice:assignment.voice, input:speechInput(segment,assignment,legacyTags,gemini38), response_format:needsPcm(settings) ? 'pcm' : 'mp3' };
   if (gemini38) {
     const emotions: Record<string,string> = { happy:'happy and cheerful',sad:'sad',angry:'angry',worried:'worried',curious:'curious',excited:'excited',sarcastic:'sarcastic',tender:'warm and tender',afraid:'afraid' };
     const deliveries: Record<string,string> = { whispers:'whispering',shouts:'shouting',softly:'soft-spoken',slowly:'slow and deliberate',laughs:'with a light laugh',sighs:'with a sigh' };
@@ -159,4 +174,4 @@ export function speechRequest(settings: Settings, segment: SpeechSegment, charac
   }
   return body;
 }
-export const EMOTION_INSTRUCTION = `When vocal delivery matters, add sparse voice cues immediately before the affected sentence, using [emotion:neutral|happy|sad|angry|worried|curious|excited|sarcastic|tender|afraid] and optionally [delivery:normal|whispers|shouts|softly|slowly|laughs|sighs]. Choose one value per cue, not the list. Put [speaker:Character Name] inside the opening quotation mark of that character's dialogue. Quoted dialogue ends that speaker's cues; surrounding prose automatically uses the narrator. Repeat a speaker cue for each quote that needs a different character. For intentional unquoted speech, cues persist until [speaker:narrator] or another speaker cue; a speaker change resets emotion and delivery. Use the character's name, preserve ordinary prose and formatting, and avoid tagging every sentence. These cues are hidden from the reader and used only for speech. Do not add any other bracketed audio instructions.`;
+export const EMOTION_INSTRUCTION = `When vocal delivery matters, add sparse voice cues immediately before the affected sentence, using [emotion:neutral|happy|sad|angry|worried|curious|excited|sarcastic|tender|afraid] and optionally [delivery:normal|whispers|shouts|softly|slowly|laughs|sighs]. Choose one value per cue, not the list. Put [speaker:Character Name] inside the opening quotation mark of that character's dialogue. Quoted dialogue ends that speaker's cues; surrounding prose automatically uses the narrator. Repeat a speaker cue for each quote that needs a different character. For intentional unquoted speech, cues persist until [speaker:narrator] or another speaker cue; a speaker change resets emotion and delivery. Use the character's name, preserve ordinary prose and formatting, and avoid tagging every sentence. These cues are hidden from the reader and used only for speech. Do not add any other square-bracket audio instructions. Preserve inline vocal tags requested by the preset.`;

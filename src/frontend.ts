@@ -157,7 +157,7 @@ export function setup(ctx: SpindleFrontendContext) {
     if(audioPlayer.duration){const time=el('span',`${timeLabel(audioPlayer.elapsed)} / ${timeLabel(audioPlayer.duration)}`,'ra-time');header.append(time)}
     const close=button('×',()=>widget?.setVisible(false));close.className='ra-close';close.setAttribute('aria-label','Hide floating player');header.append(close);
     const caption=el('p',phase==='playing' || phase==='paused' ? `${currentSegments[position]?.speaker || 'Voice'} · ${currentPassages[currentPassage]?.voice || ''}` : status.textContent ?? 'Choose a message.','ra-caption');
-    caption.title=currentSegments[position]?.text ?? caption.textContent ?? '';
+    caption.title=plainText(currentSegments[position]?.text ?? caption.textContent ?? '');
     const controls=el('div','', 'ra-row');
     const play=button(!settings.enabled?'Turn on':phase==='preparing'?(checkingSavedAudio?'Loading…':'Preparing…'):phase==='idle'?'Play latest':phase==='paused'?'Resume':phase==='playing'?'Pause':phase==='finished'?'Replay':'Play',()=>safe(settings.enabled?playOrPause:()=>setEnabled(true)),true);
     play.disabled=!ready || settings.enabled && (phase==='preparing' || phase==='idle' && !selectedId);controls.append(play);
@@ -170,7 +170,7 @@ export function setup(ctx: SpindleFrontendContext) {
     const next=currentPassages.slice(0,passageIndex).reduce((sum,p)=>sum+p.segments.length,0)+sentenceIndex;
     if(next===markedPosition && currentPassage===passageIndex)return;
     currentPassage=passageIndex;position=next;markedPosition=next;
-    if(currentMessage){marker.mark(()=>contentRoot(currentMessage!.id),currentSegments[position].text);if(settings.follow)marker.follow()}
+    if(currentMessage){marker.mark(()=>contentRoot(currentMessage!.id),plainText(currentSegments[position].text));if(settings.follow)marker.follow()}
     renderPlayer();
   }
   function updateClock() {
@@ -395,7 +395,7 @@ export function setup(ctx: SpindleFrontendContext) {
     if (phase==='idle' && messages.length) player.append(field('Assistant message',select([...messages].reverse().map(m=>({value:m.id,label:`${m.name || 'Assistant'} · ${plainText(stripCues(m.content)).slice(0,70)}`})), selectedId,v=>{selectedId=v})));
     if (currentSegments.length) {
       const segment = currentSegments[position], progress = el('progress');progress.max=phase==='preparing'?currentPassages.length:currentSegments.length;progress.value=phase==='preparing'?preparedCount:phase==='ready'?0:position+1;
-      player.append(el('p',`${segment?.speaker || 'Voice'} · ${currentPassages[currentPassage]?.voice || ''} · Sentence ${position+1} of ${currentSegments.length}`,'ra-muted'),progress,el('p',segment?.text ?? '', 'ra-passage'));
+      player.append(el('p',`${segment?.speaker || 'Voice'} · ${currentPassages[currentPassage]?.voice || ''} · Sentence ${position+1} of ${currentSegments.length}`,'ra-muted'),progress,el('p',plainText(segment?.text ?? ''), 'ra-passage'));
       if (currentMessage) player.append(el('p','The sentence marker estimates your place within continuous audio. Pausing keeps it in place.','ra-muted'));
     } else player.append(el('p',settings.enabled?'Prepare message reuses matching saved audio. If none is available, it generates speech and charges may apply.':'Readalong is off. Turn it on when you want prepared speech.','ra-muted'));
     player.append(toggle('Follow the spoken passage as it moves down the page',settings.follow,v=>{settings.follow=v;void safe(saveSettings)}));
@@ -422,7 +422,7 @@ export function setup(ctx: SpindleFrontendContext) {
       if(models.length && activeNative())config.append(field('Speech model',select(models.map(m=>({value:m.id,label:m.name})),settings.model,v=>{stop(false);settings.model=v;settings.voice=voiceNames()[0]??'';renderConfig();renderVoices();renderAssignments();void safe(saveSettings)})));
       config.append(el('p','Uses your saved Lumiverse TTS connection and key. No separate key or helper app is needed. Add or edit connections in Lumiverse’s voice settings.','ra-muted'));
       config.append(button('Check connection',()=>safe(async()=>{if(!activeNative())throw new Error('Choose a saved TTS connection first.');notice('Checking connection…');notice(await nativeTts.check(settings.connectionId))})));
-      if(/gemini-3\.8.*tts/i.test(settings.model))config.append(el('p','Gemini 3.8 reads clean dialogue through this connection. Lumiverse’s current TTS endpoint does not pass its per-sentence emotion directions.','ra-muted'));
+      if(/gemini-3\.8.*tts/i.test(settings.model))config.append(el('p','Gemini 3.8 supports your preset’s inline vocal sounds and pauses. Separate Readalong emotion directions are not yet supported through this connection.','ra-muted'));
       diagnoseButton=null;diagnoseHint=null;
     }
     if(settings.provider==='openrouter') {

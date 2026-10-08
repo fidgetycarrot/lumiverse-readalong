@@ -7,6 +7,19 @@ const connection:NativeConnection={id:'saved-router',name:'My OpenRouter',provid
 const settings={...DEFAULTS,provider:'lumiverse' as const,connectionId:connection.id};
 const segment={text:'Are you sure?',speaker:'Mara',emotion:'worried',delivery:'whispers'};
 describe('native Lumiverse TTS',()=>{
+  test('Threadbare vocal events pass through Gemini 3.8 in their exact spoken position',async()=>{
+    const raw='She paused. <font color="blue">"[speaker:Mara] Wait. <gasp> You heard that too? <short pause> Listen."</font> She nodded. <dt-image>"<laugh> Hidden image prompt."</dt-image>';
+    const chosen=normalizeSettings({...settings,narratorVoice:'Autonoe',assignments:{'id:mara':{voice:'Fenrir'}}});
+    const passages=planSpeech(parseSegments(raw,'Mara'),chosen,{characters:[{id:'mara',name:'Mara'}],characterId:'mara'});
+    const requests:any[]=[];
+    const client=createNativeTtsClient((async(_url:any,init:any)=>{requests.push(JSON.parse(init.body));return new Response(new Uint8Array(2),{headers:{'Content-Type':'audio/pcm'}})}) as unknown as typeof fetch);
+    for(const p of passages)await client.speech(connection,p.settings,p.segment);
+    expect(requests.map(r=>[r.voice,r.text])).toEqual([
+      ['Autonoe','She paused.'],['Fenrir','"Wait. <gasp> You heard that too? <short pause> Listen."'],['Autonoe','She nodded.'],
+    ]);
+    expect(requests).toHaveLength(3);
+    expect(JSON.stringify(requests)).not.toMatch(/speaker:|font|dt-image|Hidden/);
+  });
   test('Autonoe narration and assigned Fenrir dialogue reach the native endpoint separately',async()=>{
     const chosen=normalizeSettings({...settings,voice:'Autonoe',narratorVoice:'Autonoe',inheritVoices:true,assignments:{'id:elys':{voice:'Fenrir',emotion:'tender',delivery:'normal'}}});
     const characters=[{id:'elys',name:'Elys-04 || I misclicked and now I have a femboy android maid',ttsVoice:{connectionId:'saved-router',voice:'Kore'}}];

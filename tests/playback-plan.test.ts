@@ -33,6 +33,35 @@ test('same voice prose batches across sentences, not per sentence',()=>{
   const passages=plan('She waited. It was late. The room was quiet.');
   expect(passages).toHaveLength(1);expect(passages[0].segments).toHaveLength(3);
 });
+test('inline vocal events do not add requests or break a continuous voice passage',()=>{
+  const raw='She paused. "Wait. <gasp> You heard that too? <short pause> Listen." She nodded.';
+  const tagged=plan(raw),plain=plan(raw.replace(/<[^>]+>/g,''));
+  expect(tagged.map(p=>p.voice)).toEqual(plain.map(p=>p.voice));
+  expect(tagged).toHaveLength(3);expect(tagged[1].segment.text).toContain('<gasp>');
+  expect(tagged.flatMap(p=>p.segments)).toHaveLength(plain.flatMap(p=>p.segments).length);
+});
+test('browser and unsupported models omit vocal events while keeping all words',()=>{
+  const raw='She paused. "Wait. <gasp> You heard that too? <short pause> Listen." She nodded.';
+  for(const provider of ['browser','local','lumiverse'] as const) {
+    const passages=plan(raw,{...settings,provider,model:'gpt-4o-mini-tts'});
+    expect(passages.map(p=>p.segment.text).join(' ')).toBe('She paused. "Wait. You heard that too? Listen." She nodded.');
+    expect(passages.map(p=>p.voice)).toEqual(['Charon','Kore','Charon']);
+  }
+  expect(plan('<gasp>',{...settings,provider:'browser'})).toHaveLength(0);
+});
+test('vocal support follows the resolved inherited model instead of the initial connection',()=>{
+  const s={...settings,model:'gpt-4o-mini-tts',assignments:{},narratorVoice:''};
+  const passages=planSpeech(parseSegments('"Hello <sigh> there."','Mara'),s,{characters:[{id:'mara',name:'Mara',ttsVoice:{connectionId:'gemini',voice:'Leda'}}],characterId:'mara',connections:[{id:'gemini',name:'Gemini',provider:'openrouter_tts',model:DEFAULTS.model,voice:'Kore'}]});
+  expect(passages[0].segment.text).toBe('"Hello <sigh> there."');
+});
+test('long Gemini passages cannot split a multiword vocal token across requests',()=>{
+  const raw='"'+('Hold on <heavy breath> keep going <short pause> '.repeat(500))+'"';
+  const passages=plan(raw);
+  expect(passages.length).toBeGreaterThan(1);
+  expect(passages.every(p=>p.segment.text.length<=MAX_NATIVE_PASSAGE_CHARS)).toBe(true);
+  for(const p of passages)expect(p.segment.text.replace(/<heavy breath>|<short pause>/g,'')).not.toMatch(/[<>]/);
+  expect(passages.map(p=>p.segment.text).join(' ')).toBe(raw.trim());
+});
 test('ignored Gemini 3.8 styles do not fragment continuous prose',()=>{
   expect(plan('[speaker:Mara][emotion:angry] Stop. [emotion:sad] Please stay.')).toHaveLength(1);
   const legacy=plan('[speaker:Mara][emotion:angry] Stop. [emotion:sad] Please stay.',{...settings,model:'google/gemini-3.1-flash-tts-preview'});

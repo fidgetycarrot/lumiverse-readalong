@@ -21,13 +21,12 @@ export function nativeSpeechRequest(connection:NativeConnection, settings:Settin
   const gemini=/gemini-.*tts/i.test(model);
   const legacyTags=gemini && /gemini-3\.1/i.test(model);
   const direction=style(assignment.emotion,assignment.delivery);
-  // The current native provider only forwards instructions for OpenAI's mini
-  // TTS family. Gemini 3.8 must receive clean text; its style metadata isn't
-  // exposed through the host's synthesis route yet.
+  // Sustained Gemini directions aren't exposed by this host adapter. Inline
+  // vocal events are part of the transcript and pass through without metadata.
   const parameters:Record<string,unknown>={};
   if (openrouter && gemini) parameters.speed=1;
   if (/gpt-4o-mini-tts/i.test(model) && ['openrouter_tts','openai_tts'].includes(connection.provider) && direction) parameters.instructions=`Speak ${direction}.`;
-  return {connectionId:connection.id,text:speechInput(segment,assignment,legacyTags),voice:assignment.voice || connection.voice,model,parameters,
+  return {connectionId:connection.id,text:speechInput(segment,assignment,legacyTags,gemini && /gemini-3\.8/i.test(model)),voice:assignment.voice || connection.voice,model,parameters,
     outputFormat:openrouter && gemini ? 'pcm' : connection.outputFormat};
 }
 export function createNativeTtsClient(transport:typeof fetch = fetch) {

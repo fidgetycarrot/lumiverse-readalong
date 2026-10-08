@@ -1,5 +1,6 @@
 import { selectVoice, speakerCharacterId, splitSentences, readVoiceRef, type CharacterInfo, type NativeVoiceRef, type Settings, type SpeechSegment } from './shared';
 import type { NativeConnection } from './native-tts';
+import { stripVocalTags } from './speech-text';
 
 export const MAX_PASSAGE_CHARS=3000;
 export const MAX_NATIVE_PASSAGE_CHARS=12000;
@@ -10,7 +11,8 @@ export interface VoiceContext { characters:CharacterInfo[];characterId?:string;c
 export function planSpeech(segments:SpeechSegment[], settings:Settings, context:VoiceContext):SpeechPassage[] {
   const passages:SpeechPassage[]=[];
   let previousKey='';
-  for(const segment of segments) {
+  for(const source of segments) {
+    let segment=source;
     const characterId=speakerCharacterId(segment.speaker,context.characters,context.characterId);
     const assignment=selectVoice(settings,segment,characterId);
     const narrator=segment.speaker.trim().toLowerCase()==='narrator';
@@ -21,6 +23,10 @@ export function planSpeech(segments:SpeechSegment[], settings:Settings, context:
       const inherited=narrator ? readVoiceRef(context.overrides?.narrator) ?? context.narrationVoice ?? speech : speech;
       const connection=context.connections?.find(c=>c.id===inherited?.connectionId);
       if(connection && inherited)snapshot={...snapshot,connectionId:connection.id,model:connection.model || settings.model,voice:inherited.voice || connection.voice || assignment.voice};
+    }
+    if(snapshot.provider==='browser' || !/gemini-3\.8.*tts/i.test(snapshot.model)) {
+      segment={...source,text:stripVocalTags(source.text).replace(/\s+/g,' ').trim()};
+      if(!segment.text || /^["“”«»\s]+$/.test(segment.text))continue;
     }
     // Gemini 3.8's native adapter ignores style cues, so don't fragment its
     // prose on directions it cannot use. Keep directions for supported TTS.
@@ -58,7 +64,7 @@ export async function prepareAll<T>(items:SpeechPassage[], prepare:(passage:Spee
 // Synthesis has no alignment timestamps. Sentence markers use a lightweight
 // estimate within a continuous voice passage, without another API request.
 export function estimatedSentenceIndex(passage:SpeechPassage, fraction:number):number {
-  const weights=passage.segments.map(s=>Math.max(1,s.text.replace(/[^\p{L}\p{N}]/gu,'').length)+12*splitSentences(s.text).length);
+  const weights=passage.segments.map(s=>Math.max(1,stripVocalTags(s.text).replace(/[^\p{L}\p{N}]/gu,'').length)+12*splitSentences(s.text).length);
   const target=Math.max(0,Math.min(.999999,fraction))*weights.reduce((a,b)=>a+b,0);
   let sum=0;for(let i=0;i<weights.length;i++){sum+=weights[i];if(target<sum)return i}return weights.length-1;
 }

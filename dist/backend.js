@@ -2,6 +2,16 @@
 // src/speech-text.ts
 var PROSE_TAGS = new Set(`p div span section article header footer main aside nav address blockquote q cite figure figcaption hgroup ul ol li dl dt dd menu br hr wbr h1 h2 h3 h4 h5 h6 b strong i em u s strike del ins mark small big sub sup abbr acronym dfn kbd samp var time font tt bdi bdo data ruby rb rp rt rtc a table thead tbody tfoot tr td th caption col colgroup label legend fieldset`.split(" "));
 var VOID_TAGS = new Set("area base br col embed hr img input link meta param source track wbr".split(" "));
+var VOCAL_TAGS = ["laugh", "laughter", "chuckle", "chuckles", "giggle", "snicker", "cackle", "cheer", "gasp", "sigh", "sighs", "groan", "grunt", "grr", "growl", "hiss", "moan", "pant", "pff", "phew", "tsk", "whispers", "whispering", "shout", "argh", "whimper", "cry", "sob", "scream", "shriek", "snort", "breath", "heavy breath", "exhales", "cough", "throat-clearing", "sneeze", "yawn", "short pause", "long pause"];
+var vocalTags = new Set(VOCAL_TAGS);
+function vocalTag(tag) {
+  const match = /^<([a-z][a-z\s-]*?)\s*\/?>$/i.exec(tag);
+  const name = match?.[1].toLowerCase().trim().replace(/\s+/g, " ");
+  return name && vocalTags.has(name) ? `<${name}>` : undefined;
+}
+function stripVocalTags(text, preserveOffsets = false) {
+  return text.replace(/<[^<>]*>/g, (tag) => vocalTag(tag) ? " ".repeat(preserveOffsets ? tag.length : 1) : tag);
+}
 
 // src/shared.ts
 var EMOTIONS = ["neutral", "happy", "sad", "angry", "worried", "curious", "excited", "sarcastic", "tender", "afraid"];
@@ -76,16 +86,17 @@ function selectVoice(settings, segment, characterId) {
     delivery: settings.useEmotions ? segment.delivery || assigned?.delivery || "normal" : "normal"
   };
 }
-function speechInput(segment, assignment, supportsTags) {
+function speechInput(segment, assignment, supportsTags, supportsVocalTags = false) {
+  const text = supportsVocalTags ? segment.text : stripVocalTags(segment.text).replace(/\s+/g, " ").trim();
   if (!supportsTags)
-    return segment.text;
+    return text;
   const emotionTag = { happy: "happy", sad: "sad", angry: "angry", worried: "worried", curious: "curious", excited: "excited", sarcastic: "sarcastic", tender: "warmly", afraid: "scared" };
   const cues = [];
   if (emotionTag[assignment.emotion])
     cues.push(`[${emotionTag[assignment.emotion]}]`);
   if (assignment.delivery !== "normal")
     cues.push(`[${assignment.delivery}]`);
-  return [...cues, segment.text].join(" ");
+  return [...cues, text].join(" ");
 }
 function needsPcm(settings) {
   return settings.provider === "openrouter" && /^google\/gemini-.*tts/i.test(settings.model);
@@ -95,7 +106,7 @@ function speechRequest(settings, segment, characterId) {
   const openrouter = settings.provider === "openrouter";
   const gemini38 = openrouter && /^google\/gemini-3\.8.*tts/.test(settings.model);
   const legacyTags = openrouter && /^google\/gemini-3\.1.*tts/.test(settings.model);
-  const body = { model: settings.model, voice: assignment.voice, input: speechInput(segment, assignment, legacyTags), response_format: needsPcm(settings) ? "pcm" : "mp3" };
+  const body = { model: settings.model, voice: assignment.voice, input: speechInput(segment, assignment, legacyTags, gemini38), response_format: needsPcm(settings) ? "pcm" : "mp3" };
   if (gemini38) {
     const emotions = { happy: "happy and cheerful", sad: "sad", angry: "angry", worried: "worried", curious: "curious", excited: "excited", sarcastic: "sarcastic", tender: "warm and tender", afraid: "afraid" };
     const deliveries = { whispers: "whispering", shouts: "shouting", softly: "soft-spoken", slowly: "slow and deliberate", laughs: "with a light laugh", sighs: "with a sigh" };
@@ -105,7 +116,7 @@ function speechRequest(settings, segment, characterId) {
   }
   return body;
 }
-var EMOTION_INSTRUCTION = `When vocal delivery matters, add sparse voice cues immediately before the affected sentence, using [emotion:neutral|happy|sad|angry|worried|curious|excited|sarcastic|tender|afraid] and optionally [delivery:normal|whispers|shouts|softly|slowly|laughs|sighs]. Choose one value per cue, not the list. Put [speaker:Character Name] inside the opening quotation mark of that character's dialogue. Quoted dialogue ends that speaker's cues; surrounding prose automatically uses the narrator. Repeat a speaker cue for each quote that needs a different character. For intentional unquoted speech, cues persist until [speaker:narrator] or another speaker cue; a speaker change resets emotion and delivery. Use the character's name, preserve ordinary prose and formatting, and avoid tagging every sentence. These cues are hidden from the reader and used only for speech. Do not add any other bracketed audio instructions.`;
+var EMOTION_INSTRUCTION = `When vocal delivery matters, add sparse voice cues immediately before the affected sentence, using [emotion:neutral|happy|sad|angry|worried|curious|excited|sarcastic|tender|afraid] and optionally [delivery:normal|whispers|shouts|softly|slowly|laughs|sighs]. Choose one value per cue, not the list. Put [speaker:Character Name] inside the opening quotation mark of that character's dialogue. Quoted dialogue ends that speaker's cues; surrounding prose automatically uses the narrator. Repeat a speaker cue for each quote that needs a different character. For intentional unquoted speech, cues persist until [speaker:narrator] or another speaker cue; a speaker change resets emotion and delivery. Use the character's name, preserve ordinary prose and formatting, and avoid tagging every sentence. These cues are hidden from the reader and used only for speech. Do not add any other square-bracket audio instructions. Preserve inline vocal tags requested by the preset.`;
 
 // src/playback-plan.ts
 var MAX_PASSAGE_CHARS = 3000;
