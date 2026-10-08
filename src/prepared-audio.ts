@@ -89,10 +89,13 @@ export class PreparedPlayer {
   private started=false;
   private playEpoch=0;
   private pendingPlay:Promise<boolean>|null=null;
+  private cancelPlay:(()=>void)|null=null;
+  private rejectPlay:((error:Error)=>void)|null=null;
+  private reloadBeforePlay=false;
   onEnded:()=>void=()=>{};
   onError:(error:Error)=>void=()=>{};
   onWaiting:(waiting:boolean)=>void=()=>{};
-  constructor(private factory=()=>new Audio(),private urls:{create:(blob:Blob)=>string;revoke:(url:string)=>void}={create:URL.createObjectURL.bind(URL),revoke:URL.revokeObjectURL.bind(URL)}){this.audio=factory()}
+  constructor(private factory=()=>new Audio(),private urls:{create:(blob:Blob)=>string;revoke:(url:string)=>void}={create:URL.createObjectURL.bind(URL),revoke:URL.revokeObjectURL.bind(URL)},private startTimeoutMs=10000){this.audio=factory()}
   unlock() {
     if(this.primed || this.tracks.length)return;this.primed=true;
     const silent=new Blob([waveHeader(2),new Uint8Array(2)],{type:'audio/wav'}),url=this.urls.create(silent),audio=this.audio;
@@ -129,12 +132,17 @@ export class PreparedPlayer {
       }
       this.advance();
     };
-    this.audio.onerror=()=>{if(generation===this.generation && audio===this.audio){this.running=false;this.onError(new Error('The prepared audio file could not be played.'))}};
+    this.audio.onerror=()=>{if(generation===this.generation && audio===this.audio){
+      this.running=false;this.reloadBeforePlay=true;audio.pause();
+      const detail=audio.error?.code===3?'This browser could not decode the prepared audio.':audio.error?.code===4?'This browser could not load the prepared audio format.':'The prepared audio file could not be played.';
+      const error=new Error(`${detail} Press Play again to reload the same recording; no speech is requested.`);
+      if(this.rejectPlay)this.rejectPlay(error);else this.onError(error);
+    }};
     this.preloadNext();
   }
   private preloadNext(){if(!this.next && this.index+1<this.tracks.length){this.next=this.factory();this.configure(this.next);this.next.src=this.tracks[this.index+1].url}}
   private advance(){
-    const generation=this.generation,old=this.audio;old.onended=null;old.onerror=null;old.removeAttribute('src');old.load();
+    const generation=this.generation,old=this.audio;old.onended=null;old.onerror=null;old.onplaying=null;old.onloadedmetadata=null;old.removeAttribute('src');old.load();
     this.audio=this.next??this.factory();this.next=null;this.activate(this.index+1);
     // Reuse the same guarded local playback path. No synthesis occurs here.
     void this.play().catch(()=>{if(generation===this.generation){this.running=false;this.onError(new Error('Prepared audio is ready. Press Resume to continue playback.'))}});
@@ -155,29 +163,46 @@ export class PreparedPlayer {
       if(this.index+1<this.tracks.length){this.waiting=false;this.onWaiting(false);this.advance();return this.pendingPlay!}
       this.running=true;return Promise.resolve(true);
     }
-    const generation=this.generation,epoch=++this.playEpoch;
-    const pending=(async()=>{
-      try{await this.audio.play()}catch(error){
-        if(generation!==this.generation || epoch!==this.playEpoch)return false;
-        const blocked=error instanceof Error && error.name==='NotAllowedError';
-        throw new Error(`${blocked?'Your browser blocked playback.':'Playback could not start.'} Press Play again; the prepared audio is reused and no speech is requested.`);
-      }
-      if(generation!==this.generation || epoch!==this.playEpoch)return false;
-      this.running=true;this.started=true;return true;
-    })();
+    // A failed media element is replaced only on a later local Play. Keep its
+    // Blob URL and clock: recovery never authorizes another speech request.
+    if(this.reloadBeforePlay){
+      const old=this.audio,time=Number.isFinite(old.currentTime)?old.currentTime:0,generation=this.generation;
+      old.pause();old.onended=null;old.onerror=null;old.onplaying=null;old.onloadedmetadata=null;old.removeAttribute('src');old.load();
+      this.audio=this.factory();this.reloadBeforePlay=false;this.activate(this.index);
+      const audio=this.audio,seek=()=>{if(generation!==this.generation || audio!==this.audio)return;try{audio.currentTime=time;audio.onloadedmetadata=null}catch{ /* Seek again once metadata is available. */ }};
+      if(time){audio.onloadedmetadata=seek;seek()}
+    }
+    const generation=this.generation,epoch=++this.playEpoch,audio=this.audio;
+    let done=false,resolve!:(started:boolean)=>void,reject!:(error:Error)=>void;
+    const pending=new Promise<boolean>((yes,no)=>{resolve=yes;reject=no});
+    const current=()=>generation===this.generation && epoch===this.playEpoch && audio===this.audio;
+    const cleanup=()=>{done=true;clearTimeout(timer);if(audio.onplaying===started)audio.onplaying=null;this.cancelPlay=null;this.rejectPlay=null;if(this.pendingPlay===pending)this.pendingPlay=null};
+    const cancel=()=>{if(done)return;cleanup();resolve(false)};
+    const failed=(error:Error)=>{if(done)return;if(!current()){cancel();return}this.running=false;audio.pause();cleanup();reject(error)};
+    const started=()=>{if(done)return;if(!current()){cancel();return}this.running=true;this.started=true;cleanup();resolve(true)};
+    const timer=setTimeout(()=>{if(done)return;this.reloadBeforePlay=true;failed(new Error('Playback is taking too long to start. Press Play again to reload the same recording; no speech is requested.'))},this.startTimeoutMs);
     this.pendingPlay=pending;
-    void pending.finally(()=>{if(this.pendingPlay===pending)this.pendingPlay=null}).catch(()=>{});
+    this.cancelPlay=cancel;this.rejectPlay=failed;audio.onplaying=started;
+    const rejected=(error:unknown)=>{
+      if(done)return;
+      const blocked=error instanceof Error && error.name==='NotAllowedError';
+      if(current() && !blocked)this.reloadBeforePlay=true;
+      failed(new Error(`${blocked?'Your browser blocked playback.':'Playback could not start.'} Press Play again; the prepared audio is reused and no speech is requested.`));
+    };
+    // Stay synchronous with the user's click. Either the promise or a real
+    // playing event confirms startup; some embedded browsers only deliver one.
+    try{void audio.play().then(started,rejected)}catch(error){rejected(error)}
     return pending;
   }
-  pause(){this.playEpoch++;this.pendingPlay=null;this.audio.pause();this.running=false}
+  pause(){this.playEpoch++;this.cancelPlay?.();this.pendingPlay=null;this.audio.pause();this.running=false}
   setSpeed(speed:number){this.speed=Math.max(.5,Math.min(2,speed));this.audio.playbackRate=this.speed;if(this.next)this.next.playbackRate=this.speed}
   setVolume(volume:number){this.volume=Math.max(0,Math.min(1,volume));this.audio.volume=this.volume;if(this.next)this.next.volume=this.volume}
   rewind(){this.pause();this.finished=false;this.waiting=false;if(this.index===0)this.audio.currentTime=0;else{this.next?.removeAttribute('src');this.next?.load();this.next=null;this.activate(0)}}
   clear(){
-    this.generation++;this.pause();this.audio.onended=null;this.audio.onerror=null;this.audio.removeAttribute('src');this.audio.load();
+    this.generation++;this.pause();this.audio.onended=null;this.audio.onerror=null;this.audio.onplaying=null;this.audio.onloadedmetadata=null;this.audio.removeAttribute('src');this.audio.load();
     this.next?.removeAttribute('src');this.next?.load();this.next=null;
     for(const track of this.tracks)this.urls.revoke(track.url);
-    this.tracks=[];this.durations=[];this.index=0;this.finished=false;this.complete=true;this.waiting=false;this.started=false;
+    this.tracks=[];this.durations=[];this.index=0;this.finished=false;this.complete=true;this.waiting=false;this.started=false;this.reloadBeforePlay=false;
   }
   dispose(){this.clear()}
 }

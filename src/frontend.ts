@@ -417,11 +417,17 @@ export function setup(ctx: SpindleFrontendContext) {
     const attempt={};playAttempt=attempt;
     try {
       // Call play synchronously inside the click, before any asynchronous work.
-      const pending=audioPlayer.play();renderPlayer();
+      const pending=audioPlayer.play();notice('Starting playback…');renderPlayer();
       const started=await pending;
       if(token!==playbackId || !started)return;
       playing=true;phase='playing';notice(waitingForAudio?'Waiting for the rest of the audio…':preparingAudio?'Reading… The rest is still on its way.':'Reading…');updateClock();
       stopClock();clockTimer=setInterval(updateClock,100);
+    }catch(error){
+      if(token!==playbackId)return;
+      playing=false;paused=audioPlayer.hasStarted;phase=paused?'paused':'ready';stopClock();
+      // Keep the useful local error visible if preparation finishes later.
+      automaticPlaybackError=error instanceof Error?error.message:'Playback could not start. Press Play to use the prepared audio.';
+      notice(automaticPlaybackError,true);throw error;
     }finally{if(playAttempt===attempt){playAttempt=null;renderPlayer()}}
   }
   function browserSpeech(passage:SpeechPassage,token:number,passageIndex:number) {
@@ -441,7 +447,7 @@ export function setup(ctx: SpindleFrontendContext) {
   async function flushCompletion(){
     if(!initialized || disposed || !settings.enabled)return;
     const chatId=ctx.getActiveChat().chatId;if(!chatId)return;
-    const reply=completionInbox.take(chatId);if(reply)await autoPrepareMessage(reply.message);
+    const reply=completionInbox.take(chatId);if(reply)await autoPrepareMessage(reply.message,false,false,true);
   }
   async function receiveCompletion(reply:CompletedReply){
     if(disposed || reply.chatId!==ctx.getActiveChat().chatId || !completionInbox.receive(reply))return;
@@ -482,12 +488,12 @@ export function setup(ctx: SpindleFrontendContext) {
     try{return await nativeTts.speech(connection,snapshot,segment,undefined,AbortSignal.any([controller.signal,AbortSignal.timeout(300000),...(signal?[signal]:[])]))}
     finally{nativeRequests.delete(controller)}
   }
-  async function autoPrepareMessage(message:MessageInfo,force=false,restoreOnly=false) {
+  async function autoPrepareMessage(message:MessageInfo,force=false,restoreOnly=false,autoStart=false) {
     if(!initialized || !settings.enabled || disposed || message.isUser)return;
     const key=JSON.stringify([ctx.getActiveChat().chatId,message.id,message.content]);
     if(!force && (automaticPreparations.has(key) || currentMessage?.id===message.id && currentMessage.content===message.content))return;
     if(!restoreOnly){automaticPreparations.add(key);if(automaticPreparations.size>20)automaticPreparations.delete(automaticPreparations.values().next().value!)}
-    await startMessage(message,{automatic:true,restoreOnly});
+    await startMessage(message,{automatic:true,restoreOnly,autoStart});
   }
   async function prepareLatest(force=false,restoreOnly=false) {
     if(!settings.enabled || !initialized)return;
@@ -506,23 +512,21 @@ export function setup(ctx: SpindleFrontendContext) {
   }
   async function setAutomaticPlayback(enabled:boolean) {
     settings.automaticPlayback=enabled;
-    if(enabled){
-      if(currentMessage && (phase==='preparing' || phase==='ready'))automaticPlayback.arm();
-      if(settings.enabled && settings.provider!=='browser')audioPlayer.unlock();
-    }else automaticPlayback.cancel();
+    // The next completed reply may start automatically. This reading keeps
+    // waiting for Play, including when its preparation is still in flight.
+    automaticPlayback.cancel();
+    if(enabled && settings.enabled && settings.provider!=='browser')audioPlayer.unlock();
     renderOptions();renderPlayer();
-    // Enabling this option is an explicit playback choice, including for the
-    // currently loaded message. It never loads or synthesizes a message.
-    tryAutomaticPlayback();await saveSettings();
+    await saveSettings();
   }
-  async function startMessage(message: MessageInfo,options:{automatic?:boolean;restoreOnly?:boolean}={}) {
+  async function startMessage(message: MessageInfo,options:{automatic?:boolean;restoreOnly?:boolean;autoStart?:boolean}={}) {
     if(!settings.enabled)throw new Error('Readalong is off. Turn it on to prepare audio.');
     if(!options.restoreOnly){
       automaticPreparations.add(JSON.stringify([ctx.getActiveChat().chatId,message.id,message.content]));
       if(automaticPreparations.size>20)automaticPreparations.delete(automaticPreparations.values().next().value!);
     }
     stop(false);
-    automaticPlayback.arm(!options.restoreOnly);
+    automaticPlayback.arm(!!options.autoStart && settings.automaticPlayback && !options.restoreOnly);
     const token=playbackId;readingAbort=new AbortController();const signal=readingAbort.signal;
     currentMessage={...message,characterId:message.isUser?undefined:message.characterId ?? speakerCharacterId(message.name,characters,ctx.getActiveChat().characterId ?? undefined)};
     phase='preparing';preparingAudio=true;checkingSavedAudio=true;preparedCount=0;showWidget();notice('Looking for saved audio…');renderPlayer();
@@ -709,7 +713,7 @@ export function setup(ctx: SpindleFrontendContext) {
       el('p','Changing a voice, or how a name is said, only changes new audio.','ra-muted'),
       el('p','The highlighted sentence is a close guess of where the voice is.','ra-muted'));
     options.replaceChildren(sliders,
-      toggle('Play replies automatically',settings.automaticPlayback,v=>{void safe(()=>setAutomaticPlayback(v))},'Start when enough audio is ready. Pause waits for Resume. Reloading or switching chats does not start old audio.'),
+      toggle('Play replies automatically',settings.automaticPlayback,v=>{void safe(()=>setAutomaticPlayback(v))},'Start with the next new reply when enough audio is ready. Current and manually prepared messages wait for Play. Pause waits for Resume.'),
       toggle('Scroll the chat to follow the voice',settings.follow,v=>{settings.follow=v;void safe(saveSettings)}),
       toggle('Allow playback before the whole message is ready',settings.earlyPlayback,v=>{settings.earlyPlayback=v;void safe(saveSettings)},'Manual and automatic playback can start with about three quarters of the text and at least 30 seconds of opening audio. Turn off to wait for the whole message.'),
       about.details);

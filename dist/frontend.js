@@ -590,6 +590,7 @@ function joinPrepared(clips) {
 class PreparedPlayer {
   factory;
   urls;
+  startTimeoutMs;
   audio;
   next = null;
   tracks = [];
@@ -606,12 +607,16 @@ class PreparedPlayer {
   started = false;
   playEpoch = 0;
   pendingPlay = null;
+  cancelPlay = null;
+  rejectPlay = null;
+  reloadBeforePlay = false;
   onEnded = () => {};
   onError = () => {};
   onWaiting = () => {};
-  constructor(factory = () => new Audio, urls = { create: URL.createObjectURL.bind(URL), revoke: URL.revokeObjectURL.bind(URL) }) {
+  constructor(factory = () => new Audio, urls = { create: URL.createObjectURL.bind(URL), revoke: URL.revokeObjectURL.bind(URL) }, startTimeoutMs = 1e4) {
     this.factory = factory;
     this.urls = urls;
+    this.startTimeoutMs = startTimeoutMs;
     this.audio = factory();
   }
   unlock() {
@@ -689,7 +694,14 @@ class PreparedPlayer {
     this.audio.onerror = () => {
       if (generation === this.generation && audio === this.audio) {
         this.running = false;
-        this.onError(new Error("The prepared audio file could not be played."));
+        this.reloadBeforePlay = true;
+        audio.pause();
+        const detail = audio.error?.code === 3 ? "This browser could not decode the prepared audio." : audio.error?.code === 4 ? "This browser could not load the prepared audio format." : "The prepared audio file could not be played.";
+        const error = new Error(`${detail} Press Play again to reload the same recording; no speech is requested.`);
+        if (this.rejectPlay)
+          this.rejectPlay(error);
+        else
+          this.onError(error);
       }
     };
     this.preloadNext();
@@ -705,6 +717,8 @@ class PreparedPlayer {
     const generation = this.generation, old = this.audio;
     old.onended = null;
     old.onerror = null;
+    old.onplaying = null;
+    old.onloadedmetadata = null;
     old.removeAttribute("src");
     old.load();
     this.audio = this.next ?? this.factory();
@@ -748,31 +762,106 @@ class PreparedPlayer {
       this.running = true;
       return Promise.resolve(true);
     }
-    const generation = this.generation, epoch = ++this.playEpoch;
-    const pending = (async () => {
-      try {
-        await this.audio.play();
-      } catch (error) {
-        if (generation !== this.generation || epoch !== this.playEpoch)
-          return false;
-        const blocked = error instanceof Error && error.name === "NotAllowedError";
-        throw new Error(`${blocked ? "Your browser blocked playback." : "Playback could not start."} Press Play again; the prepared audio is reused and no speech is requested.`);
+    if (this.reloadBeforePlay) {
+      const old = this.audio, time = Number.isFinite(old.currentTime) ? old.currentTime : 0, generation = this.generation;
+      old.pause();
+      old.onended = null;
+      old.onerror = null;
+      old.onplaying = null;
+      old.onloadedmetadata = null;
+      old.removeAttribute("src");
+      old.load();
+      this.audio = this.factory();
+      this.reloadBeforePlay = false;
+      this.activate(this.index);
+      const audio = this.audio, seek = () => {
+        if (generation !== this.generation || audio !== this.audio)
+          return;
+        try {
+          audio.currentTime = time;
+          audio.onloadedmetadata = null;
+        } catch {}
+      };
+      if (time) {
+        audio.onloadedmetadata = seek;
+        seek();
       }
-      if (generation !== this.generation || epoch !== this.playEpoch)
-        return false;
-      this.running = true;
-      this.started = true;
-      return true;
-    })();
-    this.pendingPlay = pending;
-    pending.finally(() => {
+    }
+    const generation = this.generation, epoch = ++this.playEpoch, audio = this.audio;
+    let done = false, resolve, reject;
+    const pending = new Promise((yes, no) => {
+      resolve = yes;
+      reject = no;
+    });
+    const current = () => generation === this.generation && epoch === this.playEpoch && audio === this.audio;
+    const cleanup = () => {
+      done = true;
+      clearTimeout(timer);
+      if (audio.onplaying === started)
+        audio.onplaying = null;
+      this.cancelPlay = null;
+      this.rejectPlay = null;
       if (this.pendingPlay === pending)
         this.pendingPlay = null;
-    }).catch(() => {});
+    };
+    const cancel = () => {
+      if (done)
+        return;
+      cleanup();
+      resolve(false);
+    };
+    const failed = (error) => {
+      if (done)
+        return;
+      if (!current()) {
+        cancel();
+        return;
+      }
+      this.running = false;
+      audio.pause();
+      cleanup();
+      reject(error);
+    };
+    const started = () => {
+      if (done)
+        return;
+      if (!current()) {
+        cancel();
+        return;
+      }
+      this.running = true;
+      this.started = true;
+      cleanup();
+      resolve(true);
+    };
+    const timer = setTimeout(() => {
+      if (done)
+        return;
+      this.reloadBeforePlay = true;
+      failed(new Error("Playback is taking too long to start. Press Play again to reload the same recording; no speech is requested."));
+    }, this.startTimeoutMs);
+    this.pendingPlay = pending;
+    this.cancelPlay = cancel;
+    this.rejectPlay = failed;
+    audio.onplaying = started;
+    const rejected = (error) => {
+      if (done)
+        return;
+      const blocked = error instanceof Error && error.name === "NotAllowedError";
+      if (current() && !blocked)
+        this.reloadBeforePlay = true;
+      failed(new Error(`${blocked ? "Your browser blocked playback." : "Playback could not start."} Press Play again; the prepared audio is reused and no speech is requested.`));
+    };
+    try {
+      audio.play().then(started, rejected);
+    } catch (error) {
+      rejected(error);
+    }
     return pending;
   }
   pause() {
     this.playEpoch++;
+    this.cancelPlay?.();
     this.pendingPlay = null;
     this.audio.pause();
     this.running = false;
@@ -807,6 +896,8 @@ class PreparedPlayer {
     this.pause();
     this.audio.onended = null;
     this.audio.onerror = null;
+    this.audio.onplaying = null;
+    this.audio.onloadedmetadata = null;
     this.audio.removeAttribute("src");
     this.audio.load();
     this.next?.removeAttribute("src");
@@ -821,6 +912,7 @@ class PreparedPlayer {
     this.complete = true;
     this.waiting = false;
     this.started = false;
+    this.reloadBeforePlay = false;
   }
   dispose() {
     this.clear();
@@ -2086,6 +2178,7 @@ function setup(ctx) {
     playAttempt = attempt;
     try {
       const pending = audioPlayer.play();
+      notice("Starting playback…");
       renderPlayer();
       const started = await pending;
       if (token !== playbackId || !started)
@@ -2096,6 +2189,16 @@ function setup(ctx) {
       updateClock();
       stopClock();
       clockTimer = setInterval(updateClock, 100);
+    } catch (error) {
+      if (token !== playbackId)
+        return;
+      playing = false;
+      paused = audioPlayer.hasStarted;
+      phase = paused ? "paused" : "ready";
+      stopClock();
+      automaticPlaybackError = error instanceof Error ? error.message : "Playback could not start. Press Play to use the prepared audio.";
+      notice(automaticPlaybackError, true);
+      throw error;
     } finally {
       if (playAttempt === attempt) {
         playAttempt = null;
@@ -2158,7 +2261,7 @@ function setup(ctx) {
       return;
     const reply = completionInbox.take(chatId);
     if (reply)
-      await autoPrepareMessage(reply.message);
+      await autoPrepareMessage(reply.message, false, false, true);
   }
   async function receiveCompletion(reply) {
     if (disposed || reply.chatId !== ctx.getActiveChat().chatId || !completionInbox.receive(reply))
@@ -2227,7 +2330,7 @@ function setup(ctx) {
       nativeRequests.delete(controller);
     }
   }
-  async function autoPrepareMessage(message, force = false, restoreOnly = false) {
+  async function autoPrepareMessage(message, force = false, restoreOnly = false, autoStart = false) {
     if (!initialized || !settings.enabled || disposed || message.isUser)
       return;
     const key = JSON.stringify([ctx.getActiveChat().chatId, message.id, message.content]);
@@ -2238,7 +2341,7 @@ function setup(ctx) {
       if (automaticPreparations.size > 20)
         automaticPreparations.delete(automaticPreparations.values().next().value);
     }
-    await startMessage(message, { automatic: true, restoreOnly });
+    await startMessage(message, { automatic: true, restoreOnly, autoStart });
   }
   async function prepareLatest(force = false, restoreOnly = false) {
     if (!settings.enabled || !initialized)
@@ -2272,16 +2375,11 @@ function setup(ctx) {
   }
   async function setAutomaticPlayback(enabled) {
     settings.automaticPlayback = enabled;
-    if (enabled) {
-      if (currentMessage && (phase === "preparing" || phase === "ready"))
-        automaticPlayback.arm();
-      if (settings.enabled && settings.provider !== "browser")
-        audioPlayer.unlock();
-    } else
-      automaticPlayback.cancel();
+    automaticPlayback.cancel();
+    if (enabled && settings.enabled && settings.provider !== "browser")
+      audioPlayer.unlock();
     renderOptions();
     renderPlayer();
-    tryAutomaticPlayback();
     await saveSettings();
   }
   async function startMessage(message, options = {}) {
@@ -2293,7 +2391,7 @@ function setup(ctx) {
         automaticPreparations.delete(automaticPreparations.values().next().value);
     }
     stop(false);
-    automaticPlayback.arm(!options.restoreOnly);
+    automaticPlayback.arm(!!options.autoStart && settings.automaticPlayback && !options.restoreOnly);
     const token = playbackId;
     readingAbort = new AbortController;
     const signal = readingAbort.signal;
@@ -2694,7 +2792,7 @@ function setup(ctx) {
     about.body.append(el("p", "While Readalong is on, each new reply gets audio as soon as it is written. Automatic playback can start it for you; otherwise press Play.", "ra-muted"), el("p", "Audio is saved on this device. Reloading or switching chats brings it back for free. If nothing is saved, press Prepare message to make it.", "ra-muted"), el("p", "Changing a voice, or how a name is said, only changes new audio.", "ra-muted"), el("p", "The highlighted sentence is a close guess of where the voice is.", "ra-muted"));
     options.replaceChildren(sliders, toggle("Play replies automatically", settings.automaticPlayback, (v) => {
       safe(() => setAutomaticPlayback(v));
-    }, "Start when enough audio is ready. Pause waits for Resume. Reloading or switching chats does not start old audio."), toggle("Scroll the chat to follow the voice", settings.follow, (v) => {
+    }, "Start with the next new reply when enough audio is ready. Current and manually prepared messages wait for Play. Pause waits for Resume."), toggle("Scroll the chat to follow the voice", settings.follow, (v) => {
       settings.follow = v;
       safe(saveSettings);
     }), toggle("Allow playback before the whole message is ready", settings.earlyPlayback, (v) => {

@@ -2,10 +2,10 @@ import { test,expect } from 'bun:test';
 import { waveHeader,readWave,pcmBlobToWav,prepareClip,joinPrepared,PreparedPlayer } from '../src/prepared-audio';
 const wav=(seconds:number,rate=8000)=>new Blob([waveHeader(seconds*rate*2,rate),new Uint8Array(seconds*rate*2)],{type:'audio/wav'});
 const clip=async(seconds:number,rate=8000)=>prepareClip({blob:wav(seconds,rate),mime:'audio/wav'},undefined,()=>{throw new Error('PCM must not create a decoder')});
-function fixture(){
+function fixture(startTimeoutMs=10000){
   const audios:any[]=[],created:Blob[]=[],revoked:string[]=[];
   const factory=()=>{let src='';const a:any={currentTime:0,paused:true,volume:1,playbackRate:1,preload:'',onended:null,onerror:null,playCalls:0,loadCalls:0,async play(){a.paused=false;a.playCalls++},pause(){a.paused=true},removeAttribute(name:string){if(name==='src')src=''},load(){a.loadCalls++},get src(){return src},set src(v:string){src=v;a.currentTime=0}};audios.push(a);return a as HTMLAudioElement};
-  const player=new PreparedPlayer(factory,{create:b=>{created.push(b);return `blob:test-${created.length}`},revoke:url=>revoked.push(url)});
+  const player=new PreparedPlayer(factory,{create:b=>{created.push(b);return `blob:test-${created.length}`},revoke:url=>revoked.push(url)},startTimeoutMs);
   return {player,audios,created,revoked};
 }
 test('PCM preparation reads headers without invoking an audio decoder',async()=>{
@@ -58,6 +58,31 @@ test('Pause cancels a pending Play attempt before it can report a started sessio
   const {player,audios}=fixture();player.load([await clip(10)]);let resolve!:()=>void;
   audios[0].play=()=>new Promise<void>(r=>resolve=r);const pending=player.play();player.pause();resolve();
   expect(await pending).toBe(false);expect(audios[0].paused).toBe(true);expect(player.hasStarted).toBe(false);
+});
+test('a media start that never settles times out and can retry the same file locally',async()=>{
+  const {player,audios,created,revoked}=fixture(15);player.load([await clip(10)]);const source=audios[0].src;
+  audios[0].play=()=>new Promise<void>(()=>{});
+  await expect(player.play()).rejects.toThrow('taking too long');
+  expect(audios[0].paused).toBe(true);expect(player.hasStarted).toBe(false);
+  expect(await player.play()).toBe(true);expect(audios).toHaveLength(2);
+  expect(audios[1].src).toBe(source);expect(created).toHaveLength(1);expect(revoked).toHaveLength(0);
+  player.clear();
+});
+test('a real playing event unlocks controls even if the start promise remains pending',async()=>{
+  const {player,audios}=fixture(15);player.load([await clip(10)]);
+  audios[0].play=()=>new Promise<void>(()=>{});const pending=player.play();audios[0].paused=false;audios[0].onplaying();
+  expect(await pending).toBe(true);expect(player.hasStarted).toBe(true);player.pause();expect(audios[0].paused).toBe(true);
+});
+test('a media error releases a pending start and retains the recording and resume position',async()=>{
+  const {player,audios,created}=fixture();player.load([await clip(10)]);await player.play();audios[0].currentTime=4;player.pause();
+  audios[0].play=()=>new Promise<void>(()=>{});const pending=player.play();audios[0].onerror();
+  await expect(pending).rejects.toThrow('prepared audio');expect(await player.play()).toBe(true);
+  expect(player.elapsed).toBe(4);expect(created).toHaveLength(1);expect(audios).toHaveLength(2);player.clear();
+});
+test('Stop settles a never-ending start immediately rather than leaving stale controls busy',async()=>{
+  const {player,audios}=fixture();player.load([await clip(10)]);audios[0].play=()=>new Promise<void>(()=>{});
+  const pending=player.play();player.clear();
+  expect(await Promise.race([pending,new Promise(resolve=>setTimeout(()=>resolve('still pending'),30))])).toBe(false);
 });
 test('early playback appends one joined remaining buffer and preserves clock, pause and replay',async()=>{
   const {player,audios,created}=fixture();const clips=[await clip(20),await clip(20),await clip(10),await clip(10)];
