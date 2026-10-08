@@ -84,6 +84,30 @@ test('Stop settles a never-ending start immediately rather than leaving stale co
   const pending=player.play();player.clear();
   expect(await Promise.race([pending,new Promise(resolve=>setTimeout(()=>resolve('still pending'),30))])).toBe(false);
 });
+test('WebKit element permissions survive the handoff from opening audio to the rest',async()=>{
+  const {player,audios}=fixture();let ended=0;const errors:string[]=[];
+  player.onEnded=()=>ended++;player.onError=e=>errors.push(e.message);
+  player.begin([await clip(30)]);await player.play();const permitted=audios[0];
+  player.append([await clip(30)]);
+  // A user click permitted the opening element, not a fresh/preloaded one.
+  for(const audio of audios.slice(1))audio.play=async()=>{throw new DOMException('This element needs its own gesture','NotAllowedError')};
+  permitted.currentTime=30;permitted.onended();await Promise.resolve();await Promise.resolve();
+  expect(errors).toEqual([]);expect(permitted.playCalls).toBe(2);expect(player.elapsed).toBe(30);
+  permitted.currentTime=30;permitted.onended();expect(ended).toBe(1);expect(player.elapsed).toBe(60);player.clear();
+});
+test('arming automatic playback with a ready recording primes a reserve without touching it',async()=>{
+  const {player,audios,created}=fixture();player.load([await clip(10)]);const source=audios[0].src;audios[0].currentTime=4;
+  player.unlock();await Promise.resolve();await Promise.resolve();
+  expect(audios[0].src).toBe(source);expect(audios[0].currentTime).toBe(4);expect(audios[0].playCalls).toBe(0);expect(audios[0].paused).toBe(true);
+  expect(audios).toHaveLength(2);expect(audios[1].playCalls).toBe(1);
+  player.load([await clip(20)]);await player.play();expect(audios[1].playCalls).toBe(2);expect(audios[0].playCalls).toBe(0);expect(created).toHaveLength(3);player.dispose();
+});
+test('a rejected silent prime can be tried on a later gesture without claiming permission',async()=>{
+  const {player,audios}=fixture();audios[0].play=async()=>{throw new DOMException('Not a gesture','NotAllowedError')};
+  player.unlock();await Promise.resolve();await Promise.resolve();
+  audios[0].play=async()=>{audios[0].paused=false;audios[0].playCalls++};
+  player.unlock();await Promise.resolve();await Promise.resolve();expect(audios[0].playCalls).toBe(1);player.dispose();
+});
 test('early playback appends one joined remaining buffer and preserves clock, pause and replay',async()=>{
   const {player,audios,created}=fixture();const clips=[await clip(20),await clip(20),await clip(10),await clip(10)];
   player.begin(clips.slice(0,2));await player.play();audios[0].currentTime=15;player.pause();
@@ -91,7 +115,7 @@ test('early playback appends one joined remaining buffer and preserves clock, pa
   expect(created).toHaveLength(2);expect(audios).toHaveLength(2);
   await player.play();audios[0].currentTime=40;audios[0].onended();await Promise.resolve();
   expect(player.position).toMatchObject({index:2,elapsed:40,duration:60});
-  audios[1].currentTime=20;audios[1].onended();expect(player.elapsed).toBe(60);
+  audios[0].currentTime=20;audios[0].onended();expect(player.elapsed).toBe(60);
   await player.play();expect(player.elapsed).toBe(0);expect(created).toHaveLength(2);player.clear();
 });
 test('catching up to preparation waits without replaying or declaring the story finished',async()=>{
@@ -100,13 +124,13 @@ test('catching up to preparation waits without replaying or declaring the story 
   player.begin([await clip(30)]);await player.play();audios[0].currentTime=30;audios[0].onended();
   expect(ended).toBe(0);expect(waiting).toEqual([true]);
   player.append([await clip(10)]);await Promise.resolve();expect(waiting).toEqual([true,false]);
-  expect(player.elapsed).toBe(30);expect(audios[1].playCalls).toBe(1);
-  audios[1].currentTime=10;audios[1].onended();expect(ended).toBe(1);expect(player.elapsed).toBe(40);
+  expect(player.elapsed).toBe(30);expect(audios[0].playCalls).toBe(2);
+  audios[0].currentTime=10;audios[0].onended();expect(ended).toBe(1);expect(player.elapsed).toBe(40);
 });
 test('pausing while waiting prevents remaining audio from starting until Resume',async()=>{
   const {player,audios}=fixture();player.begin([await clip(30)]);await player.play();audios[0].currentTime=30;audios[0].onended();player.pause();
   player.append([await clip(10)]);expect(audios[1]?.playCalls??0).toBe(0);
-  await player.play();expect(player.elapsed).toBe(30);expect(audios[1].playCalls).toBe(1);
+  await player.play();expect(player.elapsed).toBe(30);expect(audios[0].playCalls).toBe(2);
 });
 test('Stop during early playback discards the buffer and never advances a stale end event',async()=>{
   const {player,audios,revoked}=fixture();player.begin([await clip(30)]);await player.play();const stale=audios[0].onended;
@@ -122,12 +146,12 @@ test('a stale opening-buffer ended callback cannot prematurely finish the remain
   const {player,audios}=fixture();let ended=0;player.onEnded=()=>ended++;
   player.begin([await clip(30)]);player.append([await clip(10)]);await player.play();const firstEnded=audios[0].onended;
   firstEnded();await Promise.resolve();firstEnded();expect(ended).toBe(0);
-  audios[1].onended();expect(ended).toBe(1);
+  audios[0].onended();expect(ended).toBe(1);
 });
-test('mixed audio files preload the next voice and do not reload it at the boundary',async()=>{
+test('mixed audio files preload the next voice but play through the permitted element',async()=>{
   const {player,audios}=fixture();player.load([await clip(10,8000),await clip(20,16000)]);expect(audios).toHaveLength(2);
   const next=audios[1];await player.play();audios[0].onended();await Promise.resolve();
-  expect(next.playCalls).toBe(1);expect(next.loadCalls).toBe(0);expect(player.position.index).toBe(1);player.clear();
+  expect(next.playCalls).toBe(0);expect(next.loadCalls).toBe(1);expect(audios[0].playCalls).toBe(2);expect(player.position.index).toBe(1);player.clear();
 });
 test('canceled and malformed PCM preparations cannot become playable',async()=>{
   const aborted=new AbortController();aborted.abort();await expect(prepareClip({blob:wav(1),mime:'audio/wav'},aborted.signal)).rejects.toThrow();

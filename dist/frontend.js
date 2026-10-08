@@ -602,6 +602,9 @@ class PreparedPlayer {
   speed = 1;
   volume = 0.85;
   primed = false;
+  reserve = null;
+  reservePrimed = false;
+  priming = null;
   complete = true;
   waiting = false;
   started = false;
@@ -620,19 +623,52 @@ class PreparedPlayer {
     this.audio = factory();
   }
   unlock() {
-    if (this.primed || this.tracks.length)
+    if (this.primed || this.reservePrimed || this.priming || this.running || this.pendingPlay)
       return;
-    this.primed = true;
-    const silent = new Blob([waveHeader(2), new Uint8Array(2)], { type: "audio/wav" }), url = this.urls.create(silent), audio = this.audio;
-    audio.src = url;
-    const generation = this.generation;
-    audio.play().then(() => {
-      if (generation === this.generation && !this.tracks.length)
+    const audio = this.reserve ?? (this.tracks.length ? this.reserve = this.factory() : this.audio);
+    const size = 4800, silent = new Blob([waveHeader(size), new Uint8Array(size)], { type: "audio/wav" }), url = this.urls.create(silent);
+    let done = false;
+    const finish = (success) => {
+      if (done)
+        return;
+      done = true;
+      clearTimeout(timer);
+      if (audio.onplaying === started)
+        audio.onplaying = null;
+      if (this.priming?.audio === audio)
+        this.priming = null;
+      if (success) {
+        if (audio === this.audio)
+          this.primed = true;
+        else if (audio === this.reserve)
+          this.reservePrimed = true;
+      }
+      if (audio.src === url) {
         audio.pause();
-    }).catch(() => {}).finally(() => this.urls.revoke(url));
+        audio.removeAttribute("src");
+        audio.load();
+      }
+      this.urls.revoke(url);
+    };
+    const started = () => finish(true), timer = setTimeout(() => finish(false), 2000);
+    this.priming = { audio, cancel: () => finish(false) };
+    audio.onplaying = started;
+    audio.src = url;
+    try {
+      audio.play().then(started, () => finish(false));
+    } catch {
+      finish(false);
+    }
   }
   load(clips) {
     this.clear();
+    if (this.reserve) {
+      this.audio = this.reserve;
+      this.primed = this.reservePrimed;
+      this.reserve = null;
+      this.reservePrimed = false;
+    }
+    this.priming?.cancel();
     this.durations = clips.map((c) => c.duration);
     this.tracks = joinPrepared(clips).map((c) => ({ url: this.urls.create(c.blob), duration: c.duration }));
     if (this.tracks.length)
@@ -714,15 +750,14 @@ class PreparedPlayer {
     }
   }
   advance() {
-    const generation = this.generation, old = this.audio;
-    old.onended = null;
-    old.onerror = null;
-    old.onplaying = null;
-    old.onloadedmetadata = null;
-    old.removeAttribute("src");
-    old.load();
-    this.audio = this.next ?? this.factory();
+    const generation = this.generation;
+    this.next?.removeAttribute("src");
+    this.next?.load();
     this.next = null;
+    this.audio.onended = null;
+    this.audio.onerror = null;
+    this.audio.onplaying = null;
+    this.audio.onloadedmetadata = null;
     this.activate(this.index + 1);
     this.play().catch(() => {
       if (generation === this.generation) {
@@ -772,6 +807,7 @@ class PreparedPlayer {
       old.removeAttribute("src");
       old.load();
       this.audio = this.factory();
+      this.primed = false;
       this.reloadBeforePlay = false;
       this.activate(this.index);
       const audio = this.audio, seek = () => {
@@ -831,6 +867,7 @@ class PreparedPlayer {
       }
       this.running = true;
       this.started = true;
+      this.primed = true;
       cleanup();
       resolve(true);
     };
@@ -892,6 +929,8 @@ class PreparedPlayer {
     }
   }
   clear() {
+    if (this.priming?.audio === this.audio)
+      this.priming.cancel();
     this.generation++;
     this.pause();
     this.audio.onended = null;
@@ -916,6 +955,12 @@ class PreparedPlayer {
   }
   dispose() {
     this.clear();
+    this.priming?.cancel();
+    this.reserve?.pause();
+    this.reserve?.removeAttribute("src");
+    this.reserve?.load();
+    this.reserve = null;
+    this.reservePrimed = false;
   }
 }
 
@@ -1165,27 +1210,27 @@ function planSpeech(segments, settings, context) {
   return passages;
 }
 async function prepareAll(items, prepare, signal, progress, concurrency = 3) {
-  const abort = new AbortController, combined = AbortSignal.any([signal, abort.signal]);
   const results = new Array(items.length);
-  let next = 0, completed = 0, firstError;
+  let next = 0, completed = 0, failed = false, firstError;
   const worker = async () => {
     try {
-      while (next < items.length) {
-        combined.throwIfAborted();
+      while (next < items.length && !failed) {
+        signal.throwIfAborted();
         const index = next++;
-        results[index] = await prepare(items[index], index, combined);
-        combined.throwIfAborted();
+        results[index] = await prepare(items[index], index, signal);
+        signal.throwIfAborted();
         progress(++completed);
       }
     } catch (error) {
-      if (firstError === undefined)
+      if (!failed) {
+        failed = true;
         firstError = error;
-      abort.abort();
+      }
       throw error;
     }
   };
   await Promise.allSettled(Array.from({ length: Math.min(Math.max(1, concurrency), items.length) }, worker));
-  if (firstError !== undefined)
+  if (failed)
     throw firstError;
   signal.throwIfAborted();
   return results;
@@ -1207,8 +1252,14 @@ async function preparationHash(value) {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(value)));
   return Array.from(new Uint8Array(digest), (n) => n.toString(16).padStart(2, "0")).join("");
 }
+function validClip(c) {
+  return c?.blob instanceof Blob && c.blob.size > 0 && Number.isFinite(c.duration) && c.duration > 0;
+}
 function validClips(value) {
-  return Array.isArray(value) && value.length > 0 && value.every((c) => c?.blob instanceof Blob && c.blob.size > 0 && Number.isFinite(c.duration) && c.duration > 0);
+  return Array.isArray(value) && value.length > 0 && Array.from(value).every(validClip);
+}
+function validPartial(value) {
+  return Array.isArray(value) && value.length > 0 && value.some(validClip) && Array.from(value).every((c) => c === undefined || validClip(c));
 }
 
 class AudioCache {
@@ -1258,6 +1309,14 @@ class AudioCache {
     });
   }
   async get(userId, key) {
+    const clips = await this.read(userId, key);
+    return validClips(clips) ? clips : undefined;
+  }
+  async getPartial(userId, key, count) {
+    const clips = await this.read(userId, key);
+    return validPartial(clips) && clips.length === count ? clips : undefined;
+  }
+  async read(userId, key) {
     if (!userId)
       return;
     const db = await this.open();
@@ -1266,7 +1325,7 @@ class AudioCache {
         const request = db.transaction("audio", "readonly").objectStore("audio").get(`${userId}:${key}`);
         request.onsuccess = () => {
           const record = request.result;
-          resolve(record?.userId === userId && validClips(record.clips) ? record.clips : undefined);
+          resolve(record?.userId === userId && validPartial(record.clips) ? record.clips : undefined);
         };
         request.onerror = () => reject(request.error ?? new Error("Could not read saved audio."));
       });
@@ -1277,22 +1336,32 @@ class AudioCache {
   async put(userId, key, clips) {
     if (!userId || !validClips(clips))
       return false;
-    const bytes = clips.reduce((n, c) => n + c.blob.size, 0);
-    if (bytes > this.maxBytes)
+    return this.putPartial(userId, key, clips);
+  }
+  async putPartial(userId, key, clips) {
+    if (!userId || !validPartial(clips) || clips.reduce((n, c) => n + (c?.blob.size ?? 0), 0) > this.maxBytes)
       return false;
+    const snapshot = Array.from(clips);
     const db = await this.open();
     try {
       return await new Promise((resolve, reject) => {
         const tx = db.transaction("audio", "readwrite"), store = tx.objectStore("audio");
-        tx.oncomplete = () => resolve(true);
+        let written = false;
+        tx.oncomplete = () => resolve(written);
         tx.onabort = () => reject(tx.error ?? new Error("Could not save audio."));
         const request = store.index("user").getAll(userId);
         request.onsuccess = () => {
           const rows = request.result;
-          const record = { id: `${userId}:${key}`, userId, clips, bytes, at: Math.max(Date.now(), ...rows.map((r) => r.at + 1)) };
+          const id = `${userId}:${key}`, prior = rows.find((r) => r.id === id);
+          const merged = snapshot.map((clip, i) => clip ?? (prior?.clips.length === snapshot.length && validPartial(prior.clips) ? prior.clips[i] : undefined));
+          const bytes = merged.reduce((n, c) => n + (c?.blob.size ?? 0), 0);
+          if (bytes > this.maxBytes)
+            return;
+          const record = { id, userId, clips: merged, bytes, at: Math.max(Date.now(), ...rows.map((r) => r.at + 1)) };
           const older = rows.filter((r) => r.id !== record.id).sort((a, b) => b.at - a.at);
           let total = bytes, count = 1;
           store.put(record);
+          written = true;
           for (const row of older) {
             if (count >= this.maxEntries || total + row.bytes > this.maxBytes)
               store.delete(row.id);
@@ -1668,6 +1737,8 @@ function setup(ctx) {
   let phase = "idle";
   let checkingSavedAudio = false;
   let preparingAudio = false, waitingForAudio = false;
+  let incompleteAudio = false, retryPreparation = null;
+  let retainedParts = null;
   let playAttempt = null, messageLoad = null;
   const automaticPlayback = new AutomaticPlayback;
   let automaticPlaybackError = "";
@@ -1692,6 +1763,14 @@ function setup(ctx) {
   let playbackSettler = null;
   const pending = new Map;
   const cleanups = [], bubbleHandles = new Map;
+  const primeAutomaticAudio = () => {
+    if (!disposed && settings.enabled && settings.automaticPlayback && settings.provider !== "browser")
+      audioPlayer.unlock();
+  };
+  for (const event of ["pointerdown", "keydown", "touchstart", "click"]) {
+    document.addEventListener(event, primeAutomaticAudio, { capture: true, passive: true });
+    cleanups.push(() => document.removeEventListener(event, primeAutomaticAudio, true));
+  }
   let editorTab = null;
   const tab = ctx.ui.registerDrawerTab({ id: "readalong", title: "Readalong", shortName: "Read", description: "Listen to passages, assign character voices, and follow the spoken text", keywords: ["tts", "voice", "speech", "audio"], iconSvg: TAB_ICON });
   const root = tab.root;
@@ -1835,6 +1914,8 @@ function setup(ctx) {
     checkingSavedAudio = false;
     preparingAudio = false;
     waitingForAudio = false;
+    incompleteAudio = false;
+    retryPreparation = null;
     playAttempt = null;
     messageLoad = null;
     stopClock();
@@ -1977,7 +2058,7 @@ function setup(ctx) {
     widget.root.classList.toggle("ra-narrow", widgetDimensions2().narrow);
     const { label: playLabel } = playState(), speaking = phase === "playing" || phase === "paused", hasTime = !!audioPlayer.duration;
     const play = playButton(() => safe(settings.enabled ? playOrPause : () => setEnabled(true)));
-    play.disabled = !ready || !!playAttempt || !!messageLoad || settings.enabled && (phase === "preparing" || phase === "idle" && !selectedId);
+    play.disabled = !ready || !!playAttempt || !!messageLoad || settings.enabled && (phase === "preparing" || phase === "idle" && !selectedId || incompleteAudio && !audioPlayer.duration);
     const close = iconButton("close", "Hide floating player", () => widget?.setVisible(false));
     const resize = iconButton(settings.widgetMinimized ? "expand" : "minimize", settings.widgetMinimized ? "Expand floating player" : "Minimize floating player", () => safe(() => setWidgetMinimized(!settings.widgetMinimized)));
     resize.dataset.raControl = "resize";
@@ -2013,8 +2094,13 @@ function setup(ctx) {
       seek.append(progress, el("span", hasTime ? clock : "", "ra-time"));
       const foot = el("div", "", "ra-row ra-widget-foot"), stopButton = withIcon(button("Stop", () => stop()), "stop");
       stopButton.disabled = phase === "idle";
-      const fix = button("Fix a name", () => fixAName());
-      fix.title = "Change how a name is said";
+      const retry = !!retryPreparation && (incompleteAudio || preparingAudio && preparedCount > 0);
+      const fix = retry ? button("Retry missing audio", () => safe(async () => {
+        await retryPreparation?.();
+      })) : button("Fix a name", () => fixAName());
+      fix.title = retry ? "Requests only missing parts; your speech service may charge." : "Change how a name is said";
+      if (retry)
+        fix.disabled = preparingAudio;
       const open = iconButton("tune", "Open Readalong", () => tab.activate());
       power.classList.add("ra-push");
       foot.append(stopButton, fix, power, open);
@@ -2069,7 +2155,14 @@ function setup(ctx) {
   };
   audioPlayer.onWaiting = (waiting) => {
     waitingForAudio = waiting;
-    if (phase === "playing")
+    if (waiting && incompleteAudio) {
+      audioPlayer.pause();
+      paused = true;
+      playing = false;
+      phase = "paused";
+      stopClock();
+      notice("Reached the missing audio. Retry missing audio to continue; your speech service may charge.", true);
+    } else if (phase === "playing")
       notice(waiting ? "Waiting for the rest of the audio…" : "Reading…");
     renderPlayer();
   };
@@ -2440,86 +2533,168 @@ function setup(ctx) {
           return p.settings.provider === "lumiverse" && connection ? nativeSpeechRequest(connection, p.settings, p.segment) : [p.settings.provider, p.settings.localUrl, speechRequest(p.settings, p.segment)];
         });
         const audioKey = await preparationHash([messageKey, requests]);
-        let clips = undefined;
-        try {
-          clips = await audioCache.get(cacheUserId, audioKey);
-        } catch {}
+        let partial;
+        if (retainedParts?.userId === cacheUserId && retainedParts.key === audioKey) {
+          partial = Array.from(retainedParts.clips);
+          saved = retainedParts.saved;
+        } else
+          try {
+            partial = await audioCache.getPartial(cacheUserId, audioKey, currentPassages.length);
+          } catch {}
         if (token !== playbackId)
           return;
-        if (clips?.length !== currentPassages.length)
-          clips = undefined;
-        if (clips) {
-          restored = true;
-          preparedCount = currentPassages.length;
-        } else {
-          if (options.restoreOnly) {
-            stop(false);
-            notice("No saved audio for this message. Press Prepare message to make it. This may cost money.");
-            return;
-          }
-          const claim = await rpc("claim_preparation", { key: messageKey, manual: !options.automatic });
-          if (token !== playbackId)
-            return;
-          if (!claim?.allowed) {
-            stop(false);
-            notice("Audio for this message was already tried once. Press Prepare message to try again. This may cost money.");
-            return;
-          }
-          checkingSavedAudio = false;
-          notice("Preparing the whole message…");
-          renderPlayer();
-          const partial = new Array(currentPassages.length), texts = currentPassages.map((p) => plainText(p.segment.text));
-          clips = await prepareAll(currentPassages, async (p, _index, requestSignal) => {
-            const data = await prepareSpeech(p.segment, p.settings, requestSignal);
-            requestSignal.throwIfAborted();
-            const clip = await prepareClip(data, requestSignal);
-            requestSignal.throwIfAborted();
-            partial[_index] = clip;
-            return clip;
-          }, signal, (count) => {
-            if (token !== playbackId)
-              return;
-            preparedCount = count;
-            if (settings.earlyPlayback && !openingCount && count < currentPassages.length) {
-              const prefix = earlyPlaybackPrefix(texts, partial);
-              if (prefix) {
-                openingCount = prefix;
-                audioPlayer.begin(partial.slice(0, prefix));
-                audioPlayer.setSpeed(settings.speed);
-                audioPlayer.setVolume(settings.volume);
-                phase = "ready";
-              }
-            }
-            preparationNotice(phase === "playing" ? `Reading… ${count} of ${currentPassages.length} parts ready. The rest is on its way.` : phase === "paused" ? `Paused. ${count} of ${currentPassages.length} parts ready. The rest is on its way.` : openingCount ? `You can press Play now. ${count} of ${currentPassages.length} parts ready.` : `Preparing: ${count} of ${currentPassages.length} parts ready…`);
-            renderPlayer();
-            tryAutomaticPlayback();
-          }, snapshot.provider === "lumiverse" ? 3 : 2);
-          if (token !== playbackId)
-            return;
-          if (openingCount && (audioPlayer.hasStarted || playAttempt))
-            audioPlayer.append(clips.slice(openingCount), true);
-          else
-            audioPlayer.load(clips);
+        if (partial?.length !== currentPassages.length)
+          partial = undefined;
+        partial ??= Array.from({ length: currentPassages.length }, () => {
+          return;
+        });
+        const parts = partial, texts = currentPassages.map((p) => plainText(p.segment.text));
+        const retained = { userId: cacheUserId, key: audioKey, clips: parts, saved };
+        retainedParts = retained;
+        const prefixCount = () => {
+          let n = 0;
+          while (n < parts.length && parts[n])
+            n++;
+          return n;
+        };
+        const retainPartial = () => {
+          automaticPlayback.cancel();
+          incompleteAudio = true;
           preparingAudio = false;
-          audioPlayer.setSpeed(settings.speed);
-          audioPlayer.setVolume(settings.volume);
+          checkingSavedAudio = false;
+          preparedCount = parts.filter(Boolean).length;
+          const prefix = prefixCount();
+          if (prefix > openingCount) {
+            if (openingCount && (audioPlayer.hasStarted || playAttempt))
+              audioPlayer.append(parts.slice(openingCount, prefix), false);
+            else
+              audioPlayer.begin(parts.slice(0, prefix));
+            openingCount = prefix;
+            audioPlayer.setSpeed(settings.speed);
+            audioPlayer.setVolume(settings.volume);
+          }
           if (phase === "preparing")
             phase = "ready";
-          preparationNotice(phase === "playing" ? "Reading… The whole message is ready." : phase === "paused" ? "Paused. The whole message is ready." : "The whole message is ready. Press Play.");
+          renderPlayer();
+        };
+        const progress = () => {
+          if (token !== playbackId)
+            return;
+          preparedCount = parts.filter(Boolean).length;
+          if (settings.earlyPlayback && !openingCount && preparedCount < parts.length) {
+            const prefix = earlyPlaybackPrefix(texts, parts);
+            if (prefix) {
+              openingCount = prefix;
+              audioPlayer.begin(parts.slice(0, prefix));
+              audioPlayer.setSpeed(settings.speed);
+              audioPlayer.setVolume(settings.volume);
+              phase = "ready";
+            }
+          }
+          const opening = prefixCount(), percent = Math.round(texts.slice(0, opening).reduce((n, t) => n + t.length, 0) / Math.max(1, texts.reduce((n, t) => n + t.length, 0)) * 100), seconds = parts.slice(0, opening).reduce((n, c) => n + (c?.duration ?? 0), 0);
+          preparationNotice(phase === "playing" ? `Reading… ${preparedCount} of ${parts.length} parts ready. The rest is on its way.` : phase === "paused" ? `Paused. ${preparedCount} of ${parts.length} parts ready. The rest is on its way.` : openingCount ? `You can press Play now. ${preparedCount} of ${parts.length} parts ready.` : `Preparing: ${preparedCount} of ${parts.length} parts ready…${settings.earlyPlayback ? ` Opening audio: ${percent}% of text · ${timeLabel(seconds)}.` : ""}`);
           renderPlayer();
           tryAutomaticPlayback();
+        };
+        const prepareParts = async (manual) => {
+          if (token !== playbackId)
+            return;
+          preparingAudio = true;
+          incompleteAudio = false;
+          checkingSavedAudio = false;
+          notice(`Preparing missing audio… ${parts.filter(Boolean).length} of ${parts.length} parts kept.`);
+          renderPlayer();
           try {
-            saved = await audioCache.put(cacheUserId, audioKey, clips);
-          } catch {
-            saved = false;
+            const claim = await rpc("claim_preparation", { key: messageKey, manual });
+            if (token !== playbackId)
+              return;
+            if (!claim?.allowed) {
+              if (parts.some(Boolean)) {
+                retainPartial();
+                notice(`Kept ${preparedCount} of ${parts.length} parts. Retry missing audio explicitly; your speech service may charge.`, true);
+                renderPlayer();
+              } else {
+                stop(false);
+                notice("Audio for this message was already tried once. Press Prepare message to try again. This may cost money.");
+              }
+              return;
+            }
+            const clips = await prepareAll(currentPassages, async (p, index, requestSignal) => {
+              if (parts[index])
+                return parts[index];
+              const data = await prepareSpeech(p.segment, p.settings, requestSignal);
+              requestSignal.throwIfAborted();
+              const clip = await prepareClip(data, requestSignal);
+              requestSignal.throwIfAborted();
+              parts[index] = clip;
+              try {
+                saved = await audioCache.putPartial(cacheUserId, audioKey, parts);
+              } catch {
+                saved = false;
+              }
+              retained.saved = saved;
+              requestSignal.throwIfAborted();
+              return clip;
+            }, signal, progress, snapshot.provider === "lumiverse" ? 3 : 2);
+            if (token !== playbackId)
+              return;
+            if (openingCount && (audioPlayer.hasStarted || playAttempt))
+              audioPlayer.append(clips.slice(openingCount), true);
+            else
+              audioPlayer.load(clips);
+            incompleteAudio = false;
+            retryPreparation = null;
+            preparingAudio = false;
+            checkingSavedAudio = false;
+            preparedCount = clips.length;
+            audioPlayer.setSpeed(settings.speed);
+            audioPlayer.setVolume(settings.volume);
+            if (phase === "preparing")
+              phase = "ready";
+            preparationNotice(!saved ? "The audio is ready, but some parts could not be saved. Keep this window open." : phase === "playing" ? "Reading… The whole message is ready." : phase === "paused" ? "Paused. The whole message is ready." : "The whole message is ready. Press Play.");
+            renderPlayer();
+            tryAutomaticPlayback();
+          } catch (error) {
+            if (token !== playbackId)
+              return;
+            if (parts.some(Boolean)) {
+              retainPartial();
+              const detail = error instanceof Error ? error.message : "The speech request failed.";
+              notice(`${detail} Kept ${preparedCount} of ${parts.length} parts${saved ? " on this device" : " in this window"}. Retry missing audio requests only the missing parts and may cost money.`, true);
+              renderPlayer();
+            } else {
+              stop(false);
+              throw error;
+            }
           }
-        }
-        if (token !== playbackId)
-          return;
-        if (restored) {
-          audioPlayer.load(clips);
+        };
+        retryPreparation = async () => {
+          if (preparingAudio || token !== playbackId || !settings.enabled)
+            return;
+          automaticPlayback.cancel();
+          automaticPlaybackError = "";
+          await prepareParts(true);
+        };
+        if (parts.filter(Boolean).length === parts.length) {
+          restored = true;
+          preparedCount = parts.length;
+          retryPreparation = null;
+          audioPlayer.load(parts);
           audioPlayer.setSpeed(settings.speed);
           audioPlayer.setVolume(settings.volume);
+        } else if (options.restoreOnly || options.automatic && parts.some(Boolean)) {
+          if (parts.some(Boolean)) {
+            retainPartial();
+            notice(`Kept ${preparedCount} of ${parts.length} parts${saved ? " on this device" : " in this window"}. Play uses the prepared opening. Retry missing audio requests only missing parts and may cost money.`, true);
+            renderPlayer();
+          } else {
+            stop(false);
+            notice("No saved audio for this message. Press Prepare message to make it. This may cost money.");
+          }
+          return;
+        } else {
+          await prepareParts(!options.automatic);
+          return;
         }
       }
       if (token !== playbackId)
@@ -2528,7 +2703,7 @@ function setup(ctx) {
         phase = "ready";
       preparingAudio = false;
       checkingSavedAudio = false;
-      preparationNotice(restored ? "Saved audio is ready, at no new cost. Press Play." : !saved ? "This audio could not be saved. It will be gone after a reload." : phase === "playing" ? "Reading… The whole message is ready." : phase === "paused" ? "Paused. The whole message is ready." : phase === "finished" ? "Finished. Replay is free." : "The whole message is ready. Press Play.");
+      preparationNotice(restored ? saved ? "Saved audio is ready, at no new cost. Press Play." : "The prepared audio is ready, at no new cost. Keep this window open; it could not be saved." : !saved ? "This audio could not be saved. It will be gone after a reload." : phase === "playing" ? "Reading… The whole message is ready." : phase === "paused" ? "Paused. The whole message is ready." : phase === "finished" ? "Finished. Replay is free." : "The whole message is ready. Press Play.");
       renderPlayer();
       tryAutomaticPlayback();
     } catch (e) {
@@ -2705,7 +2880,7 @@ function setup(ctx) {
       meta.append(el("strong", speakerLabel(segment?.speaker, "Voice")));
       if (voice)
         meta.append(el("span", voice));
-      meta.append(el("span", preparingAudio ? `${preparedCount} of ${currentPassages.length} parts ready` : `Sentence ${position + 1} of ${currentSegments.length}`, "ra-push"));
+      meta.append(el("span", preparingAudio || incompleteAudio ? `${preparedCount} of ${currentPassages.length} parts ready` : `Sentence ${position + 1} of ${currentSegments.length}`, "ra-push"));
       const progress = el("progress");
       progress.max = preparingAudio ? currentPassages.length : currentSegments.length;
       progress.value = preparingAudio ? preparedCount : phase === "ready" ? 0 : position + 1;
@@ -2722,10 +2897,17 @@ function setup(ctx) {
     const row = el("div", "", "ra-row");
     if (phase !== "idle") {
       const play = playButton(() => safe(playOrPause));
-      play.disabled = phase === "preparing" || !!playAttempt;
+      play.disabled = phase === "preparing" || !!playAttempt || incompleteAudio && !audioPlayer.duration;
       row.append(play, iconButton("stop", "Stop", () => stop(), "ra-icon"));
       if (currentMessage)
         row.append(button("Show in chat", () => marker.follow()), button("Fix a name", () => fixAName()));
+      if (retryPreparation && (incompleteAudio || preparingAudio && preparedCount > 0)) {
+        const retry = button("Retry missing audio", () => safe(async () => {
+          await retryPreparation?.();
+        }), true);
+        retry.disabled = preparingAudio;
+        row.append(retry);
+      }
     } else {
       const read = button("Prepare message", () => safe(async () => {
         if (selectedId)
@@ -2789,7 +2971,7 @@ function setup(ctx) {
     const sliders = el("div", "", "ra-grid");
     sliders.append(speedField, volumeField);
     const about = disclosure([el("strong", "About cost and saved audio")]);
-    about.body.append(el("p", "While Readalong is on, each new reply gets audio as soon as it is written. Automatic playback can start it for you; otherwise press Play.", "ra-muted"), el("p", "Audio is saved on this device. Reloading or switching chats brings it back for free. If nothing is saved, press Prepare message to make it.", "ra-muted"), el("p", "Changing a voice, or how a name is said, only changes new audio.", "ra-muted"), el("p", "The highlighted sentence is a close guess of where the voice is.", "ra-muted"));
+    about.body.append(el("p", "While Readalong is on, each new reply gets audio as soon as it is written. Automatic playback can start it for you; otherwise press Play.", "ra-muted"), el("p", "Each successful audio part is saved on this device. Reloading or switching chats reuses what is still saved. Play never requests speech.", "ra-muted"), el("p", "If preparation fails, Retry missing audio keeps the successful parts and requests only what is missing. That retry can cost money. Storage limits or clearing app data can remove saved audio.", "ra-muted"), el("p", "Changing a voice, or how a name is said, only changes new audio.", "ra-muted"), el("p", "The highlighted sentence is a close guess of where the voice is.", "ra-muted"));
     options.replaceChildren(sliders, toggle("Play replies automatically", settings.automaticPlayback, (v) => {
       safe(() => setAutomaticPlayback(v));
     }, "Start with the next new reply when enough audio is ready. Current and manually prepared messages wait for Play. Pause waits for Resume."), toggle("Scroll the chat to follow the voice", settings.follow, (v) => {
@@ -3486,8 +3668,6 @@ function setup(ctx) {
   });
   onEvent("GENERATION_STOPPED", (p) => {
     localGenerations.delete(p?.generationId);
-    if (p?.chatId === ctx.getActiveChat().chatId && currentMessage)
-      stop();
   });
   onEvent("CONNECTED", () => {
     safe(recoverCompletion);
@@ -3608,6 +3788,7 @@ function setup(ctx) {
   return () => {
     stop(false);
     disposed = true;
+    retainedParts = null;
     marker.dispose();
     audioPlayer.dispose();
     widgetDragCleanup?.();

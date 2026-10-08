@@ -78,19 +78,20 @@ export function planSpeech(segments:SpeechSegment[], settings:Settings, context:
 
 /** Bounded synthesis; results stay ordered while progress exposes completed clips. */
 export async function prepareAll<T>(items:SpeechPassage[], prepare:(passage:SpeechPassage,index:number,signal:AbortSignal)=>Promise<T>, signal:AbortSignal, progress:(completed:number)=>void, concurrency=3):Promise<T[]> {
-  const abort=new AbortController(), combined=AbortSignal.any([signal,abort.signal]);
-  const results=new Array<T>(items.length);let next=0,completed=0,firstError:unknown;
+  const results=new Array<T>(items.length);let next=0,completed=0,failed=false,firstError:unknown;
   const worker=async()=>{
     try {
-      while(next<items.length) {
-        combined.throwIfAborted();const index=next++;
-        results[index]=await prepare(items[index],index,combined);
-        combined.throwIfAborted();progress(++completed);
+      while(next<items.length && !failed) {
+        signal.throwIfAborted();const index=next++;
+        results[index]=await prepare(items[index],index,signal);
+        signal.throwIfAborted();progress(++completed);
       }
-    } catch(error) {if(firstError===undefined)firstError=error;abort.abort();throw error}
+    // Let already accepted requests finish so their audio can be checkpointed.
+    // A failure stops dispatching new work; only Off/Stop aborts siblings.
+    } catch(error) {if(!failed){failed=true;firstError=error}throw error}
   };
   await Promise.allSettled(Array.from({length:Math.min(Math.max(1,concurrency),items.length)},worker));
-  if(firstError!==undefined)throw firstError;
+  if(failed)throw firstError;
   signal.throwIfAborted();return results;
 }
 

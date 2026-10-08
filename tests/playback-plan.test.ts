@@ -145,10 +145,12 @@ test('stop cancels preparation without starting remaining paid requests',async()
   await expect(prepareAll(plan('Rain. “Hello.” More rain.'),async()=>{calls++;abort.abort();return 'audio'},abort.signal,()=>{},1)).rejects.toThrow();
   expect(calls).toBe(1);
 });
-test('a provider failure aborts siblings and stops dispatching additional requests',async()=>{
-  let calls=0,aborted=false;
-  await expect(prepareAll(plan('Rain. “Hello.” More rain. “Goodbye.”'),async(_p,i,signal)=>{calls++;if(i===0)throw new Error('Provider failed');await new Promise<void>(resolve=>signal.addEventListener('abort',()=>{aborted=true;resolve()},{once:true}));signal.throwIfAborted();return i},new AbortController().signal,()=>{},2)).rejects.toThrow('Provider failed');
-  expect(calls).toBe(2);expect(aborted).toBe(true);
+test('a provider failure keeps already accepted audio and stops dispatching new requests',async()=>{
+  let calls=0;const kept:number[]=[];
+  await expect(prepareAll(plan('Rain. “Hello.” More rain. “Goodbye.”'),async(_p,i,signal)=>{
+    calls++;if(i===0)throw new Error('Provider failed');await Bun.sleep(1);signal.throwIfAborted();kept.push(i);return i;
+  },new AbortController().signal,()=>{},2)).rejects.toThrow('Provider failed');
+  expect(calls).toBe(2);expect(kept).toEqual([1]);
 });
 test('estimated sentence tracking stays in bounds and advances through a batched passage',()=>{
   const passage=plan('She waited. It was late. The room was quiet.')[0];

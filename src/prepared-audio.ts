@@ -84,6 +84,9 @@ export class PreparedPlayer {
   private speed=1;
   private volume=.85;
   private primed=false;
+  private reserve:HTMLAudioElement|null=null;
+  private reservePrimed=false;
+  private priming:{audio:HTMLAudioElement;cancel:()=>void}|null=null;
   private complete=true;
   private waiting=false;
   private started=false;
@@ -97,13 +100,28 @@ export class PreparedPlayer {
   onWaiting:(waiting:boolean)=>void=()=>{};
   constructor(private factory=()=>new Audio(),private urls:{create:(blob:Blob)=>string;revoke:(url:string)=>void}={create:URL.createObjectURL.bind(URL),revoke:URL.revokeObjectURL.bind(URL)},private startTimeoutMs=10000){this.audio=factory()}
   unlock() {
-    if(this.primed || this.tracks.length)return;this.primed=true;
-    const silent=new Blob([waveHeader(2),new Uint8Array(2)],{type:'audio/wav'}),url=this.urls.create(silent),audio=this.audio;
-    audio.src=url;const generation=this.generation;
-    void audio.play().then(()=>{if(generation===this.generation && !this.tracks.length)audio.pause()}).catch(()=>{}).finally(()=>this.urls.revoke(url));
+    if(this.primed || this.reservePrimed || this.priming || this.running || this.pendingPlay)return;
+    // WebKit grants sound permission per element. If a recording is already
+    // loaded, prime a reserve for the next reading without changing this one.
+    const audio=this.reserve??(this.tracks.length?(this.reserve=this.factory()):this.audio);
+    const size=4800,silent=new Blob([waveHeader(size),new Uint8Array(size)],{type:'audio/wav'}),url=this.urls.create(silent);
+    let done=false;
+    const finish=(success:boolean)=>{
+      if(done)return;done=true;clearTimeout(timer);
+      if(audio.onplaying===started)audio.onplaying=null;
+      if(this.priming?.audio===audio)this.priming=null;
+      if(success){if(audio===this.audio)this.primed=true;else if(audio===this.reserve)this.reservePrimed=true}
+      if(audio.src===url){audio.pause();audio.removeAttribute('src');audio.load()}
+      this.urls.revoke(url);
+    };
+    const started=()=>finish(true),timer=setTimeout(()=>finish(false),2000);
+    this.priming={audio,cancel:()=>finish(false)};audio.onplaying=started;audio.src=url;
+    try{void audio.play().then(started,()=>finish(false))}catch{finish(false)}
   }
   load(clips:PreparedClip[]) {
-    this.clear();this.durations=clips.map(c=>c.duration);
+    this.clear();
+    if(this.reserve){this.audio=this.reserve;this.primed=this.reservePrimed;this.reserve=null;this.reservePrimed=false}
+    this.priming?.cancel();this.durations=clips.map(c=>c.duration);
     this.tracks=joinPrepared(clips).map(c=>({url:this.urls.create(c.blob),duration:c.duration}));
     if(this.tracks.length)this.activate(0);
   }
@@ -142,8 +160,12 @@ export class PreparedPlayer {
   }
   private preloadNext(){if(!this.next && this.index+1<this.tracks.length){this.next=this.factory();this.configure(this.next);this.next.src=this.tracks[this.index+1].url}}
   private advance(){
-    const generation=this.generation,old=this.audio;old.onended=null;old.onerror=null;old.onplaying=null;old.onloadedmetadata=null;old.removeAttribute('src');old.load();
-    this.audio=this.next??this.factory();this.next=null;this.activate(this.index+1);
+    const generation=this.generation;
+    // Preloading may warm the next file, but it does not give that separate
+    // element permission to play. Keep the permitted element for every track.
+    this.next?.removeAttribute('src');this.next?.load();this.next=null;
+    this.audio.onended=null;this.audio.onerror=null;this.audio.onplaying=null;this.audio.onloadedmetadata=null;
+    this.activate(this.index+1);
     // Reuse the same guarded local playback path. No synthesis occurs here.
     void this.play().catch(()=>{if(generation===this.generation){this.running=false;this.onError(new Error('Prepared audio is ready. Press Resume to continue playback.'))}});
   }
@@ -168,7 +190,7 @@ export class PreparedPlayer {
     if(this.reloadBeforePlay){
       const old=this.audio,time=Number.isFinite(old.currentTime)?old.currentTime:0,generation=this.generation;
       old.pause();old.onended=null;old.onerror=null;old.onplaying=null;old.onloadedmetadata=null;old.removeAttribute('src');old.load();
-      this.audio=this.factory();this.reloadBeforePlay=false;this.activate(this.index);
+      this.audio=this.factory();this.primed=false;this.reloadBeforePlay=false;this.activate(this.index);
       const audio=this.audio,seek=()=>{if(generation!==this.generation || audio!==this.audio)return;try{audio.currentTime=time;audio.onloadedmetadata=null}catch{ /* Seek again once metadata is available. */ }};
       if(time){audio.onloadedmetadata=seek;seek()}
     }
@@ -179,7 +201,7 @@ export class PreparedPlayer {
     const cleanup=()=>{done=true;clearTimeout(timer);if(audio.onplaying===started)audio.onplaying=null;this.cancelPlay=null;this.rejectPlay=null;if(this.pendingPlay===pending)this.pendingPlay=null};
     const cancel=()=>{if(done)return;cleanup();resolve(false)};
     const failed=(error:Error)=>{if(done)return;if(!current()){cancel();return}this.running=false;audio.pause();cleanup();reject(error)};
-    const started=()=>{if(done)return;if(!current()){cancel();return}this.running=true;this.started=true;cleanup();resolve(true)};
+    const started=()=>{if(done)return;if(!current()){cancel();return}this.running=true;this.started=true;this.primed=true;cleanup();resolve(true)};
     const timer=setTimeout(()=>{if(done)return;this.reloadBeforePlay=true;failed(new Error('Playback is taking too long to start. Press Play again to reload the same recording; no speech is requested.'))},this.startTimeoutMs);
     this.pendingPlay=pending;
     this.cancelPlay=cancel;this.rejectPlay=failed;audio.onplaying=started;
@@ -199,10 +221,11 @@ export class PreparedPlayer {
   setVolume(volume:number){this.volume=Math.max(0,Math.min(1,volume));this.audio.volume=this.volume;if(this.next)this.next.volume=this.volume}
   rewind(){this.pause();this.finished=false;this.waiting=false;if(this.index===0)this.audio.currentTime=0;else{this.next?.removeAttribute('src');this.next?.load();this.next=null;this.activate(0)}}
   clear(){
+    if(this.priming?.audio===this.audio)this.priming.cancel();
     this.generation++;this.pause();this.audio.onended=null;this.audio.onerror=null;this.audio.onplaying=null;this.audio.onloadedmetadata=null;this.audio.removeAttribute('src');this.audio.load();
     this.next?.removeAttribute('src');this.next?.load();this.next=null;
     for(const track of this.tracks)this.urls.revoke(track.url);
     this.tracks=[];this.durations=[];this.index=0;this.finished=false;this.complete=true;this.waiting=false;this.started=false;this.reloadBeforePlay=false;
   }
-  dispose(){this.clear()}
+  dispose(){this.clear();this.priming?.cancel();this.reserve?.pause();this.reserve?.removeAttribute('src');this.reserve?.load();this.reserve=null;this.reservePrimed=false}
 }

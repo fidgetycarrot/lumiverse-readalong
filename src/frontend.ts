@@ -155,6 +155,8 @@ export function setup(ctx: SpindleFrontendContext) {
   let phase:'idle'|'preparing'|'ready'|'playing'|'paused'|'finished'='idle';
   let checkingSavedAudio=false;
   let preparingAudio=false,waitingForAudio=false;
+  let incompleteAudio=false,retryPreparation:(()=>Promise<void>)|null=null;
+  let retainedParts:{userId:string;key:string;clips:(PreparedClip|undefined)[];saved:boolean}|null=null;
   let playAttempt:object|null=null,messageLoad:object|null=null;
   const automaticPlayback=new AutomaticPlayback();let automaticPlaybackError='';
   let utterance: SpeechSynthesisUtterance | null = null;
@@ -177,6 +179,13 @@ export function setup(ctx: SpindleFrontendContext) {
   let playbackSettler: (() => void) | null = null;
   const pending = new Map<string,{resolve:(data:any)=>void;reject:(err:Error)=>void;timer:ReturnType<typeof setTimeout>}>();
   const cleanups: (()=>void)[] = [], bubbleHandles = new Map<string,Element>();
+  // Capture the Send click/Enter gesture before the asynchronous reply arrives.
+  // A reserve is used if old audio is loaded, so priming never starts that story.
+  const primeAutomaticAudio=()=>{if(!disposed && settings.enabled && settings.automaticPlayback && settings.provider!=='browser')audioPlayer.unlock()};
+  for(const event of ['pointerdown','keydown','touchstart','click'] as const){
+    document.addEventListener(event,primeAutomaticAudio,{capture:true,passive:true});
+    cleanups.push(()=>document.removeEventListener(event,primeAutomaticAudio,true));
+  }
   let editorTab: SpindleCharacterEditorTabHandle | null = null;
   const tab = ctx.ui.registerDrawerTab({ id:'readalong', title:'Readalong', shortName:'Read', description:'Listen to passages, assign character voices, and follow the spoken text', keywords:['tts','voice','speech','audio'], iconSvg:TAB_ICON });
   const root = tab.root; root.classList.add('ra'); root.dataset.raUi = 'true';
@@ -250,7 +259,7 @@ export function setup(ctx: SpindleFrontendContext) {
   function stopClock() { if(clockTimer)clearInterval(clockTimer);clockTimer=null }
   function stop(showStatus = true) {
     automaticPlayback.cancel();automaticPlaybackError='';
-    playbackId++; playing = false; paused = false; phase='idle';checkingSavedAudio=false;preparingAudio=false;waitingForAudio=false;playAttempt=null;messageLoad=null;stopClock();
+    playbackId++; playing = false; paused = false; phase='idle';checkingSavedAudio=false;preparingAudio=false;waitingForAudio=false;incompleteAudio=false;retryPreparation=null;playAttempt=null;messageLoad=null;stopClock();
     if(showStatus)completionInbox.reset();
     readingAbort?.abort();readingAbort=null;
     for(const controller of nativeRequests)controller.abort();nativeRequests.clear();
@@ -320,7 +329,7 @@ export function setup(ctx: SpindleFrontendContext) {
     widget.root.classList.toggle('ra-touch',widgetTouch());widget.root.classList.toggle('ra-narrow',widgetDimensions().narrow);
     const {label:playLabel}=playState(),speaking=phase==='playing' || phase==='paused',hasTime=!!audioPlayer.duration;
     const play=playButton(()=>safe(settings.enabled?playOrPause:()=>setEnabled(true)));
-    play.disabled=!ready || !!playAttempt || !!messageLoad || settings.enabled && (phase==='preparing' || phase==='idle' && !selectedId);
+    play.disabled=!ready || !!playAttempt || !!messageLoad || settings.enabled && (phase==='preparing' || phase==='idle' && !selectedId || incompleteAudio && !audioPlayer.duration);
     const close=iconButton('close','Hide floating player',()=>widget?.setVisible(false));
     const resize=iconButton(settings.widgetMinimized?'expand':'minimize',settings.widgetMinimized?'Expand floating player':'Minimize floating player',()=>safe(()=>setWidgetMinimized(!settings.widgetMinimized)));
     resize.dataset.raControl='resize';resize.setAttribute('aria-expanded',String(!settings.widgetMinimized));
@@ -344,7 +353,8 @@ export function setup(ctx: SpindleFrontendContext) {
       const tools=el('div','', 'ra-row ra-widget-tools');tools.append(resize,close);top.append(play,text,tools);
       const seek=el('div','', 'ra-seek');seek.append(progress,el('span',hasTime?clock:'','ra-time'));
       const foot=el('div','', 'ra-row ra-widget-foot'),stopButton=withIcon(button('Stop',()=>stop()),'stop');stopButton.disabled=phase==='idle';
-      const fix=button('Fix a name',()=>fixAName());fix.title='Change how a name is said';
+      const retry=!!retryPreparation && (incompleteAudio || preparingAudio && preparedCount>0);
+      const fix=retry?button('Retry missing audio',()=>safe(async()=>{await retryPreparation?.()})):button('Fix a name',()=>fixAName());fix.title=retry?'Requests only missing parts; your speech service may charge.':'Change how a name is said';if(retry)fix.disabled=preparingAudio;
       const open=iconButton('tune','Open Readalong',()=>tab.activate());
       power.classList.add('ra-push');foot.append(stopButton,fix,power,open);
       patchPlaybackChildren(widget.root,top,seek,foot);
@@ -371,7 +381,12 @@ export function setup(ctx: SpindleFrontendContext) {
   }
   audioPlayer.onEnded=finished;
   audioPlayer.onError=error=>{paused=true;playing=false;phase='paused';stopClock();notice(error.message,true);renderPlayer()};
-  audioPlayer.onWaiting=waiting=>{waitingForAudio=waiting;if(phase==='playing')notice(waiting?'Waiting for the rest of the audio…':'Reading…');renderPlayer()};
+  audioPlayer.onWaiting=waiting=>{
+    waitingForAudio=waiting;
+    if(waiting && incompleteAudio){audioPlayer.pause();paused=true;playing=false;phase='paused';stopClock();notice('Reached the missing audio. Retry missing audio to continue; your speech service may charge.',true)}
+    else if(phase==='playing')notice(waiting?'Waiting for the rest of the audio…':'Reading…');
+    renderPlayer();
+  };
   function tryAutomaticPlayback() {
     if(!automaticPlayback.take({enabled:settings.enabled,automatic:settings.automaticPlayback,ready:phase==='ready',busy:!!playAttempt || !!messageLoad}))return;
     const token=playbackId;
@@ -552,48 +567,86 @@ export function setup(ctx: SpindleFrontendContext) {
           return p.settings.provider==='lumiverse' && connection?nativeSpeechRequest(connection,p.settings,p.segment):[p.settings.provider,p.settings.localUrl,speechRequest(p.settings,p.segment)];
         });
         const audioKey=await preparationHash([messageKey,requests]);
-        let clips:PreparedClip[]|undefined=undefined;
-        try{clips=await audioCache.get(cacheUserId,audioKey)}catch{ /* A missing cache never authorizes an automatic retry. */ }
+        let partial:(PreparedClip|undefined)[]|undefined;
+        if(retainedParts?.userId===cacheUserId && retainedParts.key===audioKey){partial=Array.from(retainedParts.clips);saved=retainedParts.saved}
+        else try{partial=await audioCache.getPartial(cacheUserId,audioKey,currentPassages.length)}catch{ /* Storage never authorizes a retry. */ }
         if(token!==playbackId)return;
-        if(clips?.length!==currentPassages.length)clips=undefined;
-        if(clips){restored=true;preparedCount=currentPassages.length}
-        else {
-          if(options.restoreOnly){stop(false);notice('No saved audio for this message. Press Prepare message to make it. This may cost money.');return}
-          const claim=await rpc('claim_preparation',{key:messageKey,manual:!options.automatic});
-          if(token!==playbackId)return;
-          if(!claim?.allowed){stop(false);notice('Audio for this message was already tried once. Press Prepare message to try again. This may cost money.');return}
-          checkingSavedAudio=false;notice('Preparing the whole message…');renderPlayer();
-          const partial:Array<PreparedClip|undefined>=new Array(currentPassages.length),texts=currentPassages.map(p=>plainText(p.segment.text));
-          clips=await prepareAll(currentPassages,async(p,_index,requestSignal)=>{
-            const data=await prepareSpeech(p.segment,p.settings,requestSignal);requestSignal.throwIfAborted();
-            const clip=await prepareClip(data,requestSignal);requestSignal.throwIfAborted();
-            partial[_index]=clip;return clip;
-          },signal,count=>{
-            if(token!==playbackId)return;preparedCount=count;
-            if(settings.earlyPlayback && !openingCount && count<currentPassages.length){
-              const prefix=earlyPlaybackPrefix(texts,partial);
-              if(prefix){
-                openingCount=prefix;audioPlayer.begin(partial.slice(0,prefix) as PreparedClip[]);audioPlayer.setSpeed(settings.speed);audioPlayer.setVolume(settings.volume);phase='ready';
-              }
-            }
-            preparationNotice(phase==='playing'?`Reading… ${count} of ${currentPassages.length} parts ready. The rest is on its way.`:phase==='paused'?`Paused. ${count} of ${currentPassages.length} parts ready. The rest is on its way.`:openingCount?`You can press Play now. ${count} of ${currentPassages.length} parts ready.`:`Preparing: ${count} of ${currentPassages.length} parts ready…`);renderPlayer();tryAutomaticPlayback();
-          },snapshot.provider==='lumiverse'?3:2);
-          if(token!==playbackId)return;
-          // Preserve an active/paused opening buffer. Otherwise join everything
-          // into the usual single PCM file before the first Play click.
-          if(openingCount && (audioPlayer.hasStarted || playAttempt))audioPlayer.append(clips.slice(openingCount),true);
-          else audioPlayer.load(clips);
-          preparingAudio=false;audioPlayer.setSpeed(settings.speed);audioPlayer.setVolume(settings.volume);
+        if(partial?.length!==currentPassages.length)partial=undefined;
+        partial??=Array.from({length:currentPassages.length},()=>undefined);
+        const parts=partial,texts=currentPassages.map(p=>plainText(p.segment.text));
+        const retained={userId:cacheUserId,key:audioKey,clips:parts,saved};retainedParts=retained;
+        const prefixCount=()=>{let n=0;while(n<parts.length && parts[n])n++;return n};
+        const retainPartial=()=>{
+          automaticPlayback.cancel();incompleteAudio=true;preparingAudio=false;checkingSavedAudio=false;
+          preparedCount=parts.filter(Boolean).length;
+          const prefix=prefixCount();
+          if(prefix>openingCount){
+            if(openingCount && (audioPlayer.hasStarted || playAttempt))audioPlayer.append(parts.slice(openingCount,prefix) as PreparedClip[],false);
+            else audioPlayer.begin(parts.slice(0,prefix) as PreparedClip[]);
+            openingCount=prefix;audioPlayer.setSpeed(settings.speed);audioPlayer.setVolume(settings.volume);
+          }
           if(phase==='preparing')phase='ready';
-          preparationNotice((phase as string)==='playing'?'Reading… The whole message is ready.':(phase as string)==='paused'?'Paused. The whole message is ready.':'The whole message is ready. Press Play.');renderPlayer();tryAutomaticPlayback();
-          try{saved=await audioCache.put(cacheUserId,audioKey,clips)}catch{saved=false}
-        }
-        if(token!==playbackId)return;
-        if(restored){audioPlayer.load(clips);audioPlayer.setSpeed(settings.speed);audioPlayer.setVolume(settings.volume)}
+          renderPlayer();
+        };
+        const progress=()=>{
+          if(token!==playbackId)return;preparedCount=parts.filter(Boolean).length;
+          if(settings.earlyPlayback && !openingCount && preparedCount<parts.length){
+            const prefix=earlyPlaybackPrefix(texts,parts);
+            if(prefix){openingCount=prefix;audioPlayer.begin(parts.slice(0,prefix) as PreparedClip[]);audioPlayer.setSpeed(settings.speed);audioPlayer.setVolume(settings.volume);phase='ready'}
+          }
+          const opening=prefixCount(),percent=Math.round(texts.slice(0,opening).reduce((n,t)=>n+t.length,0)/Math.max(1,texts.reduce((n,t)=>n+t.length,0))*100),seconds=parts.slice(0,opening).reduce((n,c)=>n+(c?.duration??0),0);
+          preparationNotice(phase==='playing'?`Reading… ${preparedCount} of ${parts.length} parts ready. The rest is on its way.`:phase==='paused'?`Paused. ${preparedCount} of ${parts.length} parts ready. The rest is on its way.`:openingCount?`You can press Play now. ${preparedCount} of ${parts.length} parts ready.`:`Preparing: ${preparedCount} of ${parts.length} parts ready…${settings.earlyPlayback?` Opening audio: ${percent}% of text · ${timeLabel(seconds)}.`:''}`);
+          renderPlayer();tryAutomaticPlayback();
+        };
+        const prepareParts=async(manual:boolean)=>{
+          if(token!==playbackId)return;
+          preparingAudio=true;incompleteAudio=false;checkingSavedAudio=false;
+          notice(`Preparing missing audio… ${parts.filter(Boolean).length} of ${parts.length} parts kept.`);renderPlayer();
+          try{
+            const claim=await rpc('claim_preparation',{key:messageKey,manual});
+            if(token!==playbackId)return;
+            if(!claim?.allowed){
+              if(parts.some(Boolean)){retainPartial();notice(`Kept ${preparedCount} of ${parts.length} parts. Retry missing audio explicitly; your speech service may charge.`,true);renderPlayer()}
+              else{stop(false);notice('Audio for this message was already tried once. Press Prepare message to try again. This may cost money.')}
+              return;
+            }
+            const clips=await prepareAll(currentPassages,async(p,index,requestSignal)=>{
+              if(parts[index])return parts[index]!;
+              const data=await prepareSpeech(p.segment,p.settings,requestSignal);requestSignal.throwIfAborted();
+              const clip=await prepareClip(data,requestSignal);requestSignal.throwIfAborted();parts[index]=clip;
+              try{saved=await audioCache.putPartial(cacheUserId,audioKey,parts)}catch{saved=false}
+              retained.saved=saved;
+              requestSignal.throwIfAborted();return clip;
+            },signal,progress,snapshot.provider==='lumiverse'?3:2);
+            if(token!==playbackId)return;
+            if(openingCount && (audioPlayer.hasStarted || playAttempt))audioPlayer.append(clips.slice(openingCount),true);
+            else audioPlayer.load(clips);
+            incompleteAudio=false;retryPreparation=null;preparingAudio=false;checkingSavedAudio=false;preparedCount=clips.length;
+            audioPlayer.setSpeed(settings.speed);audioPlayer.setVolume(settings.volume);
+            if(phase==='preparing')phase='ready';
+            preparationNotice(!saved?'The audio is ready, but some parts could not be saved. Keep this window open.':phase==='playing'?'Reading… The whole message is ready.':phase==='paused'?'Paused. The whole message is ready.':'The whole message is ready. Press Play.');
+            renderPlayer();tryAutomaticPlayback();
+          }catch(error){
+            if(token!==playbackId)return;
+            if(parts.some(Boolean)){
+              retainPartial();const detail=error instanceof Error?error.message:'The speech request failed.';
+              notice(`${detail} Kept ${preparedCount} of ${parts.length} parts${saved?' on this device':' in this window'}. Retry missing audio requests only the missing parts and may cost money.`,true);renderPlayer();
+            }else{stop(false);throw error}
+          }
+        };
+        retryPreparation=async()=>{if(preparingAudio || token!==playbackId || !settings.enabled)return;automaticPlayback.cancel();automaticPlaybackError='';await prepareParts(true)};
+        if(parts.filter(Boolean).length===parts.length){
+          restored=true;preparedCount=parts.length;retryPreparation=null;audioPlayer.load(parts as PreparedClip[]);audioPlayer.setSpeed(settings.speed);audioPlayer.setVolume(settings.volume);
+        }else if(options.restoreOnly || options.automatic && parts.some(Boolean)){
+          if(parts.some(Boolean)){retainPartial();notice(`Kept ${preparedCount} of ${parts.length} parts${saved?' on this device':' in this window'}. Play uses the prepared opening. Retry missing audio requests only missing parts and may cost money.`,true);renderPlayer()}
+          else{stop(false);notice('No saved audio for this message. Press Prepare message to make it. This may cost money.')}
+          return;
+        }else{await prepareParts(!options.automatic);return}
+
       }
       if(token!==playbackId)return;
       if(phase==='preparing')phase='ready';preparingAudio=false;checkingSavedAudio=false;
-      preparationNotice(restored?'Saved audio is ready, at no new cost. Press Play.':!saved?'This audio could not be saved. It will be gone after a reload.':(phase as string)==='playing'?'Reading… The whole message is ready.':(phase as string)==='paused'?'Paused. The whole message is ready.':(phase as string)==='finished'?'Finished. Replay is free.':'The whole message is ready. Press Play.');renderPlayer();tryAutomaticPlayback();
+      preparationNotice(restored?saved?'Saved audio is ready, at no new cost. Press Play.':'The prepared audio is ready, at no new cost. Keep this window open; it could not be saved.':!saved?'This audio could not be saved. It will be gone after a reload.':(phase as string)==='playing'?'Reading… The whole message is ready.':(phase as string)==='paused'?'Paused. The whole message is ready.':(phase as string)==='finished'?'Finished. Replay is free.':'The whole message is ready. Press Play.');renderPlayer();tryAutomaticPlayback();
     } catch(e) {if(token===playbackId){stop(false);throw e}}
   }
   async function preview(voice: string, assignment?: Partial<VoiceAssignment>,sample?:{text:string;entries:Pronunciations}) {
@@ -674,7 +727,7 @@ export function setup(ctx: SpindleFrontendContext) {
     if (currentSegments.length) {
       const segment=currentSegments[position],meta=el('div','', 'ra-meta'),voice=currentPassages[currentPassage]?.voice;
       meta.append(el('strong',speakerLabel(segment?.speaker,'Voice')));if(voice)meta.append(el('span',voice));
-      meta.append(el('span',preparingAudio?`${preparedCount} of ${currentPassages.length} parts ready`:`Sentence ${position+1} of ${currentSegments.length}`,'ra-push'));
+      meta.append(el('span',(preparingAudio || incompleteAudio)?`${preparedCount} of ${currentPassages.length} parts ready`:`Sentence ${position+1} of ${currentSegments.length}`,'ra-push'));
       const progress=el('progress');progress.max=preparingAudio?currentPassages.length:currentSegments.length;progress.value=preparingAudio?preparedCount:phase==='ready'?0:position+1;progress.setAttribute('aria-label',preparingAudio?'Speech preparation':'Playback progress');
       const seek=el('div','', 'ra-seek');seek.append(progress,el('span',audioPlayer.duration?`${timeLabel(audioPlayer.elapsed)} / ${timeLabel(audioPlayer.duration)}`:'','ra-time'));
       content.append(meta,el('p',plainText(segment?.text ?? ''), 'ra-passage'),seek);
@@ -683,9 +736,10 @@ export function setup(ctx: SpindleFrontendContext) {
     } else content.append(el('p',ready?'No replies in this chat yet. Readalong picks up the next one.':'Loading…','ra-muted'));
     const row=el('div','', 'ra-row');
     if (phase !== 'idle') {
-      const play=playButton(()=>safe(playOrPause));play.disabled=phase==='preparing' || !!playAttempt;
+      const play=playButton(()=>safe(playOrPause));play.disabled=phase==='preparing' || !!playAttempt || incompleteAudio && !audioPlayer.duration;
       row.append(play,iconButton('stop','Stop',()=>stop(),'ra-icon'));
       if (currentMessage) row.append(button('Show in chat',()=>marker.follow()),button('Fix a name',()=>fixAName()));
+      if(retryPreparation && (incompleteAudio || preparingAudio && preparedCount>0)){const retry=button('Retry missing audio',()=>safe(async()=>{await retryPreparation?.()}),true);retry.disabled=preparingAudio;row.append(retry)}
     } else {
       const read=button('Prepare message',()=>safe(async()=>{ if (selectedId) await readId(selectedId); else { await refreshMessages(); if (selectedId) await readId(selectedId); else throw new Error('No assistant message found.') } }),true);
       read.disabled=!ready || !settings.enabled || !!messageLoad;row.append(read,iconButton('refresh','Refresh messages',()=>safe(refreshMessages),'ra-icon'));
@@ -709,7 +763,8 @@ export function setup(ctx: SpindleFrontendContext) {
     const about=disclosure([el('strong','About cost and saved audio')]);
     about.body.append(
       el('p','While Readalong is on, each new reply gets audio as soon as it is written. Automatic playback can start it for you; otherwise press Play.','ra-muted'),
-      el('p','Audio is saved on this device. Reloading or switching chats brings it back for free. If nothing is saved, press Prepare message to make it.','ra-muted'),
+      el('p','Each successful audio part is saved on this device. Reloading or switching chats reuses what is still saved. Play never requests speech.','ra-muted'),
+      el('p','If preparation fails, Retry missing audio keeps the successful parts and requests only what is missing. That retry can cost money. Storage limits or clearing app data can remove saved audio.','ra-muted'),
       el('p','Changing a voice, or how a name is said, only changes new audio.','ra-muted'),
       el('p','The highlighted sentence is a close guess of where the voice is.','ra-muted'));
     options.replaceChildren(sliders,
@@ -1009,7 +1064,9 @@ export function setup(ctx: SpindleFrontendContext) {
       await receiveCompletion({chatId:p.chatId,messageId:p.messageId,generationId:p.generationId,completedAt:Date.now(),message});
     });
   });
-  onEvent('GENERATION_STOPPED',p=>{localGenerations.delete(p?.generationId);if(p?.chatId===ctx.getActiveChat().chatId && currentMessage)stop()});
+  // Chat generation and speech preparation have independent lifetimes. A late
+  // chat stop notification must not discard paid audio from a completed reply.
+  onEvent('GENERATION_STOPPED',p=>{localGenerations.delete(p?.generationId)});
   onEvent('CONNECTED',()=>{void safe(recoverCompletion)});
   onEvent('CHARACTER_MESSAGE_RENDERED',()=>decorateMessages());
   cleanups.push(tab.onActivate(()=>{void safe(async()=>{await refreshPronunciations();await refreshMessages();await recoverCompletion()})}));
@@ -1045,7 +1102,7 @@ export function setup(ctx: SpindleFrontendContext) {
     if(!settings.enabled)notice('Readalong is off. Nothing is sent to your voice service.');
   });
   return()=>{
-    stop(false);disposed=true;marker.dispose();audioPlayer.dispose();widgetDragCleanup?.();widget?.destroy();for(const fn of cleanups)fn();editorTab?.destroy();action.destroy();tab.destroy();
+    stop(false);disposed=true;retainedParts=null;marker.dispose();audioPlayer.dispose();widgetDragCleanup?.();widget?.destroy();for(const fn of cleanups)fn();editorTab?.destroy();action.destroy();tab.destroy();
     for(const p of pending.values()){clearTimeout(p.timer);p.reject(new Error('Readalong unloaded.'))}pending.clear();ctx.dom.cleanup();
   };
 }
