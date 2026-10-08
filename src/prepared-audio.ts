@@ -84,8 +84,14 @@ export class PreparedPlayer {
   private speed=1;
   private volume=.85;
   private primed=false;
+  private complete=true;
+  private waiting=false;
+  private started=false;
+  private playEpoch=0;
+  private pendingPlay:Promise<boolean>|null=null;
   onEnded:()=>void=()=>{};
   onError:(error:Error)=>void=()=>{};
+  onWaiting:(waiting:boolean)=>void=()=>{};
   constructor(private factory=()=>new Audio(),private urls:{create:(blob:Blob)=>string;revoke:(url:string)=>void}={create:URL.createObjectURL.bind(URL),revoke:URL.revokeObjectURL.bind(URL)}){this.audio=factory()}
   unlock() {
     if(this.primed || this.tracks.length)return;this.primed=true;
@@ -98,19 +104,40 @@ export class PreparedPlayer {
     this.tracks=joinPrepared(clips).map(c=>({url:this.urls.create(c.blob),duration:c.duration}));
     if(this.tracks.length)this.activate(0);
   }
+  /** The opening buffer is one joined file. The remaining buffer is joined once. */
+  begin(clips:PreparedClip[]){this.load(clips);this.complete=false}
+  append(clips:PreparedClip[],complete=true){
+    this.durations.push(...clips.map(c=>c.duration));
+    this.tracks.push(...joinPrepared(clips).map(c=>({url:this.urls.create(c.blob),duration:c.duration})));
+    this.complete=complete;
+    if(this.waiting && this.index+1<this.tracks.length){
+      this.onWaiting(false);
+      if(this.running){this.waiting=false;this.advance()}
+    }else if(this.waiting && complete){this.waiting=false;this.running=false;this.finished=true;this.onWaiting(false);this.onEnded()}
+    else this.preloadNext();
+  }
+  get hasStarted(){return this.started}
   private configure(audio:HTMLAudioElement){audio.preload='auto';audio.volume=this.volume;audio.playbackRate=this.speed}
   private activate(index:number) {
     this.index=index;this.configure(this.audio);if(this.audio.src!==this.tracks[index].url)this.audio.src=this.tracks[index].url;
-    const generation=this.generation;
+    const generation=this.generation,audio=this.audio;
     this.audio.onended=()=>{
-      if(generation!==this.generation || !this.running)return;
-      if(this.index+1===this.tracks.length){this.running=false;this.finished=true;this.onEnded();return}
-      const old=this.audio;old.onended=null;old.onerror=null;old.removeAttribute('src');old.load();
-      this.audio=this.next??this.factory();this.next=null;this.activate(this.index+1);
-      void this.audio.play().catch(e=>{if(generation===this.generation){this.running=false;this.onError(e instanceof Error?e:new Error('Audio playback failed.'))}});
+      if(generation!==this.generation || audio!==this.audio || index!==this.index || !this.running)return;
+      if(this.index+1===this.tracks.length){
+        if(!this.complete){this.waiting=true;this.onWaiting(true);return}
+        this.running=false;this.finished=true;this.onEnded();return;
+      }
+      this.advance();
     };
-    this.audio.onerror=()=>{if(generation===this.generation){this.running=false;this.onError(new Error('The prepared audio file could not be played.'))}};
-    if(this.index+1<this.tracks.length){this.next=this.factory();this.configure(this.next);this.next.src=this.tracks[this.index+1].url}
+    this.audio.onerror=()=>{if(generation===this.generation && audio===this.audio){this.running=false;this.onError(new Error('The prepared audio file could not be played.'))}};
+    this.preloadNext();
+  }
+  private preloadNext(){if(!this.next && this.index+1<this.tracks.length){this.next=this.factory();this.configure(this.next);this.next.src=this.tracks[this.index+1].url}}
+  private advance(){
+    const generation=this.generation,old=this.audio;old.onended=null;old.onerror=null;old.removeAttribute('src');old.load();
+    this.audio=this.next??this.factory();this.next=null;this.activate(this.index+1);
+    // Reuse the same guarded local playback path. No synthesis occurs here.
+    void this.play().catch(()=>{if(generation===this.generation){this.running=false;this.onError(new Error('Prepared audio is ready. Press Resume to continue playback.'))}});
   }
   get duration(){return this.durations.reduce((sum,n)=>sum+n,0)}
   get elapsed(){return this.finished?this.duration:Math.min(this.duration,this.tracks.slice(0,this.index).reduce((sum,c)=>sum+c.duration,0)+(this.tracks.length?this.audio.currentTime:0))}
@@ -120,21 +147,37 @@ export class PreparedPlayer {
     const seconds=Math.max(0,elapsed-start),length=this.durations[index]??0;
     return {index,seconds,fraction:length?Math.min(1,seconds/length):0,elapsed,duration:this.duration};
   }
-  async play(){
+  play():Promise<boolean>{
+    if(this.finished)this.rewind();
+    if(this.pendingPlay)return this.pendingPlay;
     if(!this.tracks.length)throw new Error('No prepared audio is available.');
-    if(this.finished)this.rewind();const generation=this.generation;
-    try{await this.audio.play()}catch{if(generation!==this.generation)return false;throw new Error('Audio is ready. Press Play to allow playback.')}
-    if(generation!==this.generation)return false;this.running=true;return true;
+    if(this.waiting){
+      if(this.index+1<this.tracks.length){this.waiting=false;this.onWaiting(false);this.advance();return this.pendingPlay!}
+      this.running=true;return Promise.resolve(true);
+    }
+    const generation=this.generation,epoch=++this.playEpoch;
+    const pending=(async()=>{
+      try{await this.audio.play()}catch(error){
+        if(generation!==this.generation || epoch!==this.playEpoch)return false;
+        const blocked=error instanceof Error && error.name==='NotAllowedError';
+        throw new Error(`${blocked?'Your browser blocked playback.':'Playback could not start.'} Press Play again; the prepared audio is reused and no speech is requested.`);
+      }
+      if(generation!==this.generation || epoch!==this.playEpoch)return false;
+      this.running=true;this.started=true;return true;
+    })();
+    this.pendingPlay=pending;
+    void pending.finally(()=>{if(this.pendingPlay===pending)this.pendingPlay=null}).catch(()=>{});
+    return pending;
   }
-  pause(){this.audio.pause();this.running=false}
+  pause(){this.playEpoch++;this.pendingPlay=null;this.audio.pause();this.running=false}
   setSpeed(speed:number){this.speed=Math.max(.5,Math.min(2,speed));this.audio.playbackRate=this.speed;if(this.next)this.next.playbackRate=this.speed}
   setVolume(volume:number){this.volume=Math.max(0,Math.min(1,volume));this.audio.volume=this.volume;if(this.next)this.next.volume=this.volume}
-  rewind(){this.pause();this.finished=false;if(this.index===0)this.audio.currentTime=0;else{this.next?.removeAttribute('src');this.next?.load();this.next=null;this.activate(0)}}
+  rewind(){this.pause();this.finished=false;this.waiting=false;if(this.index===0)this.audio.currentTime=0;else{this.next?.removeAttribute('src');this.next?.load();this.next=null;this.activate(0)}}
   clear(){
     this.generation++;this.pause();this.audio.onended=null;this.audio.onerror=null;this.audio.removeAttribute('src');this.audio.load();
     this.next?.removeAttribute('src');this.next?.load();this.next=null;
     for(const track of this.tracks)this.urls.revoke(track.url);
-    this.tracks=[];this.durations=[];this.index=0;this.finished=false;
+    this.tracks=[];this.durations=[];this.index=0;this.finished=false;this.complete=true;this.waiting=false;this.started=false;
   }
   dispose(){this.clear()}
 }

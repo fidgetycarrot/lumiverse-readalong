@@ -41,6 +41,64 @@ test('a delayed play promise cannot restart a stopped session',async()=>{
   const {player,audios}=fixture();player.load([await clip(10)]);let resolve!:()=>void;
   audios[0].play=()=>new Promise<void>(r=>resolve=r);const pending=player.play();player.clear();resolve();expect(await pending).toBe(false);
 });
+test('overlapping Play presses share one local media attempt',async()=>{
+  const {player,audios}=fixture();player.load([await clip(10)]);let resolve!:()=>void,calls=0;
+  audios[0].play=()=>{calls++;return new Promise<void>(r=>resolve=r)};
+  const first=player.play(),second=player.play();expect(first).toBe(second);expect(calls).toBe(1);
+  resolve();expect(await first).toBe(true);expect(await second).toBe(true);
+});
+test('a blocked first Play can be retried using exactly the same prepared file',async()=>{
+  const {player,audios,created}=fixture();player.load([await clip(10)]);const file=audios[0].src;
+  audios[0].play=async()=>{throw new DOMException('Gesture needed','NotAllowedError')};
+  await expect(player.play()).rejects.toThrow('no speech is requested');
+  audios[0].play=async()=>{audios[0].paused=false};expect(await player.play()).toBe(true);
+  expect(audios[0].src).toBe(file);expect(created).toHaveLength(1);
+});
+test('Pause cancels a pending Play attempt before it can report a started session',async()=>{
+  const {player,audios}=fixture();player.load([await clip(10)]);let resolve!:()=>void;
+  audios[0].play=()=>new Promise<void>(r=>resolve=r);const pending=player.play();player.pause();resolve();
+  expect(await pending).toBe(false);expect(audios[0].paused).toBe(true);expect(player.hasStarted).toBe(false);
+});
+test('early playback appends one joined remaining buffer and preserves clock, pause and replay',async()=>{
+  const {player,audios,created}=fixture();const clips=[await clip(20),await clip(20),await clip(10),await clip(10)];
+  player.begin(clips.slice(0,2));await player.play();audios[0].currentTime=15;player.pause();
+  player.append(clips.slice(2));expect(audios[0].paused).toBe(true);expect(player.elapsed).toBe(15);expect(player.duration).toBe(60);
+  expect(created).toHaveLength(2);expect(audios).toHaveLength(2);
+  await player.play();audios[0].currentTime=40;audios[0].onended();await Promise.resolve();
+  expect(player.position).toMatchObject({index:2,elapsed:40,duration:60});
+  audios[1].currentTime=20;audios[1].onended();expect(player.elapsed).toBe(60);
+  await player.play();expect(player.elapsed).toBe(0);expect(created).toHaveLength(2);player.clear();
+});
+test('catching up to preparation waits without replaying or declaring the story finished',async()=>{
+  const {player,audios}=fixture();let ended=0;const waiting:boolean[]=[];
+  player.onEnded=()=>ended++;player.onWaiting=value=>waiting.push(value);
+  player.begin([await clip(30)]);await player.play();audios[0].currentTime=30;audios[0].onended();
+  expect(ended).toBe(0);expect(waiting).toEqual([true]);
+  player.append([await clip(10)]);await Promise.resolve();expect(waiting).toEqual([true,false]);
+  expect(player.elapsed).toBe(30);expect(audios[1].playCalls).toBe(1);
+  audios[1].currentTime=10;audios[1].onended();expect(ended).toBe(1);expect(player.elapsed).toBe(40);
+});
+test('pausing while waiting prevents remaining audio from starting until Resume',async()=>{
+  const {player,audios}=fixture();player.begin([await clip(30)]);await player.play();audios[0].currentTime=30;audios[0].onended();player.pause();
+  player.append([await clip(10)]);expect(audios[1]?.playCalls??0).toBe(0);
+  await player.play();expect(player.elapsed).toBe(30);expect(audios[1].playCalls).toBe(1);
+});
+test('Stop during early playback discards the buffer and never advances a stale end event',async()=>{
+  const {player,audios,revoked}=fixture();player.begin([await clip(30)]);await player.play();const stale=audios[0].onended;
+  player.clear();stale();expect(player.duration).toBe(0);expect(revoked).toHaveLength(1);expect(audios).toHaveLength(1);
+});
+test('completion during a pending early Play preserves the original media source and time',async()=>{
+  const {player,audios}=fixture();player.begin([await clip(30)]);const source=audios[0].src;let resolve!:()=>void;
+  audios[0].play=()=>new Promise<void>(r=>resolve=r);const pending=player.play();audios[0].currentTime=2;
+  player.append([await clip(10)]);resolve();expect(await pending).toBe(true);
+  expect(audios[0].src).toBe(source);expect(player.elapsed).toBe(2);expect(player.duration).toBe(40);
+});
+test('a stale opening-buffer ended callback cannot prematurely finish the remaining buffer',async()=>{
+  const {player,audios}=fixture();let ended=0;player.onEnded=()=>ended++;
+  player.begin([await clip(30)]);player.append([await clip(10)]);await player.play();const firstEnded=audios[0].onended;
+  firstEnded();await Promise.resolve();firstEnded();expect(ended).toBe(0);
+  audios[1].onended();expect(ended).toBe(1);
+});
 test('mixed audio files preload the next voice and do not reload it at the boundary',async()=>{
   const {player,audios}=fixture();player.load([await clip(10,8000),await clip(20,16000)]);expect(audios).toHaveLength(2);
   const next=audios[1];await player.play();audios[0].onended();await Promise.resolve();

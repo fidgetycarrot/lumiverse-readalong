@@ -6,6 +6,8 @@ import { planSpeech, prepareAll, estimatedSentenceIndex, type SpeechPassage, typ
 import { PreparedPlayer, prepareClip, type PreparedClip } from './prepared-audio';
 import { AudioCache, preparationHash } from './audio-cache';
 import {widgetDimensions as resolveWidgetDimensions,widgetPosition} from './widget-layout';
+import {patchPlaybackChildren} from './playback-ui';
+import {earlyPlaybackPrefix} from './early-playback';
 
 const STYLE = `
 ::highlight(lumiverse-readalong){background:rgba(245,190,80,.30);color:inherit;text-decoration:underline;text-decoration-color:#e7b24c;text-decoration-thickness:2px;}
@@ -42,11 +44,11 @@ const STYLE = `
 .ra-mini.ra-collapsed.ra-narrow{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;}.ra-collapsed.ra-narrow .ra-compact-info{display:none;}.ra-mini.ra-collapsed.ra-narrow button{width:100%;min-width:0;min-height:44px;}
 `;
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, text = '', className = '') { const node = document.createElement(tag); if (text) node.textContent = text; if (className) node.className = className; return node }
-function button(text: string, action: () => void | Promise<void>, primary = false) { const b = el('button',text,primary ? 'ra-primary' : ''); b.type = 'button'; b.onclick = () => { void action() }; return b }
+function button(text: string, action: () => void | Promise<void>, primary = false) { const b = el('button',text,primary ? 'ra-primary' : ''); b.type = 'button';b.dataset.raControl=text; b.onclick = () => { void action() }; return b }
 function field(label: string, input: HTMLElement) { const l = el('label','', 'ra-field'); input.setAttribute('aria-label',label); l.append(el('span',label), input); return l }
-function select(options: {value:string;label:string}[], value: string, change: (v: string) => void) { const s = el('select'); for (const o of options) { const option = el('option',o.label); option.value = o.value; s.append(option) }; s.value = value; s.onchange = () => change(s.value); return s }
+function select(options: {value:string;label:string}[], value: string, change: (v: string) => void) { const s = el('select'); for (const o of options) { const option = el('option',o.label); option.value = o.value; s.append(option) }; s.value = value; s.onchange = e => change((e.currentTarget as HTMLSelectElement).value); return s }
 function textInput(value: string, onInput: (value: string) => void, type = 'text') { const i = el('input'); i.type = type; i.value = value; i.oninput = () => onInput(i.value); return i }
-function toggle(label: string, value: boolean, change: (v: boolean) => void) { const row = el('label','', 'ra-toggle'), i = el('input'); i.type = 'checkbox'; i.checked = value; i.onchange = () => change(i.checked); row.append(i,el('span',label)); return row }
+function toggle(label: string, value: boolean, change: (v: boolean) => void) { const row = el('label','', 'ra-toggle'), i = el('input'); i.type = 'checkbox'; i.checked = value; i.onchange = e => change((e.currentTarget as HTMLInputElement).checked); row.append(i,el('span',label)); return row }
 function timeLabel(seconds:number){const value=Math.floor(seconds);return `${Math.floor(value/60)}:${String(value%60).padStart(2,'0')}`}
 
 export function setup(ctx: SpindleFrontendContext) {
@@ -63,6 +65,8 @@ export function setup(ctx: SpindleFrontendContext) {
   let playbackId = 0, playing = false, paused = false, currentMessage: MessageInfo | null = null;
   let phase:'idle'|'preparing'|'ready'|'playing'|'paused'|'finished'='idle';
   let checkingSavedAudio=false;
+  let preparingAudio=false,waitingForAudio=false;
+  let playAttempt:object|null=null,messageLoad:object|null=null;
   let utterance: SpeechSynthesisUtterance | null = null;
   const audioPlayer=new PreparedPlayer();
   const audioCache=new AudioCache();let cacheUserId='';
@@ -80,9 +84,6 @@ export function setup(ctx: SpindleFrontendContext) {
   let playbackSettler: (() => void) | null = null;
   const pending = new Map<string,{resolve:(data:any)=>void;reject:(err:Error)=>void;timer:ReturnType<typeof setTimeout>}>();
   const cleanups: (()=>void)[] = [], bubbleHandles = new Map<string,Element>();
-  const primeAudio=()=>{try{audioPlayer.unlock();removePrimer()}catch{}};
-  const removePrimer=()=>{document.removeEventListener('pointerdown',primeAudio,true);document.removeEventListener('keydown',primeAudio,true)};
-  document.addEventListener('pointerdown',primeAudio,{capture:true,passive:true});document.addEventListener('keydown',primeAudio,true);cleanups.push(removePrimer);
   let editorTab: SpindleCharacterEditorTabHandle | null = null;
   const tab = ctx.ui.registerDrawerTab({ id:'readalong', title:'Readalong', shortName:'Read', description:'Listen to passages, assign character voices, and follow the spoken text', keywords:['tts','voice','speech','audio'] });
   const root = tab.root; root.classList.add('ra'); root.dataset.raUi = 'true';
@@ -133,7 +134,7 @@ export function setup(ctx: SpindleFrontendContext) {
   }
   function stopClock() { if(clockTimer)clearInterval(clockTimer);clockTimer=null }
   function stop(showStatus = true) {
-    playbackId++; playing = false; paused = false; phase='idle';checkingSavedAudio=false;stopClock();
+    playbackId++; playing = false; paused = false; phase='idle';checkingSavedAudio=false;preparingAudio=false;waitingForAudio=false;playAttempt=null;messageLoad=null;stopClock();
     readingAbort?.abort();readingAbort=null;
     for(const controller of nativeRequests)controller.abort();nativeRequests.clear();
     audioPlayer.clear();
@@ -195,21 +196,21 @@ export function setup(ctx: SpindleFrontendContext) {
     const caption=el('p',phase==='playing' || phase==='paused' ? `${currentSegments[position]?.speaker || 'Voice'} · ${currentPassages[currentPassage]?.voice || ''}` : status.textContent ?? 'Choose a message.','ra-caption');
     caption.title=plainText(currentSegments[position]?.text ?? caption.textContent ?? '');
     const controls=el('div','', 'ra-row ra-controls');
-    const playLabel=!settings.enabled?'Turn on':phase==='preparing'?(checkingSavedAudio?'Loading…':'Preparing…'):phase==='idle'?'Play latest':phase==='paused'?'Resume':phase==='playing'?'Pause':phase==='finished'?'Replay':'Play';
+    const playLabel=!settings.enabled?'Turn on':playAttempt?'Starting…':messageLoad?'Loading…':phase==='preparing'?(checkingSavedAudio?'Loading…':'Preparing…'):phase==='idle'?'Load saved':phase==='paused'?'Resume':phase==='playing'?'Pause':phase==='finished'?'Replay':'Play';
     const play=button(playLabel,()=>safe(settings.enabled?playOrPause:()=>setEnabled(true)),true);play.title=playLabel;
-    play.disabled=!ready || settings.enabled && (phase==='preparing' || phase==='idle' && !selectedId);controls.append(play);
+    play.dataset.raControl='play';play.disabled=!ready || !!playAttempt || !!messageLoad || settings.enabled && (phase==='preparing' || phase==='idle' && !selectedId);controls.append(play);
     const stopButton=button('Stop',()=>stop());stopButton.disabled=phase==='idle';controls.append(stopButton,button('Open player',()=>tab.activate()));
     const power=button(settings.enabled?'On':'Off',()=>safe(()=>setEnabled(!settings.enabled)));power.className='ra-power';power.setAttribute('aria-label',settings.enabled?'Turn Readalong off':'Turn Readalong on');power.title=power.getAttribute('aria-label')!;
-    const progress=el('progress');progress.max=1;progress.value=phase==='preparing'?preparedCount/Math.max(1,currentPassages.length):phase==='finished'?1:phase==='ready'?0:audioPlayer.duration?audioPlayer.elapsed/audioPlayer.duration:position/Math.max(1,currentSegments.length);progress.setAttribute('aria-label',phase==='preparing'?'Speech preparation':'Playback progress');
+    const progress=el('progress');progress.max=1;progress.value=preparingAudio?preparedCount/Math.max(1,currentPassages.length):phase==='finished'?1:phase==='ready'?0:audioPlayer.duration?audioPlayer.elapsed/audioPlayer.duration:position/Math.max(1,currentSegments.length);progress.setAttribute('aria-label',preparingAudio?'Speech preparation':'Playback progress');
     if(settings.widgetMinimized){
       play.textContent=phase==='preparing'?'…':phase==='playing'?'Ⅱ':phase==='finished'?'↻':'▶';play.setAttribute('aria-label',playLabel);play.classList.add('ra-compact-play');
       const info=el('div','', 'ra-compact-info');info.append(el('strong','Readalong'));
       const detail=el('span',!settings.enabled?'Off':audioPlayer.duration && ['playing','paused','ready','finished'].includes(phase)?`${timeLabel(audioPlayer.elapsed)} / ${timeLabel(audioPlayer.duration)}`:playLabel, audioPlayer.duration && settings.enabled && phase!=='preparing'?'ra-compact-status ra-time':'ra-compact-status');
       detail.title=status.textContent??'';info.append(detail);
-      widget.root.replaceChildren(play,info,power,resize,close,progress);
+      patchPlaybackChildren(widget.root,play,info,power,resize,close,progress);
     }else{
       const tools=el('div','', 'ra-row ra-widget-tools');tools.append(power,resize,close);header.append(tools);
-      widget.root.replaceChildren(header,caption,controls,progress);
+      patchPlaybackChildren(widget.root,header,caption,controls,progress);
     }
   }
   function markSentence(passageIndex:number,sentenceIndex:number) {
@@ -223,7 +224,7 @@ export function setup(ctx: SpindleFrontendContext) {
     if(phase!=='playing')return;
     const at=audioPlayer.position,passage=currentPassages[at.index];
     if(passage)markSentence(at.index,estimatedSentenceIndex(passage,at.fraction));
-    const progress=widget?.root.querySelector('progress');if(progress)progress.value=at.duration?at.elapsed/at.duration:0;
+    const progress=widget?.root.querySelector('progress');if(progress && !preparingAudio)progress.value=at.duration?at.elapsed/at.duration:0;
     const time=widget?.root.querySelector('.ra-time');if(time)time.textContent=`${timeLabel(at.elapsed)} / ${timeLabel(at.duration)}`;
   }
   function finished() {
@@ -233,10 +234,13 @@ export function setup(ctx: SpindleFrontendContext) {
   }
   audioPlayer.onEnded=finished;
   audioPlayer.onError=error=>{paused=true;playing=false;phase='paused';stopClock();notice(error.message,true);renderPlayer()};
+  audioPlayer.onWaiting=waiting=>{waitingForAudio=waiting;if(phase==='playing')notice(waiting?'Waiting for the remaining audio. Preparation continues; no retry was sent.':'Reading…');renderPlayer()};
   async function playOrPause() {
     if(!settings.enabled)throw new Error('Readalong is off. Turn it on to prepare audio.');
+    if(playAttempt || messageLoad)return;
     if(phase==='preparing')return;
-    if(phase==='idle'){if(!selectedId)throw new Error('No assistant message found.');await readId(selectedId);if((phase as string)!=='ready' || !settings.enabled)return;}
+    // Loading saved audio is a separate action. Play never authorizes synthesis.
+    if(phase==='idle'){if(!selectedId)throw new Error('No assistant message found.');await readId(selectedId,true);return;}
     if(phase==='playing') {
       if(browserQueueActive)speechSynthesis.pause();else{updateClock();audioPlayer.pause()}
       paused=true;playing=false;phase='paused';stopClock();notice('Paused. Your place is saved.');renderPlayer();return;
@@ -257,11 +261,15 @@ export function setup(ctx: SpindleFrontendContext) {
       } catch(e){if(token===playbackId){stop(false);throw e}}
       return;
     }
-    audioPlayer.unlock();
-    const started=await audioPlayer.play();
-    if(token!==playbackId || !started)return;
-    playing=true;phase='playing';notice('Reading…');updateClock();renderPlayer();
-    stopClock();clockTimer=setInterval(updateClock,100);
+    const attempt={};playAttempt=attempt;
+    try {
+      // Call play synchronously inside the click, before any asynchronous work.
+      const pending=audioPlayer.play();renderPlayer();
+      const started=await pending;
+      if(token!==playbackId || !started)return;
+      playing=true;phase='playing';notice(waitingForAudio?'Waiting for the remaining audio. Preparation continues; no retry was sent.':preparingAudio?'Reading… Remaining audio is still preparing.':'Reading…');updateClock();
+      stopClock();clockTimer=setInterval(updateClock,100);
+    }finally{if(playAttempt===attempt){playAttempt=null;renderPlayer()}}
   }
   function browserSpeech(passage:SpeechPassage,token:number,passageIndex:number) {
     return new Promise<void>((resolve,reject) => {
@@ -299,6 +307,7 @@ export function setup(ctx: SpindleFrontendContext) {
     else notice('Readalong is on. New assistant replies will prepare automatically.');
   }
   async function setEnabled(enabled:boolean) {
+    if(settings.enabled===enabled)return;
     settings.enabled=enabled;if(!enabled)stop(false);
     renderPlayer();renderVoices();renderAssignments();
     notice(enabled?'Readalong is on. Preparing the latest reply…':'Readalong is off. No speech requests will be started.');
@@ -310,7 +319,7 @@ export function setup(ctx: SpindleFrontendContext) {
     stop(false);
     const token=playbackId;readingAbort=new AbortController();const signal=readingAbort.signal;
     currentMessage={...message,characterId:message.characterId ?? speakerCharacterId(message.name,characters,ctx.getActiveChat().characterId ?? undefined)};
-    phase='preparing';checkingSavedAudio=true;preparedCount=0;showWidget();notice('Looking for saved audio. No speech requested yet.');renderPlayer();
+    phase='preparing';preparingAudio=true;checkingSavedAudio=true;preparedCount=0;showWidget();notice('Looking for saved audio. No speech requested yet.');renderPlayer();
     try {
       const snapshot=normalizeSettings(settings);
       const context:VoiceContext={characters,characterId:currentMessage.characterId,connections:nativeConnections};
@@ -324,7 +333,7 @@ export function setup(ctx: SpindleFrontendContext) {
       const parsed=parseSegments(message.content,message.name,rules);
       currentPassages=planSpeech(parsed,snapshot,context);currentSegments=currentPassages.flatMap(p=>p.segments);
       if(!currentSegments.length){stop(false);notice('There is no readable text in this message.');return}
-      let restored=false,saved=true;
+      let restored=false,saved=true,openingCount=0;
       if(snapshot.provider!=='browser') {
         const messageKey=await preparationHash([ctx.getActiveChat().chatId,message.id,message.content]);
         const requests=currentPassages.map(p=>{
@@ -338,24 +347,42 @@ export function setup(ctx: SpindleFrontendContext) {
         if(clips?.length!==currentPassages.length)clips=undefined;
         if(clips){restored=true;preparedCount=currentPassages.length}
         else {
-          if(options.restoreOnly){stop(false);notice('No saved audio for this message. Refresh did not request speech. New replies prepare automatically; Prepare message can generate this one.');return}
+          if(options.restoreOnly){stop(false);notice('No saved audio for this message. No speech was requested. Choose Prepare message to generate it; charges may apply.');return}
           const claim=await rpc('claim_preparation',{key:messageKey,manual:!options.automatic});
           if(token!==playbackId)return;
           if(!claim?.allowed){stop(false);notice('This message was already prepared or attempted. No speech was requested again. Choose Prepare message to retry; speech charges may apply.');return}
           checkingSavedAudio=false;notice('Preparing the whole message…');renderPlayer();
+          const partial:Array<PreparedClip|undefined>=new Array(currentPassages.length),texts=currentPassages.map(p=>plainText(p.segment.text));
           clips=await prepareAll(currentPassages,async(p,_index,requestSignal)=>{
             const data=await prepareSpeech(p.segment,p.settings,requestSignal);requestSignal.throwIfAborted();
             const clip=await prepareClip(data,requestSignal);requestSignal.throwIfAborted();
-            return clip;
-          },signal,count=>{if(token===playbackId){preparedCount=count;notice(`Preparing the whole message · ${count} of ${currentPassages.length} passages ready…`);renderPlayer()}},snapshot.provider==='lumiverse'?3:2);
+            partial[_index]=clip;return clip;
+          },signal,count=>{
+            if(token!==playbackId)return;preparedCount=count;
+            if(settings.earlyPlayback && !openingCount && count<currentPassages.length){
+              const prefix=earlyPlaybackPrefix(texts,partial);
+              if(prefix){
+                openingCount=prefix;audioPlayer.begin(partial.slice(0,prefix) as PreparedClip[]);audioPlayer.setSpeed(settings.speed);audioPlayer.setVolume(settings.volume);phase='ready';
+              }
+            }
+            notice(phase==='playing'?`Reading… ${count} of ${currentPassages.length} passages ready; preparation continues.`:phase==='paused'?`Paused. ${count} of ${currentPassages.length} passages ready; preparation continues.`:openingCount?`Opening audio is ready. Press Play while the rest prepares · ${count} of ${currentPassages.length} passages ready.`:`Preparing the whole message · ${count} of ${currentPassages.length} passages ready…`);renderPlayer();
+          },snapshot.provider==='lumiverse'?3:2);
           if(token!==playbackId)return;
+          // Preserve an active/paused opening buffer. Otherwise join everything
+          // into the usual single PCM file before the first Play click.
+          if(openingCount && (audioPlayer.hasStarted || playAttempt))audioPlayer.append(clips.slice(openingCount),true);
+          else audioPlayer.load(clips);
+          preparingAudio=false;audioPlayer.setSpeed(settings.speed);audioPlayer.setVolume(settings.volume);
+          if(phase==='preparing')phase='ready';
+          notice((phase as string)==='playing'?'Reading… The whole message is ready.':(phase as string)==='paused'?'Paused. The whole message is ready.':'The whole message is ready. Press Play.');renderPlayer();
           try{saved=await audioCache.put(cacheUserId,audioKey,clips)}catch{saved=false}
         }
         if(token!==playbackId)return;
-        audioPlayer.load(clips);audioPlayer.setSpeed(settings.speed);audioPlayer.setVolume(settings.volume);
+        if(restored){audioPlayer.load(clips);audioPlayer.setSpeed(settings.speed);audioPlayer.setVolume(settings.volume)}
       }
       if(token!==playbackId)return;
-      phase='ready';checkingSavedAudio=false;notice(restored?'Saved audio restored. No speech request or new charge. Press Play.':saved?'The whole message is ready. Press Play.':'Audio is ready, but could not be saved for refresh. It will not regenerate automatically. Press Play.');renderPlayer();
+      if(phase==='preparing')phase='ready';preparingAudio=false;checkingSavedAudio=false;
+      notice(restored?'Saved audio restored. No speech request or new charge. Press Play.':!saved?'Audio could not be saved for refresh. It will not regenerate automatically.':(phase as string)==='playing'?'Reading… The whole message is ready.':(phase as string)==='paused'?'Paused. The whole message is ready.':(phase as string)==='finished'?'Finished. Replay uses the prepared audio.':'The whole message is ready. Press Play.');renderPlayer();
     } catch(e) {if(token===playbackId){stop(false);throw e}}
   }
   async function preview(voice: string, assignment?: Partial<VoiceAssignment>) {
@@ -416,40 +443,46 @@ export function setup(ctx: SpindleFrontendContext) {
     messages = r.messages; selectedId = messages.some(m=>m.id === selectedId) ? selectedId : messages.at(-1)?.id ?? '';
     renderPlayer(); decorateMessages();
   }
-  async function readId(id: string) {
+  async function readId(id: string,restoreOnly=false) {
+    if(messageLoad)return;
     const chatId = ctx.getActiveChat().chatId; if (!chatId) throw new Error('Open a chat first.');
-    const r = await rpc('message',{chatId,messageId:id});
-    if (ctx.getActiveChat().chatId !== chatId) return;
-    await startMessage(r.message);
+    const operation={};messageLoad=operation;const token=playbackId;renderPlayer();
+    try {
+      const r = await rpc('message',{chatId,messageId:id});
+      if (ctx.getActiveChat().chatId !== chatId || token!==playbackId || messageLoad!==operation)return;
+      await startMessage(r.message,{restoreOnly});
+    }finally{if(messageLoad===operation){messageLoad=null;renderPlayer()}}
   }
   function renderPlayer() {
     for(const handle of bubbleHandles.values()){const read=handle.querySelector('button');if(read)read.disabled=!settings.enabled}
-    player.replaceChildren(el('h3',phase==='preparing'?(checkingSavedAudio?'Looking for saved audio':'Preparing the whole message'):phase==='ready'?'Ready to play':phase==='playing' || phase==='paused'?'Now reading':'Listen to a passage'));
-    player.append(toggle('Readalong on · prepare replies automatically',settings.enabled,v=>{void safe(()=>setEnabled(v))}),el('p','When on, new replies prepare automatically and may incur speech charges. Refresh restores saved audio without generating speech. Turning on prepares the latest reply once. Audio waits for Play. Turn off to stop new requests.','ra-muted'));
+    const playerContent=el('section');
+    playerContent.append(el('h3',phase==='preparing'?(checkingSavedAudio?'Looking for saved audio':'Preparing the whole message'):phase==='ready'?'Ready to play':phase==='playing' || phase==='paused'?'Now reading':'Listen to a passage'));
+    playerContent.append(toggle('Readalong on · prepare replies automatically',settings.enabled,v=>{void safe(()=>setEnabled(v))}),el('p','When on, new replies prepare automatically and may incur speech charges. Refresh restores saved audio without generating speech. Turning on prepares the latest reply once. Audio waits for Play. Turn off to stop new requests.','ra-muted'));
     const row = el('div','', 'ra-row');
     if (phase !== 'idle') {
-      const play=button(phase==='paused'?'Resume':phase==='playing'?'Pause':phase==='finished'?'Replay':'Play',()=>safe(playOrPause),true);play.disabled=phase==='preparing';
+      const play=button(playAttempt?'Starting…':phase==='paused'?'Resume':phase==='playing'?'Pause':phase==='finished'?'Replay':'Play',()=>safe(playOrPause),true);play.dataset.raControl='play';play.disabled=phase==='preparing' || !!playAttempt;
       row.append(play,button('Stop',()=>stop()));
     } else {
       const read = button('Prepare message',()=>safe(async()=>{ if (selectedId) await readId(selectedId); else { await refreshMessages(); if (selectedId) await readId(selectedId); else throw new Error('No assistant message found.') } }),true);
-      read.disabled = !ready || !settings.enabled; row.append(read,button('Refresh messages',()=>safe(refreshMessages)));
+      read.disabled = !ready || !settings.enabled || !!messageLoad; row.append(read,button('Refresh messages',()=>safe(refreshMessages)));
     }
     if(typeof ctx.ui.createFloatWidget==='function')row.append(button('Floating player',()=>safe(openWidget)));
     if (currentMessage) row.append(button('Return to passage',()=>marker.follow()));
-    player.append(row);
-    if(ready && typeof ctx.ui.createFloatWidget==='function' && (widgetError || !permissions.includes('ui_panels')))player.append(el('p',widgetError || widgetPermissionHint,'ra-muted'));
-    if (phase==='idle' && messages.length) player.append(field('Assistant message',select([...messages].reverse().map(m=>({value:m.id,label:`${m.name || 'Assistant'} · ${plainText(stripCues(m.content)).slice(0,70)}`})), selectedId,v=>{selectedId=v})));
+    playerContent.append(row);
+    if(ready && typeof ctx.ui.createFloatWidget==='function' && (widgetError || !permissions.includes('ui_panels')))playerContent.append(el('p',widgetError || widgetPermissionHint,'ra-muted'));
+    if (phase==='idle' && messages.length) playerContent.append(field('Assistant message',select([...messages].reverse().map(m=>({value:m.id,label:`${m.name || 'Assistant'} · ${plainText(stripCues(m.content)).slice(0,70)}`})), selectedId,v=>{selectedId=v})));
     if (currentSegments.length) {
-      const segment = currentSegments[position], progress = el('progress');progress.max=phase==='preparing'?currentPassages.length:currentSegments.length;progress.value=phase==='preparing'?preparedCount:phase==='ready'?0:position+1;
-      player.append(el('p',`${segment?.speaker || 'Voice'} · ${currentPassages[currentPassage]?.voice || ''} · Sentence ${position+1} of ${currentSegments.length}`,'ra-muted'),progress,el('p',plainText(segment?.text ?? ''), 'ra-passage'));
-      if (currentMessage) player.append(el('p','The sentence marker estimates your place within continuous audio. Pausing keeps it in place.','ra-muted'));
-    } else player.append(el('p',settings.enabled?'Prepare message reuses matching saved audio. If none is available, it generates speech and charges may apply.':'Readalong is off. Turn it on when you want prepared speech.','ra-muted'));
-    player.append(toggle('Follow the spoken passage as it moves down the page',settings.follow,v=>{settings.follow=v;void safe(saveSettings)}));
+      const segment = currentSegments[position], progress = el('progress');progress.max=preparingAudio?currentPassages.length:currentSegments.length;progress.value=preparingAudio?preparedCount:phase==='ready'?0:position+1;progress.setAttribute('aria-label',preparingAudio?'Speech preparation':'Playback progress');
+      playerContent.append(el('p',`${segment?.speaker || 'Voice'} · ${currentPassages[currentPassage]?.voice || ''} · Sentence ${position+1} of ${currentSegments.length}`,'ra-muted'),progress,el('p',plainText(segment?.text ?? ''), 'ra-passage'));
+      if (currentMessage) playerContent.append(el('p','The sentence marker estimates your place within continuous audio. Pausing keeps it in place.','ra-muted'));
+    } else playerContent.append(el('p',settings.enabled?'Prepare message reuses matching saved audio. If none is available, it generates speech and charges may apply.':'Readalong is off. Turn it on when you want prepared speech.','ra-muted'));
+    playerContent.append(toggle('Follow the spoken passage as it moves down the page',settings.follow,v=>{settings.follow=v;void safe(saveSettings)}));
+    playerContent.append(toggle('Allow Play when about 75% of the message is ready',settings.earlyPlayback,v=>{settings.earlyPlayback=v;void safe(saveSettings)}),el('p','Needs at least 30 seconds ready in order. You still press Play. The rest prepares using the same requests; playback waits if it catches up. One-file messages become playable when that file finishes.','ra-muted'));
     const slider = el('input'); slider.type='range'; slider.min='.5'; slider.max='2'; slider.step='.1'; slider.value=String(settings.speed);
-    slider.oninput=()=>{settings.speed=Number(slider.value);speedLabel.textContent=`Playback speed · ${settings.speed.toFixed(1)}×`;audioPlayer.setSpeed(settings.speed)};
+    slider.oninput=e=>{const input=e.currentTarget as HTMLInputElement;settings.speed=Number(input.value);const label=input.parentElement?.querySelector('span');if(label)label.textContent=`Playback speed · ${settings.speed.toFixed(1)}×`;audioPlayer.setSpeed(settings.speed)};
     slider.onchange=()=>{void safe(saveSettings)}; const speedLabel = el('span',`Playback speed · ${settings.speed.toFixed(1)}×`), speedField = el('label','', 'ra-field');speedField.append(speedLabel,slider);
-    const volume = el('input');volume.type='range';volume.min='0';volume.max='1';volume.step='.05';volume.value=String(settings.volume);volume.oninput=()=>{settings.volume=Number(volume.value);audioPlayer.setVolume(settings.volume)};volume.onchange=()=>{void safe(saveSettings)};
-    const controls = el('div','', 'ra-grid');controls.append(speedField,field('Volume',volume));player.append(controls);renderWidget();
+    const volume = el('input');volume.type='range';volume.min='0';volume.max='1';volume.step='.05';volume.value=String(settings.volume);volume.oninput=e=>{settings.volume=Number((e.currentTarget as HTMLInputElement).value);audioPlayer.setVolume(settings.volume)};volume.onchange=()=>{void safe(saveSettings)};
+    const controls = el('div','', 'ra-grid');controls.append(speedField,field('Volume',volume));playerContent.append(controls);patchPlaybackChildren(player,...playerContent.childNodes);renderWidget();
   }
   function renderConfig() {
     config.replaceChildren(el('h3','Speech connection'));

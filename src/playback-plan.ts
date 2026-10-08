@@ -43,7 +43,7 @@ export function planSpeech(segments:SpeechSegment[], settings:Settings, context:
   return passages;
 }
 
-/** Bounded synthesis; all results must be ready before playback is enabled. */
+/** Bounded synthesis; results stay ordered while progress exposes completed clips. */
 export async function prepareAll<T>(items:SpeechPassage[], prepare:(passage:SpeechPassage,index:number,signal:AbortSignal)=>Promise<T>, signal:AbortSignal, progress:(completed:number)=>void, concurrency=3):Promise<T[]> {
   const abort=new AbortController(), combined=AbortSignal.any([signal,abort.signal]);
   const results=new Array<T>(items.length);let next=0,completed=0,firstError:unknown;
