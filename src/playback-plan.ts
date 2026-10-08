@@ -6,17 +6,30 @@ import {applyPronunciations,type Pronunciations} from './pronunciation';
 export const MAX_PASSAGE_CHARS=3000;
 export const MAX_NATIVE_PASSAGE_CHARS=12000;
 export interface SpeechPassage { segment:SpeechSegment;segments:SpeechSegment[];settings:Settings;voice:string }
-export interface VoiceContext { characters:CharacterInfo[];characterId?:string;connections?:NativeConnection[];narrationVoice?:NativeVoiceRef;pronunciations?:Pronunciations;overrides?:{narrator?:unknown;characters?:Record<string,unknown>} }
+export interface VoiceContext { characters:CharacterInfo[];characterId?:string;connections?:NativeConnection[];mainSpeaker?:string;narrationVoice?:NativeVoiceRef;pronunciations?:Pronunciations;overrides?:{narrator?:unknown;characters?:Record<string,unknown>} }
 
+const firstName=(name:string)=>name.split('||')[0].trim().toLowerCase();
+/** True for a speaker who is neither the reply's own character, a library character, nor someone with a saved voice. */
+export function isUnvoicedExtra(speaker:string,settings:Settings,context:VoiceContext):boolean {
+  const name=speaker.trim().toLowerCase();
+  if(!name || name==='narrator' || settings.assignments[`name:${name}`])return false;
+  if(context.mainSpeaker && firstName(context.mainSpeaker)===name)return false;
+  if(context.characters.some(c=>firstName(c.name)===name || c.name.trim().toLowerCase()===name))return false;
+  return true;
+}
 /** Resolve voices before batching, so narrator/character boundaries survive. */
 export function planSpeech(segments:SpeechSegment[], settings:Settings, context:VoiceContext):SpeechPassage[] {
   const passages:SpeechPassage[]=[];
   let previousKey='';
   for(const source of segments) {
     let segment=source;
-    const characterId=speakerCharacterId(segment.speaker,context.characters,context.characterId);
-    const assignment=selectVoice(settings,segment,characterId);
     const narrator=segment.speaker.trim().toLowerCase()==='narrator';
+    // A named speaker with no voice of their own, who is not the character this
+    // reply belongs to, would otherwise borrow that character's voice.
+    const npc=!!settings.npcVoice && !narrator && isUnvoicedExtra(segment.speaker,settings,context);
+    const characterId=npc?undefined:speakerCharacterId(segment.speaker,context.characters,context.characterId);
+    const assignment=selectVoice(settings,segment,characterId);
+    if(npc)assignment.voice=settings.npcVoice;
     const explicit=settings.assignments[`name:${segment.speaker.toLowerCase()}`]?.voice || (!narrator && characterId && settings.assignments[`id:${characterId}`]?.voice);
     let snapshot={...settings,assignments:{},narratorVoice:'',voice:assignment.voice};
     if(settings.provider==='lumiverse' && settings.inheritVoices && !(narrator?settings.narratorVoice:explicit)) {

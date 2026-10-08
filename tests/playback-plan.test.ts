@@ -118,3 +118,17 @@ test('estimated sentence tracking stays in bounds and advances through a batched
   const passage=plan('She waited. It was late. The room was quiet.')[0];
   expect(estimatedSentenceIndex(passage,-1)).toBe(0);expect(estimatedSentenceIndex(passage,.5)).toBe(1);expect(estimatedSentenceIndex(passage,2)).toBe(2);
 });
+
+test('side characters without a voice use the everyone-else voice, and nobody else does',()=>{
+  const s=normalizeSettings({...DEFAULTS,provider:'openrouter',model:'openai/gpt-4o-mini-tts',voice:'Kore',narratorVoice:'Charon',npcVoice:'Orus',assignments:{'id:mara':{voice:'Leda'},'name:jason':{voice:'Fenrir'}}});
+  const line=(speaker:string)=>({text:'"Hello there."',speaker,emotion:'',delivery:''});
+  const context={characters:[{id:'mara',name:'Mara||Scholar'},{id:'rowan',name:'Rowan'}],characterId:'mara',mainSpeaker:'Mara'};
+  const voices=(speaker:string,settings=s)=>planSpeech([line(speaker)],settings,context).map(p=>p.voice);
+  expect(voices('Innkeeper')).toEqual(['Orus']);
+  expect(voices('Mara')).toEqual(['Leda']);
+  expect(voices('Jason')).toEqual(['Fenrir']);
+  expect(voices('narrator')).toEqual(['Charon']);
+  expect(voices('Rowan')).not.toEqual(['Orus']);
+  // Unset keeps the old behaviour: an unknown speaker borrows the reply's character.
+  expect(voices('Innkeeper',{...s,npcVoice:''})).toEqual(['Leda']);
+});

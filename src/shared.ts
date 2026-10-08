@@ -11,7 +11,7 @@ export interface Settings {
   provider: 'lumiverse' | 'openrouter' | 'browser' | 'local';
   connectionId: string;
   model: string; voice: string; narratorVoice: string; localUrl: string;
-  enabled: boolean; follow: boolean; earlyPlayback:boolean; promptEmotions: boolean; useEmotions: boolean;promptPronunciations:boolean; personaName:string;
+  enabled: boolean; follow: boolean; earlyPlayback:boolean; promptEmotions: boolean; useEmotions: boolean;promptPronunciations:boolean; personaName:string; npcVoice:string;
   inheritVoices: boolean; widgetMinimized: boolean; widgetPosition: {x:number;y:number}|null;
   speed: number; volume: number;
   assignments: Record<string, VoiceAssignment>;
@@ -19,7 +19,7 @@ export interface Settings {
 export const DEFAULTS: Settings = {
   provider: 'openrouter', connectionId:'', model: 'google/gemini-3.8-flash-tts', voice: 'Kore', narratorVoice: '',
   localUrl: 'http://localhost:8880/v1', enabled: false, follow: false, earlyPlayback:true,
-  promptEmotions: true, useEmotions: true, promptPronunciations:true, personaName:'', inheritVoices:true, widgetMinimized:false, widgetPosition:null, speed: 1, volume: 0.85, assignments: {},
+  promptEmotions: true, useEmotions: true, promptPronunciations:true, personaName:'', npcVoice:'', inheritVoices:true, widgetMinimized:false, widgetPosition:null, speed: 1, volume: 0.85, assignments: {},
 };
 export interface SpeechSegment { text: string; speaker: string; emotion: string; delivery: string }
 export interface SpeechModel { id: string; name: string; voices: string[] }
@@ -53,7 +53,7 @@ export function normalizeSettings(raw: unknown): Settings {
   return {
     connectionId: str(r.connectionId,'',160),
     provider: ['lumiverse','openrouter','browser','local'].includes(r.provider ?? '') ? r.provider! : DEFAULTS.provider,
-    model: str(r.model, DEFAULTS.model), voice: str(r.voice, DEFAULTS.voice), narratorVoice: str(r.narratorVoice, ''),
+    model: str(r.model, DEFAULTS.model), voice: str(r.voice, DEFAULTS.voice), narratorVoice: str(r.narratorVoice, ''), npcVoice: str(r.npcVoice, ''),
     localUrl: str(r.localUrl, DEFAULTS.localUrl, 500),
     enabled: typeof r.enabled==='boolean'?r.enabled:DEFAULTS.enabled, follow: r.follow === true, earlyPlayback:r.earlyPlayback!==false,
     promptEmotions: r.promptEmotions !== false, useEmotions: r.useEmotions !== false,promptPronunciations:r.promptPronunciations!==false, personaName:typeof r.personaName==='string' && r.personaName.trim().length<=80 && !/[\[\]\r\n]/.test(r.personaName)?r.personaName.trim():'', inheritVoices:r.inheritVoices!==false, widgetMinimized:r.widgetMinimized===true, widgetPosition,

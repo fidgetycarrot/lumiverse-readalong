@@ -495,7 +495,7 @@ export function setup(ctx: SpindleFrontendContext) {
     try {
       const snapshot=normalizeSettings(settings);
       const chatId=ctx.getActiveChat().chatId;
-      const context:VoiceContext={characters,characterId:currentMessage.characterId,connections:nativeConnections,
+      const context:VoiceContext={characters,characterId:currentMessage.characterId,connections:nativeConnections,mainSpeaker:message.name,
         pronunciations:await refreshPronunciations(chatId,options.restoreOnly?undefined:message.id)};
       let rules;
       if(snapshot.provider==='lumiverse') {
@@ -564,7 +564,7 @@ export function setup(ctx: SpindleFrontendContext) {
     stop(false);const token=playbackId;readingAbort=new AbortController();
     if(settings.provider!=='browser')audioPlayer.unlock();
     const segment={text:sample?.text??'The door was open. I took a breath, and stepped into the light.',speaker:'Preview',emotion:assignment?.emotion ?? 'neutral',delivery:assignment?.delivery ?? 'normal'};
-    const snapshot=normalizeSettings({...settings,voice,narratorVoice:'',assignments:{},inheritVoices:false});
+    const snapshot=normalizeSettings({...settings,voice,narratorVoice:'',npcVoice:'',assignments:{},inheritVoices:false});
     currentPassages=planSpeech([segment],snapshot,{characters:[],pronunciations:sample?.entries});currentSegments=[segment];position=0;phase='preparing';showWidget();renderPlayer();notice(`Preparing ${voice}…`);
     try {
       if(snapshot.provider!=='browser') {
@@ -883,7 +883,7 @@ export function setup(ctx: SpindleFrontendContext) {
     }
     for(const row of rows){
       const saved=settings.assignments[row.key],known=sayingFor(baseName(row.name));
-      const summary:(Node|string)[]=[el('strong',row.you?`You (${row.name})`:baseName(row.name)),el('span',saved?.voice||'Main voice')];
+      const summary:(Node|string)[]=[el('strong',row.you?`You (${row.name})`:baseName(row.name)),el('span',saved?.voice||'No voice yet')];
       if(known)summary.push(el('span',`said “${known.spokenAs}”`));
       if(!saved && !known && !row.you)summary.push(el('span','New','ra-badge'));
       const entry=disclosure(summary,openCast.has(row.key));
@@ -891,6 +891,14 @@ export function setup(ctx: SpindleFrontendContext) {
       entry.details.addEventListener('toggle',()=>{if(entry.details.isConnected){if(entry.details.open)openCast.add(row.key);else openCast.delete(row.key)}});
       assignmentsCard.append(entry.details);castForm(entry.body,row.key,row.name);
     }
+    const others=disclosure([el('strong','Everyone else'),el('span',settings.npcVoice||'Same as the main character')],openCast.has('others'));
+    others.details.addEventListener('toggle',()=>{if(others.details.isConnected){if(others.details.open)openCast.add('others');else openCast.delete('others')}});
+    const othersListen=withIcon(button('Listen',()=>safe(()=>preview(settings.npcVoice||settings.voice))),'speaker');othersListen.disabled=!settings.enabled;
+    const othersNames=[...voiceNames()];if(settings.npcVoice && !othersNames.includes(settings.npcVoice))othersNames.unshift(settings.npcVoice);
+    const othersRow=el('div','', 'ra-row ra-end');othersRow.append(field('Voice',select([{value:'',label:'Same as the main character'},...othersNames.map(name=>({value:name,label:name}))],settings.npcVoice,v=>{settings.npcVoice=v;void safe(async()=>{await saveSettings();renderAssignments();notice(v?'Voice saved for everyone else. Audio you already have keeps the old sound.':'Everyone else now sounds like the main character.')})})),othersListen);
+    others.body.append(othersRow,el('p','For side characters who speak but have no voice of their own yet. Give someone their own row above to make them sound different.','ra-muted'));
+    if(!settings.promptEmotions)others.body.append(el('p','This only works when “Mark feelings and who is speaking” is on under Connection. That is how Readalong knows who is talking.','ra-muted'));
+    assignmentsCard.append(others.details);
     function addMember(key:string,name?:string){
       if(!rows.some(r=>r.key===key) && rows.length>=500){notice('The cast can hold up to 500 people.',true);return}
       addedCast.add(key);if(name)addedNames.set(key,name);

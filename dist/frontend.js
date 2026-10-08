@@ -117,6 +117,7 @@ var DEFAULTS = {
   useEmotions: true,
   promptPronunciations: true,
   personaName: "",
+  npcVoice: "",
   inheritVoices: true,
   widgetMinimized: false,
   widgetPosition: null,
@@ -158,6 +159,7 @@ function normalizeSettings(raw) {
     model: str(r.model, DEFAULTS.model),
     voice: str(r.voice, DEFAULTS.voice),
     narratorVoice: str(r.narratorVoice, ""),
+    npcVoice: str(r.npcVoice, ""),
     localUrl: str(r.localUrl, DEFAULTS.localUrl, 500),
     enabled: typeof r.enabled === "boolean" ? r.enabled : DEFAULTS.enabled,
     follow: r.follow === true,
@@ -995,14 +997,28 @@ function createNativeTtsClient(transport = fetch) {
 // src/playback-plan.ts
 var MAX_PASSAGE_CHARS = 3000;
 var MAX_NATIVE_PASSAGE_CHARS = 12000;
+var firstName = (name) => name.split("||")[0].trim().toLowerCase();
+function isUnvoicedExtra(speaker, settings, context) {
+  const name = speaker.trim().toLowerCase();
+  if (!name || name === "narrator" || settings.assignments[`name:${name}`])
+    return false;
+  if (context.mainSpeaker && firstName(context.mainSpeaker) === name)
+    return false;
+  if (context.characters.some((c) => firstName(c.name) === name || c.name.trim().toLowerCase() === name))
+    return false;
+  return true;
+}
 function planSpeech(segments, settings, context) {
   const passages = [];
   let previousKey = "";
   for (const source of segments) {
     let segment = source;
-    const characterId = speakerCharacterId(segment.speaker, context.characters, context.characterId);
-    const assignment = selectVoice(settings, segment, characterId);
     const narrator = segment.speaker.trim().toLowerCase() === "narrator";
+    const npc = !!settings.npcVoice && !narrator && isUnvoicedExtra(segment.speaker, settings, context);
+    const characterId = npc ? undefined : speakerCharacterId(segment.speaker, context.characters, context.characterId);
+    const assignment = selectVoice(settings, segment, characterId);
+    if (npc)
+      assignment.voice = settings.npcVoice;
     const explicit = settings.assignments[`name:${segment.speaker.toLowerCase()}`]?.voice || !narrator && characterId && settings.assignments[`id:${characterId}`]?.voice;
     let snapshot = { ...settings, assignments: {}, narratorVoice: "", voice: assignment.voice };
     if (settings.provider === "lumiverse" && settings.inheritVoices && !(narrator ? settings.narratorVoice : explicit)) {
@@ -2210,6 +2226,7 @@ function setup(ctx) {
         characters,
         characterId: currentMessage.characterId,
         connections: nativeConnections,
+        mainSpeaker: message.name,
         pronunciations: await refreshPronunciations(chatId, options.restoreOnly ? undefined : message.id)
       };
       let rules;
@@ -2344,7 +2361,7 @@ function setup(ctx) {
     if (settings.provider !== "browser")
       audioPlayer.unlock();
     const segment = { text: sample?.text ?? "The door was open. I took a breath, and stepped into the light.", speaker: "Preview", emotion: assignment?.emotion ?? "neutral", delivery: assignment?.delivery ?? "normal" };
-    const snapshot = normalizeSettings({ ...settings, voice, narratorVoice: "", assignments: {}, inheritVoices: false });
+    const snapshot = normalizeSettings({ ...settings, voice, narratorVoice: "", npcVoice: "", assignments: {}, inheritVoices: false });
     currentPassages = planSpeech([segment], snapshot, { characters: [], pronunciations: sample?.entries });
     currentSegments = [segment];
     position = 0;
@@ -3077,7 +3094,7 @@ function setup(ctx) {
     }
     for (const row of rows) {
       const saved = settings.assignments[row.key], known = sayingFor(baseName(row.name));
-      const summary = [el("strong", row.you ? `You (${row.name})` : baseName(row.name)), el("span", saved?.voice || "Main voice")];
+      const summary = [el("strong", row.you ? `You (${row.name})` : baseName(row.name)), el("span", saved?.voice || "No voice yet")];
       if (known)
         summary.push(el("span", `said “${known.spokenAs}”`));
       if (!saved && !known && !row.you)
@@ -3097,6 +3114,33 @@ function setup(ctx) {
       assignmentsCard.append(entry.details);
       castForm(entry.body, row.key, row.name);
     }
+    const others = disclosure([el("strong", "Everyone else"), el("span", settings.npcVoice || "Same as the main character")], openCast.has("others"));
+    others.details.addEventListener("toggle", () => {
+      if (others.details.isConnected) {
+        if (others.details.open)
+          openCast.add("others");
+        else
+          openCast.delete("others");
+      }
+    });
+    const othersListen = withIcon(button("Listen", () => safe(() => preview(settings.npcVoice || settings.voice))), "speaker");
+    othersListen.disabled = !settings.enabled;
+    const othersNames = [...voiceNames()];
+    if (settings.npcVoice && !othersNames.includes(settings.npcVoice))
+      othersNames.unshift(settings.npcVoice);
+    const othersRow = el("div", "", "ra-row ra-end");
+    othersRow.append(field("Voice", select([{ value: "", label: "Same as the main character" }, ...othersNames.map((name) => ({ value: name, label: name }))], settings.npcVoice, (v) => {
+      settings.npcVoice = v;
+      safe(async () => {
+        await saveSettings();
+        renderAssignments();
+        notice(v ? "Voice saved for everyone else. Audio you already have keeps the old sound." : "Everyone else now sounds like the main character.");
+      });
+    })), othersListen);
+    others.body.append(othersRow, el("p", "For side characters who speak but have no voice of their own yet. Give someone their own row above to make them sound different.", "ra-muted"));
+    if (!settings.promptEmotions)
+      others.body.append(el("p", "This only works when “Mark feelings and who is speaking” is on under Connection. That is how Readalong knows who is talking.", "ra-muted"));
+    assignmentsCard.append(others.details);
     function addMember(key, name) {
       if (!rows.some((r) => r.key === key) && rows.length >= 500) {
         notice("The cast can hold up to 500 people.", true);

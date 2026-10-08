@@ -98,6 +98,8 @@ Play, Pause, Resume, Replay, minimizing and loading saved audio never authorize 
 
 ## Character voices
 
+**Everyone else** in the **Cast** tab sets one voice for side characters who speak with a `[speaker:Name]` cue but have no voice of their own, are not the reply’s own character, and are not in your character library. Left on **Same as the main character**, they keep borrowing that character’s voice as before. Give a side character their own cast row to make them sound different.
+
 Each cast member has a separate expandable row. Under **Cast → Add someone**, select **Character from your library** and click **Add character voice**, or enter a **Speaker name in the story** and click **Add speaker voice**. Open the row, choose its voice, preview it while Readalong is on, and click **Save voice**. Repeat for the rest of your cast. Adding or saving cast voices does not synthesize speech; **Listen** does. Remove one assignment with **Remove cast voice** without changing the others.
 
 Library assignments are tied to character IDs and survive chat changes. Named assignments are matched case-insensitively to the exact speaker name; their original capitalization is kept for display. Up to 500 assignments can be saved per user. The character editor still has a **Readalong voice** tab. Choose a separate narrator voice so the switch is audible.
