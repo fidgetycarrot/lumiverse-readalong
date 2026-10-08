@@ -2,7 +2,12 @@ import type { SpindleAPI, ChatMessageDTO } from 'lumiverse-spindle-types';
 import { DEFAULTS, CUE_PATTERN, HIDE_RULE_NAME, EMOTION_INSTRUCTION, needsPcm, normalizeSettings, speechRequest, readVoiceRef, type CharacterInfo, type Settings, type SpeechSegment, type SpeechModel } from './shared';
 import { MAX_PASSAGE_CHARS } from './playback-plan';
 import { isHiddenJsonError, providerError, redactSecrets } from './provider-errors';
+import { PreparationLedger } from './preparation-ledger';
 declare const spindle: SpindleAPI;
+const preparationLedger=new PreparationLedger({
+  read:async userId=>await spindle.userStorage.exists('preparations.json',userId)?spindle.userStorage.read('preparations.json',userId):undefined,
+  write:(userId,value)=>spindle.userStorage.write('preparations.json',value,userId),
+});
 const settingsByUser = new Map<string, Settings>();
 const loadingByUser = new Map<string, Promise<Settings>>();
 const busy = new Map<string, number>();
@@ -129,7 +134,11 @@ spindle.onFrontendMessage(async (payload, userId, sessionId) => {
     if (p.type === 'init') {
       let cueStatus = '';
       try { await ensureHideRule(userId) } catch(e) { cueStatus = e instanceof Error ? e.message : 'Could not install the display rule.' }
-      reply({ settings, hasKey: await spindle.enclave.has('openrouter_key', userId), cueStatus, permissions: await spindle.permissions.getGranted() });
+      reply({ settings, userId, hasKey: await spindle.enclave.has('openrouter_key', userId), cueStatus, permissions: await spindle.permissions.getGranted() });
+    } else if (p.type === 'claim_preparation') {
+      if(!settings.enabled)throw new Error('Readalong is off. Turn it on to request speech.');
+      if(typeof p.key!=='string')throw new Error('Invalid preparation identity.');
+      reply({allowed:await preparationLedger.claim(userId,p.key,p.manual===true)});
     } else if (p.type === 'save') {
       const saved = await save(userId,p.settings);
       for (const [id,failed] of failedSpeech) if (id.startsWith(`${userId}:`) && (saved.provider !== failed.settings.provider || saved.model !== failed.settings.model || saved.localUrl !== failed.settings.localUrl)) failedSpeech.delete(id);

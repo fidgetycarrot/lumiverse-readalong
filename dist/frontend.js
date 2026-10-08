@@ -159,6 +159,21 @@ function speechInput(segment, assignment, supportsTags) {
 function needsPcm(settings) {
   return settings.provider === "openrouter" && /^google\/gemini-.*tts/i.test(settings.model);
 }
+function speechRequest(settings, segment, characterId) {
+  const assignment = selectVoice(settings, segment, characterId);
+  const openrouter = settings.provider === "openrouter";
+  const gemini38 = openrouter && /^google\/gemini-3\.8.*tts/.test(settings.model);
+  const legacyTags = openrouter && /^google\/gemini-3\.1.*tts/.test(settings.model);
+  const body = { model: settings.model, voice: assignment.voice, input: speechInput(segment, assignment, legacyTags), response_format: needsPcm(settings) ? "pcm" : "mp3" };
+  if (gemini38) {
+    const emotions = { happy: "happy and cheerful", sad: "sad", angry: "angry", worried: "worried", curious: "curious", excited: "excited", sarcastic: "sarcastic", tender: "warm and tender", afraid: "afraid" };
+    const deliveries = { whispers: "whispering", shouts: "shouting", softly: "soft-spoken", slowly: "slow and deliberate", laughs: "with a light laugh", sighs: "with a sigh" };
+    const style = [emotions[assignment.emotion], deliveries[assignment.delivery]].filter(Boolean).join(", ");
+    if (style)
+      body.provider = { options: { "google-ai-studio": { speech_metadata: { style } } } };
+  }
+  return body;
+}
 
 // src/highlight.ts
 function canon(c) {
@@ -821,6 +836,113 @@ function estimatedSentenceIndex(passage, fraction) {
   return weights.length - 1;
 }
 
+// src/audio-cache.ts
+async function preparationHash(value) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(value)));
+  return Array.from(new Uint8Array(digest), (n) => n.toString(16).padStart(2, "0")).join("");
+}
+function validClips(value) {
+  return Array.isArray(value) && value.length > 0 && value.every((c) => c?.blob instanceof Blob && c.blob.size > 0 && Number.isFinite(c.duration) && c.duration > 0);
+}
+
+class AudioCache {
+  factory;
+  name;
+  maxBytes;
+  maxEntries;
+  constructor(factory = globalThis.indexedDB, name = "lumiverse-readalong-audio-v1", maxBytes = 256 * 1024 * 1024, maxEntries = 3) {
+    this.factory = factory;
+    this.name = name;
+    this.maxBytes = maxBytes;
+    this.maxEntries = maxEntries;
+  }
+  async open() {
+    if (!this.factory)
+      throw new Error("Saved audio is unavailable in this browser.");
+    return new Promise((resolve, reject) => {
+      const request = this.factory.open(this.name, 1);
+      let settled = false;
+      const timer = setTimeout(() => {
+        settled = true;
+        reject(new Error("Saved audio storage did not respond."));
+      }, 1e4);
+      request.onupgradeneeded = () => {
+        const store = request.result.createObjectStore("audio", { keyPath: "id" });
+        store.createIndex("user", "userId");
+      };
+      request.onsuccess = () => {
+        clearTimeout(timer);
+        if (settled)
+          request.result.close();
+        else {
+          settled = true;
+          resolve(request.result);
+        }
+      };
+      request.onerror = () => {
+        clearTimeout(timer);
+        settled = true;
+        reject(request.error ?? new Error("Saved audio storage failed."));
+      };
+      request.onblocked = () => {
+        clearTimeout(timer);
+        settled = true;
+        reject(new Error("Saved audio storage is blocked."));
+      };
+    });
+  }
+  async get(userId, key) {
+    if (!userId)
+      return;
+    const db = await this.open();
+    try {
+      return await new Promise((resolve, reject) => {
+        const request = db.transaction("audio", "readonly").objectStore("audio").get(`${userId}:${key}`);
+        request.onsuccess = () => {
+          const record = request.result;
+          resolve(record?.userId === userId && validClips(record.clips) ? record.clips : undefined);
+        };
+        request.onerror = () => reject(request.error ?? new Error("Could not read saved audio."));
+      });
+    } finally {
+      db.close();
+    }
+  }
+  async put(userId, key, clips) {
+    if (!userId || !validClips(clips))
+      return false;
+    const bytes = clips.reduce((n, c) => n + c.blob.size, 0);
+    if (bytes > this.maxBytes)
+      return false;
+    const db = await this.open();
+    try {
+      return await new Promise((resolve, reject) => {
+        const tx = db.transaction("audio", "readwrite"), store = tx.objectStore("audio");
+        tx.oncomplete = () => resolve(true);
+        tx.onabort = () => reject(tx.error ?? new Error("Could not save audio."));
+        const request = store.index("user").getAll(userId);
+        request.onsuccess = () => {
+          const rows = request.result;
+          const record = { id: `${userId}:${key}`, userId, clips, bytes, at: Math.max(Date.now(), ...rows.map((r) => r.at + 1)) };
+          const older = rows.filter((r) => r.id !== record.id).sort((a, b) => b.at - a.at);
+          let total = bytes, count = 1;
+          store.put(record);
+          for (const row of older) {
+            if (count >= this.maxEntries || total + row.bytes > this.maxBytes)
+              store.delete(row.id);
+            else {
+              total += row.bytes;
+              count++;
+            }
+          }
+        };
+      });
+    } finally {
+      db.close();
+    }
+  }
+}
+
 // src/frontend.ts
 var STYLE = `
 ::highlight(lumiverse-readalong){background:rgba(245,190,80,.30);color:inherit;text-decoration:underline;text-decoration-color:#e7b24c;text-decoration-thickness:2px;}
@@ -908,8 +1030,11 @@ function setup(ctx) {
   let messages = [], selectedId = "";
   let playbackId = 0, playing = false, paused = false, currentMessage = null;
   let phase = "idle";
+  let checkingSavedAudio = false;
   let utterance = null;
   const audioPlayer = new PreparedPlayer;
+  const audioCache = new AudioCache;
+  let cacheUserId = "";
   const automaticPreparations = new Set;
   let saveQueue = Promise.resolve(), saveVersion = 0;
   let currentPassages = [], preparedCount = 0, currentPassage = 0;
@@ -1029,6 +1154,7 @@ function setup(ctx) {
     playing = false;
     paused = false;
     phase = "idle";
+    checkingSavedAudio = false;
     stopClock();
     readingAbort?.abort();
     readingAbort = null;
@@ -1109,7 +1235,7 @@ function setup(ctx) {
     const caption = el("p", phase === "playing" || phase === "paused" ? `${currentSegments[position]?.speaker || "Voice"} · ${currentPassages[currentPassage]?.voice || ""}` : status.textContent ?? "Choose a message.", "ra-caption");
     caption.title = currentSegments[position]?.text ?? caption.textContent ?? "";
     const controls = el("div", "", "ra-row");
-    const play = button(!settings.enabled ? "Turn on" : phase === "preparing" ? "Preparing…" : phase === "idle" ? "Play latest" : phase === "paused" ? "Resume" : phase === "playing" ? "Pause" : phase === "finished" ? "Replay" : "Play", () => safe(settings.enabled ? playOrPause : () => setEnabled(true)), true);
+    const play = button(!settings.enabled ? "Turn on" : phase === "preparing" ? checkingSavedAudio ? "Loading…" : "Preparing…" : phase === "idle" ? "Play latest" : phase === "paused" ? "Resume" : phase === "playing" ? "Pause" : phase === "finished" ? "Replay" : "Play", () => safe(settings.enabled ? playOrPause : () => setEnabled(true)), true);
     play.disabled = !ready || settings.enabled && (phase === "preparing" || phase === "idle" && !selectedId);
     controls.append(play);
     const stopButton = button("Stop", () => stop());
@@ -1318,7 +1444,7 @@ function setup(ctx) {
       nativeRequests.delete(controller);
     }
   }
-  async function autoPrepareMessage(message, force = false) {
+  async function autoPrepareMessage(message, force = false, restoreOnly = false) {
     if (!initialized || !settings.enabled || disposed || message.isUser)
       return;
     const key = JSON.stringify([ctx.getActiveChat().chatId, message.id, message.content]);
@@ -1327,14 +1453,14 @@ function setup(ctx) {
     automaticPreparations.add(key);
     if (automaticPreparations.size > 20)
       automaticPreparations.delete(automaticPreparations.values().next().value);
-    await startMessage(message);
+    await startMessage(message, { automatic: true, restoreOnly });
   }
-  async function prepareLatest(force = false) {
+  async function prepareLatest(force = false, restoreOnly = false) {
     if (!settings.enabled || !initialized)
       return;
     const latest = messages.at(-1);
     if (latest)
-      await autoPrepareMessage(latest, force);
+      await autoPrepareMessage(latest, force, restoreOnly);
     else
       notice("Readalong is on. New assistant replies will prepare automatically.");
   }
@@ -1352,7 +1478,7 @@ function setup(ctx) {
       await prepareLatest(true);
     }
   }
-  async function startMessage(message) {
+  async function startMessage(message, options = {}) {
     if (!settings.enabled)
       throw new Error("Readalong is off. Turn it on to prepare audio.");
     stop(false);
@@ -1361,9 +1487,10 @@ function setup(ctx) {
     const signal = readingAbort.signal;
     currentMessage = { ...message, characterId: message.characterId ?? speakerCharacterId(message.name, characters, ctx.getActiveChat().characterId ?? undefined) };
     phase = "preparing";
+    checkingSavedAudio = true;
     preparedCount = 0;
     showWidget();
-    notice("Preparing the whole message…");
+    notice("Looking for saved audio. No speech requested yet.");
     renderPlayer();
     try {
       const snapshot = normalizeSettings(settings);
@@ -1388,20 +1515,63 @@ function setup(ctx) {
         notice("There is no readable text in this message.");
         return;
       }
+      let restored = false, saved = true;
       if (snapshot.provider !== "browser") {
-        const clips = await prepareAll(currentPassages, async (p, _index, requestSignal) => {
-          const data = await prepareSpeech(p.segment, p.settings, requestSignal);
-          requestSignal.throwIfAborted();
-          const clip = await prepareClip(data, requestSignal);
-          requestSignal.throwIfAborted();
-          return clip;
-        }, signal, (count) => {
-          if (token === playbackId) {
-            preparedCount = count;
-            notice(`Preparing the whole message · ${count} of ${currentPassages.length} passages ready…`);
-            renderPlayer();
+        const messageKey = await preparationHash([ctx.getActiveChat().chatId, message.id, message.content]);
+        const requests = currentPassages.map((p) => {
+          const connection = activeNative(p.settings.connectionId);
+          return p.settings.provider === "lumiverse" && connection ? nativeSpeechRequest(connection, p.settings, p.segment) : [p.settings.provider, p.settings.localUrl, speechRequest(p.settings, p.segment)];
+        });
+        const audioKey = await preparationHash([messageKey, requests]);
+        let clips = undefined;
+        try {
+          clips = await audioCache.get(cacheUserId, audioKey);
+        } catch {}
+        if (token !== playbackId)
+          return;
+        if (clips?.length !== currentPassages.length)
+          clips = undefined;
+        if (clips) {
+          restored = true;
+          preparedCount = currentPassages.length;
+        } else {
+          if (options.restoreOnly) {
+            stop(false);
+            notice("No saved audio for this message. Refresh did not request speech. New replies prepare automatically; Prepare message can generate this one.");
+            return;
           }
-        }, snapshot.provider === "lumiverse" ? 3 : 2);
+          const claim = await rpc("claim_preparation", { key: messageKey, manual: !options.automatic });
+          if (token !== playbackId)
+            return;
+          if (!claim?.allowed) {
+            stop(false);
+            notice("This message was already prepared or attempted. No speech was requested again. Choose Prepare message to retry; speech charges may apply.");
+            return;
+          }
+          checkingSavedAudio = false;
+          notice("Preparing the whole message…");
+          renderPlayer();
+          clips = await prepareAll(currentPassages, async (p, _index, requestSignal) => {
+            const data = await prepareSpeech(p.segment, p.settings, requestSignal);
+            requestSignal.throwIfAborted();
+            const clip = await prepareClip(data, requestSignal);
+            requestSignal.throwIfAborted();
+            return clip;
+          }, signal, (count) => {
+            if (token === playbackId) {
+              preparedCount = count;
+              notice(`Preparing the whole message · ${count} of ${currentPassages.length} passages ready…`);
+              renderPlayer();
+            }
+          }, snapshot.provider === "lumiverse" ? 3 : 2);
+          if (token !== playbackId)
+            return;
+          try {
+            saved = await audioCache.put(cacheUserId, audioKey, clips);
+          } catch {
+            saved = false;
+          }
+        }
         if (token !== playbackId)
           return;
         audioPlayer.load(clips);
@@ -1411,7 +1581,8 @@ function setup(ctx) {
       if (token !== playbackId)
         return;
       phase = "ready";
-      notice("The whole message is ready. Press Play.");
+      checkingSavedAudio = false;
+      notice(restored ? "Saved audio restored. No speech request or new charge. Press Play." : saved ? "The whole message is ready. Press Play." : "Audio is ready, but could not be saved for refresh. It will not regenerate automatically. Press Play.");
       renderPlayer();
     } catch (e) {
       if (token === playbackId) {
@@ -1562,10 +1733,10 @@ function setup(ctx) {
       if (read)
         read.disabled = !settings.enabled;
     }
-    player.replaceChildren(el("h3", phase === "preparing" ? "Preparing the whole message" : phase === "ready" ? "Ready to play" : phase === "playing" || phase === "paused" ? "Now reading" : "Listen to a passage"));
+    player.replaceChildren(el("h3", phase === "preparing" ? checkingSavedAudio ? "Looking for saved audio" : "Preparing the whole message" : phase === "ready" ? "Ready to play" : phase === "playing" || phase === "paused" ? "Now reading" : "Listen to a passage"));
     player.append(toggle("Readalong on · prepare replies automatically", settings.enabled, (v) => {
       safe(() => setEnabled(v));
-    }), el("p", "When on, the latest reply in this chat and new assistant replies are prepared automatically. Speech providers may charge for preparation. Audio waits for you to press Play. Turn off to stop new requests.", "ra-muted"));
+    }), el("p", "When on, new replies prepare automatically and may incur speech charges. Refresh restores saved audio without generating speech. Turning on prepares the latest reply once. Audio waits for Play. Turn off to stop new requests.", "ra-muted"));
     const row = el("div", "", "ra-row");
     if (phase !== "idle") {
       const play = button(phase === "paused" ? "Resume" : phase === "playing" ? "Pause" : phase === "finished" ? "Replay" : "Play", () => safe(playOrPause), true);
@@ -1605,7 +1776,7 @@ function setup(ctx) {
       if (currentMessage)
         player.append(el("p", "The sentence marker estimates your place within continuous audio. Pausing keeps it in place.", "ra-muted"));
     } else
-      player.append(el("p", settings.enabled ? "New replies prepare automatically. You can also choose an older message to prepare." : "Readalong is off. Turn it on when you want prepared speech.", "ra-muted"));
+      player.append(el("p", settings.enabled ? "Prepare message reuses matching saved audio. If none is available, it generates speech and charges may apply." : "Readalong is off. Turn it on when you want prepared speech.", "ra-muted"));
     player.append(toggle("Follow the spoken passage as it moves down the page", settings.follow, (v) => {
       settings.follow = v;
       safe(saveSettings);
@@ -1902,10 +2073,10 @@ function setup(ctx) {
     for (const handle of bubbleHandles.values())
       ctx.dom.uninject(handle);
     bubbleHandles.clear();
-    notice(settings.enabled ? "Preparing this chat’s latest reply…" : "Readalong is off.");
+    notice(settings.enabled ? "Looking for saved audio…" : "Readalong is off.");
     safe(async () => {
       await refreshMessages();
-      await prepareLatest();
+      await prepareLatest(false, true);
     });
   });
   for (const event of ["MESSAGE_EDITED", "MESSAGE_SWIPED", "SWIPE_EDITED", "MESSAGE_DELETED"])
@@ -1970,6 +2141,7 @@ function setup(ctx) {
     if (disposed)
       return;
     settings = normalizeSettings(r.settings);
+    cacheUserId = typeof r.userId === "string" ? r.userId : "";
     hasKey = r.hasKey;
     permissions = r.permissions;
     ready = true;
@@ -2007,7 +2179,7 @@ function setup(ctx) {
       refreshCatalog().catch(() => {});
     if (permissions.includes("chat_mutation")) {
       await refreshMessages();
-      await prepareLatest();
+      await prepareLatest(false, true);
     }
     if (!settings.enabled)
       notice("Readalong is off. No speech requests will be started.");

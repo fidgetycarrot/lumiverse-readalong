@@ -55,6 +55,15 @@ describe('backend provider and session integration',()=>{
     const r=await call('init');expect(rules).toHaveLength(1);expect(rules[0].target).toBe('display');expect(r.p.data.cueStatus).toBe('');
     await call('init');expect(rules).toHaveLength(1);
   });
+  test('init identifies the authenticated cache owner and a persisted claim survives reinitialization',async()=>{
+    expect((await call('init')).p.data.userId).toBe('one');
+    const before=requests.length,key='a'.repeat(64);
+    expect((await call('claim_preparation',{key})).p.data.allowed).toBe(true);
+    await call('init');expect((await call('claim_preparation',{key},'one','tab2')).p.data.allowed).toBe(false);
+    expect((await call('claim_preparation',{key},'two')).p.data.allowed).toBe(true);
+    expect((await call('claim_preparation',{key,manual:true})).p.data.allowed).toBe(true);
+    expect(requests.length).toBe(before);expect(JSON.parse(files.get('onepreparations.json')!)).toContain(key);
+  });
   test('keys never enter settings or replies and are isolated by user',async()=>{
     await call('save_key',{key:'sk-or-v1-secret'});
     expect((await call('init')).p.data.hasKey).toBe(true);
@@ -99,6 +108,7 @@ describe('backend provider and session integration',()=>{
     await call('save',{settings:{...DEFAULTS,enabled:false,promptEmotions:true}});const before=requests.length;
     expect((await call('speech',{segment:{text:'Do not synthesize.'},previewSettings:{...DEFAULTS,enabled:true}})).p.error).toContain('Readalong is off');
     expect((await call('diagnose_speech')).p.error).toContain('Readalong is off');
+    expect((await call('claim_preparation',{key:'b'.repeat(64)})).p.error).toContain('Readalong is off');
     const messages=[{role:'user',content:'Hello'}];expect(await interceptor(messages,{userId:'one'})).toEqual(messages);expect(requests.length).toBe(before);
     await call('save',{settings:DEFAULTS});
   });

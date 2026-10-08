@@ -134,7 +134,41 @@ function isHiddenJsonError(error) {
   return error instanceof Error && /only serves audio data.*application\/(?:json|[\w.-]+\+json)/i.test(error.message);
 }
 
+// src/preparation-ledger.ts
+class PreparationLedger {
+  storage;
+  chains = new Map;
+  constructor(storage) {
+    this.storage = storage;
+  }
+  async claim(userId, key, manual = false) {
+    if (!/^[a-f0-9]{64}$/.test(key))
+      throw new Error("Invalid preparation identity.");
+    const work = (this.chains.get(userId) ?? Promise.resolve()).catch(() => {}).then(async () => {
+      const raw = await this.storage.read(userId);
+      const keys = raw === undefined ? [] : JSON.parse(raw);
+      if (!Array.isArray(keys) || keys.some((k) => typeof k !== "string" || !/^[a-f0-9]{64}$/.test(k)))
+        throw new Error("Could not read the preparation history. No speech was requested.");
+      if (keys.includes(key) && !manual)
+        return false;
+      await this.storage.write(userId, JSON.stringify([...keys.filter((k) => k !== key), key].slice(-2000)));
+      return true;
+    });
+    this.chains.set(userId, work);
+    try {
+      return await work;
+    } finally {
+      if (this.chains.get(userId) === work)
+        this.chains.delete(userId);
+    }
+  }
+}
+
 // src/backend.ts
+var preparationLedger = new PreparationLedger({
+  read: async (userId) => await spindle.userStorage.exists("preparations.json", userId) ? spindle.userStorage.read("preparations.json", userId) : undefined,
+  write: (userId, value) => spindle.userStorage.write("preparations.json", value, userId)
+});
 var settingsByUser = new Map;
 var loadingByUser = new Map;
 var busy = new Map;
@@ -310,7 +344,13 @@ spindle.onFrontendMessage(async (payload, userId, sessionId) => {
       } catch (e) {
         cueStatus = e instanceof Error ? e.message : "Could not install the display rule.";
       }
-      reply({ settings, hasKey: await spindle.enclave.has("openrouter_key", userId), cueStatus, permissions: await spindle.permissions.getGranted() });
+      reply({ settings, userId, hasKey: await spindle.enclave.has("openrouter_key", userId), cueStatus, permissions: await spindle.permissions.getGranted() });
+    } else if (p.type === "claim_preparation") {
+      if (!settings.enabled)
+        throw new Error("Readalong is off. Turn it on to request speech.");
+      if (typeof p.key !== "string")
+        throw new Error("Invalid preparation identity.");
+      reply({ allowed: await preparationLedger.claim(userId, p.key, p.manual === true) });
     } else if (p.type === "save") {
       const saved = await save(userId, p.settings);
       for (const [id, failed] of failedSpeech)
