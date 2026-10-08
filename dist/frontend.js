@@ -1047,6 +1047,21 @@ class AudioCache {
   }
 }
 
+// src/widget-layout.ts
+var PAD = 12;
+function widgetDimensions(viewport, minimized, touch) {
+  const availableWidth = Math.max(1, viewport.width - PAD * 2);
+  const width = Math.min(minimized && !touch ? 240 : 320, availableWidth);
+  const narrow = minimized && width < 220;
+  const height = Math.min(minimized ? narrow ? 112 : touch ? 64 : 56 : width < 280 ? 240 : 184, Math.max(1, viewport.height - PAD * 2));
+  return { width, height, narrow };
+}
+function widgetPosition(viewport, size, preferred) {
+  const maxX = Math.max(0, viewport.width - size.width), maxY = Math.max(0, viewport.height - size.height);
+  const padX = Math.min(PAD, maxX / 2), padY = Math.min(PAD, maxY / 2);
+  return { x: Math.max(padX, Math.min(preferred?.x ?? viewport.width - size.width - 24, maxX - padX)), y: Math.max(padY, Math.min(preferred?.y ?? viewport.height - size.height - 36, maxY - padY)) };
+}
+
 // src/frontend.ts
 var STYLE = `
 ::highlight(lumiverse-readalong){background:rgba(245,190,80,.30);color:inherit;text-decoration:underline;text-decoration-color:#e7b24c;text-decoration-thickness:2px;}
@@ -1069,6 +1084,7 @@ var STYLE = `
 .ra-bubble{display:flex;gap:8px;align-items:center;padding:5px 0;font-size:12px}.ra-bubble button{padding:5px 9px;font-size:12px;}.ra details>summary{cursor:pointer;font-size:13px;margin:8px 0;}
 .ra-mini{font:13px/1.4 system-ui,sans-serif;color:var(--lumiverse-text,#eee);padding:12px;background:var(--lumiverse-bg,#202026);height:100%;box-sizing:border-box;}
 .ra-mini .ra-row{display:flex;gap:7px;align-items:center}.ra-mini .ra-caption{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin:7px 0;color:var(--lumiverse-text-muted,#aaa);}
+.ra-mini .ra-widget-heading{flex:1;min-width:0;display:flex;flex-direction:column;}.ra-mini .ra-widget-heading strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}.ra-mini .ra-controls{flex-wrap:wrap;}
 .ra-mini button{font:inherit;border:1px solid var(--lumiverse-border,#555);border-radius:7px;background:var(--lumiverse-fill,#292932);color:inherit;padding:6px 10px;cursor:pointer;}
 .ra-mini button:disabled{opacity:.5;cursor:default}.ra-mini .ra-primary{background:var(--lumiverse-primary,#ac8b4f);color:var(--lumiverse-on-primary,#fff);}
 .ra-mini .ra-widget-tools{margin-left:auto;gap:5px}.ra-mini .ra-icon{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;padding:0;flex-shrink:0;}
@@ -1078,6 +1094,8 @@ var STYLE = `
 .ra-collapsed .ra-compact-info{flex:1;min-width:0;display:flex;flex-direction:column;line-height:1.25;}
 .ra-collapsed .ra-compact-info strong{font-size:11px}.ra-collapsed .ra-compact-status{font-size:10px;color:var(--lumiverse-text-muted,#aaa);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .ra-collapsed .ra-power{font-size:11px;padding:4px;flex-shrink:0;}.ra-collapsed progress{position:absolute;bottom:3px;left:8px;width:calc(100% - 16px);height:3px;pointer-events:none;}
+.ra-mini.ra-touch button{min-width:44px;min-height:44px;touch-action:manipulation;}.ra-mini.ra-touch .ra-icon,.ra-mini.ra-touch .ra-compact-play{width:44px;height:44px;}
+.ra-mini.ra-collapsed.ra-narrow{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;}.ra-collapsed.ra-narrow .ra-compact-info{display:none;}.ra-mini.ra-collapsed.ra-narrow button{width:100%;min-width:0;min-height:44px;}
 `;
 function el(tag, text = "", className = "") {
   const node = document.createElement(tag);
@@ -1306,9 +1324,8 @@ function setup(ctx) {
       return;
     try {
       if (!widget && typeof ctx.ui.createFloatWidget === "function") {
-        const { width, height } = widgetDimensions();
-        const viewport = widgetViewport(), saved = settings.widgetPosition;
-        const initialPosition = { x: Math.max(12, Math.min(saved?.x ?? viewport.width - width - 24, viewport.width - width - 12)), y: Math.max(12, Math.min(saved?.y ?? viewport.height - height - 36, viewport.height - height - 12)) };
+        const { width, height } = widgetDimensions2();
+        const initialPosition = widgetPosition(widgetViewport(), { width, height }, settings.widgetPosition);
         widget = ctx.ui.createFloatWidget({ width, height, initialPosition, snapToEdge: true, tooltip: "Readalong · drag to move" });
         widgetSize = `${width}:${height}`;
         widgetDragCleanup = widget.onDragEnd((pos) => {
@@ -1351,29 +1368,55 @@ function setup(ctx) {
   function widgetViewport() {
     return ctx.ui.geometry?.layoutViewportSize() ?? { width: window.innerWidth, height: window.innerHeight };
   }
-  function widgetDimensions() {
-    const viewport = widgetViewport();
-    return { width: Math.min(settings.widgetMinimized ? 240 : 320, Math.max(1, viewport.width - 24)), height: Math.min(settings.widgetMinimized ? 56 : 184, Math.max(1, viewport.height - 24)) };
+  function widgetTouch() {
+    return window.innerWidth <= 600 || window.matchMedia("(pointer: coarse)").matches;
+  }
+  function widgetDimensions2() {
+    return widgetDimensions(widgetViewport(), settings.widgetMinimized, widgetTouch());
+  }
+  function fitWidgetPosition(preferred = settings.widgetPosition ?? widget?.getPosition()) {
+    if (!widget)
+      return;
+    const position = widgetPosition(widgetViewport(), widgetDimensions2(), preferred), current = widget.getPosition();
+    if (current.x !== position.x || current.y !== position.y)
+      widget.moveTo(position.x, position.y);
   }
   async function setWidgetMinimized(minimized) {
+    const preferred = settings.widgetPosition ?? widget?.getPosition();
     settings.widgetMinimized = minimized;
     renderWidget();
+    fitWidgetPosition(preferred);
     await saveSettings();
   }
+  const resizeWidget = () => {
+    if (disposed || !widget)
+      return;
+    const preferred = settings.widgetPosition ?? widget.getPosition();
+    renderWidget();
+    fitWidgetPosition(preferred);
+  };
+  window.addEventListener("resize", resizeWidget);
+  cleanups.push(() => window.removeEventListener("resize", resizeWidget));
+  const pointerMedia = window.matchMedia("(pointer: coarse)");
+  pointerMedia.addEventListener("change", resizeWidget);
+  cleanups.push(() => pointerMedia.removeEventListener("change", resizeWidget));
   function renderWidget() {
     if (!widget || disposed)
       return;
-    const { width, height } = widgetDimensions(), size = `${width}:${height}`;
+    const { width, height } = widgetDimensions2(), size = `${width}:${height}`;
     if (widgetSize !== size) {
       widget.setSize(width, height);
       widgetSize = size;
     }
     widget.root.classList.toggle("ra-collapsed", settings.widgetMinimized);
-    const header = el("div", "", "ra-row");
-    header.append(el("strong", "Readalong"));
+    widget.root.classList.toggle("ra-touch", widgetTouch());
+    widget.root.classList.toggle("ra-narrow", widgetDimensions2().narrow);
+    const header = el("div", "", "ra-row"), title = el("div", "", "ra-widget-heading");
+    title.append(el("strong", "Readalong"));
+    header.append(title);
     if (audioPlayer.duration) {
       const time = el("span", `${timeLabel(audioPlayer.elapsed)} / ${timeLabel(audioPlayer.duration)}`, "ra-time");
-      header.append(time);
+      title.append(time);
     }
     const close = button("×", () => widget?.setVisible(false));
     close.className = "ra-icon";
@@ -1386,7 +1429,7 @@ function setup(ctx) {
     resize.setAttribute("aria-expanded", String(!settings.widgetMinimized));
     const caption = el("p", phase === "playing" || phase === "paused" ? `${currentSegments[position]?.speaker || "Voice"} · ${currentPassages[currentPassage]?.voice || ""}` : status.textContent ?? "Choose a message.", "ra-caption");
     caption.title = plainText(currentSegments[position]?.text ?? caption.textContent ?? "");
-    const controls = el("div", "", "ra-row");
+    const controls = el("div", "", "ra-row ra-controls");
     const playLabel = !settings.enabled ? "Turn on" : phase === "preparing" ? checkingSavedAudio ? "Loading…" : "Preparing…" : phase === "idle" ? "Play latest" : phase === "paused" ? "Resume" : phase === "playing" ? "Pause" : phase === "finished" ? "Replay" : "Play";
     const play = button(playLabel, () => safe(settings.enabled ? playOrPause : () => setEnabled(true)), true);
     play.title = playLabel;

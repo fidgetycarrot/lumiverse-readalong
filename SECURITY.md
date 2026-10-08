@@ -1,6 +1,6 @@
 # Readalong security and privacy notes
 
-Review date: 2026-10-08. Applies to Readalong **0.2.0**. This is a source review and automated/mock verification, not an independent security certification or a guarantee against every possible compromise.
+Review date: 2026-10-08. Applies to Readalong **0.2.0–0.2.1**. The 0.2.1 update changes widget layout and placement; it retains the reviewed credential protections. This is a source review and automated/mock verification, not an independent security certification or a guarantee against every possible compromise.
 
 ## Where credentials go
 
@@ -33,7 +33,7 @@ Fresh installs start **off**. Turn on explicitly to prepare the latest unattempt
 - Reviewed frontend/backend credential flows, authenticated user scoping, native request targets, error handling, persistence, packaging and permission use.
 - Compared host behavior with the locally inspected Lumiverse source at commit `7398fa5f4fc73eaee1aaa767804312765e84ea79` and Spindle types `0.6.39`. Host behavior can change independently of this extension.
 - Automated tests cover forged-user payloads, other-user credential isolation, blank/failed replacement saves, confirmed removal, URL binding, remote HTTPS, retained legacy credentials, arbitrary secret formats in errors, native error sanitization, initial opt-in and multiple cast voices. Browser checks use synthetic passages, fake credentials and mock speech only.
-- Scanned 77 distinct historical repository blobs through 0.1.9, plus the 0.2.0 release files, for common OpenRouter/OpenAI/Google key and private-key patterns. No credential matches were found. Pattern scanning cannot identify every possible secret format; test fixtures contain deliberately fake keys.
+- Scanned 77 distinct historical repository blobs through 0.1.9, plus the 0.2.0 and 0.2.1 release files, for common OpenRouter/OpenAI/Google key and private-key patterns. No credential matches were found. Pattern scanning cannot identify every possible secret format; test fixtures contain deliberately fake keys.
 - The distributable contains source, tests, documentation, manifest and prebuilt bundles only. It excludes local settings, keys, audio caches, host databases, test harness data, `.env` files and dependency directories. Builds have no third-party runtime dependency.
 
 No real user credential or paid provider request was used for this review. Acoustic quality and real-provider performance remain separate from these checks. A reasonable release label is **public beta**, with these limits visible to testers.
