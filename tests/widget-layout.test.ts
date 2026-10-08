@@ -27,7 +27,7 @@ test('a large-screen preferred position returns after a temporary phone viewport
 });
 test('expanding near an edge keeps controls visible; minimizing restores the preferred location',()=>{
   const viewport={width:360,height:800},preferred={x:28,y:724};
-  expect(widgetPosition(viewport,widgetDimensions(viewport,false,true),preferred)).toEqual({x:28,y:604});
+  expect(widgetPosition(viewport,widgetDimensions(viewport,false,true),preferred)).toEqual({x:28,y:624});
   expect(widgetPosition(viewport,widgetDimensions(viewport,true,true),preferred)).toEqual(preferred);
 });
 test('enlarged UI layouts use a compact button grid and allow expanded controls to wrap',()=>{
