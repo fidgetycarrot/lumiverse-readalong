@@ -42,6 +42,42 @@ async function call(type:string,data:any={},user='one',session:string|null='tab1
   return outgoing.find(r=>r.p.requestId===requestId);
 }
 describe('backend provider and session integration',()=>{
+  test('completion delivery and recovery are available while on without making speech',async()=>{
+    await call('save',{settings:DEFAULTS},'completion-one');const before=requests.length;
+    listeners.get('GENERATION_STARTED')!({generationId:'complete-g1',chatId:'completion-one-chat',characterId:'mara',characterName:'Mara'},'completion-one');
+    expect((await call('latest_completion',{chatId:'completion-one-chat',since:0},'completion-one')).p.data.generating).toBe(true);
+    expect((await call('latest_completion',{chatId:'completion-one-chat',since:0},'someone-else')).p.data.generating).toBe(false);
+    await listeners.get('GENERATION_ENDED')!({generationId:'complete-g1',chatId:'completion-one-chat',messageId:'m1',content:'A completed reply.'},'completion-one');
+    const completion=(await call('latest_completion',{chatId:'completion-one-chat',since:0},'completion-one')).p.data.completion;
+    expect(completion).toMatchObject({generationId:'complete-g1',messageId:'m1',name:'Mara',characterId:'mara'});
+    expect(completion.content).toBeUndefined();expect(completion.message).toBeUndefined();
+    expect((await call('latest_completion',{chatId:'completion-one-chat',since:0},'completion-one')).p.data.generating).toBe(false);
+    expect(outgoing.find(r=>r.p.type==='new_message' && r.p.generationId==='complete-g1')?.p.autoEligible).toBe(true);
+    expect(requests.length).toBe(before);
+  });
+  test('recovery cannot expose another user or return an earlier-session completion',async()=>{
+    expect((await call('latest_completion',{chatId:'completion-one-chat',since:0,userId:'completion-one'},'someone-else')).p.data.completion).toBeNull();
+    expect((await call('latest_completion',{chatId:'completion-one-chat',since:Date.now()+1000},'completion-one')).p.data.completion).toBeNull();
+  });
+  test('replies completed while off do not become an automatic catch-up queue',async()=>{
+    await call('save',{settings:{...DEFAULTS,enabled:false}},'completion-off');
+    await listeners.get('GENERATION_ENDED')!({generationId:'off-g',chatId:'completion-off-chat',messageId:'m1',content:'Generated while off.'},'completion-off');
+    await call('save',{settings:DEFAULTS},'completion-off');
+    expect((await call('latest_completion',{chatId:'completion-off-chat',since:0},'completion-off')).p.data.completion).toBeNull();
+    expect(outgoing.find(r=>r.p.type==='new_message' && r.p.generationId==='off-g')?.p.autoEligible).toBe(false);
+  });
+  test('a successful completion without inline content reads its owned saved message',async()=>{
+    const before=requests.length;
+    await listeners.get('GENERATION_ENDED')!({generationId:'no-content-g',chatId:'completion-one-chat',messageId:'m1'},'completion-one');
+    expect(outgoing.find(r=>r.p.type==='new_message' && r.p.generationId==='no-content-g')?.p.message.content).toBe('Hello.');
+    expect((await call('message',{chatId:'completion-one-chat',messageId:'old',latestOnly:true},'completion-one')).p.data.message).toBeNull();
+    expect(requests.length).toBe(before);
+  });
+  test('failed, stopped and impersonated generations do not register automatic preparation',async()=>{
+    await call('save',{settings:DEFAULTS},'completion-invalid');
+    for(const extra of [{error:'failed'},{generationType:'impersonate'},{messageId:undefined}])await listeners.get('GENERATION_ENDED')!({generationId:'bad-g',chatId:'completion-invalid-chat',messageId:'m1',content:'Skip.',...extra},'completion-invalid');
+    expect((await call('latest_completion',{chatId:'completion-invalid-chat',since:0},'completion-invalid')).p.data.completion).toBeNull();
+  });
   test('fresh installs stay off and updating existing settings preserves opt-in',async()=>{
     expect((await call('init',{},'fresh')).p.data.settings.enabled).toBe(false);
     await call('save',{settings:DEFAULTS});

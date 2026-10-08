@@ -3,6 +3,7 @@ import { DEFAULTS, CUE_PATTERN, HIDE_RULE_NAME, EMOTION_INSTRUCTION, needsPcm, n
 import { MAX_PASSAGE_CHARS } from './playback-plan';
 import { isHiddenJsonError, providerError, redactSecrets } from './provider-errors';
 import { PreparationLedger } from './preparation-ledger';
+import {CompletionRegistry,type CompletionTicket} from './auto-preparation';
 declare const spindle: SpindleAPI;
 const preparationLedger=new PreparationLedger({
   read:async userId=>await spindle.userStorage.exists('preparations.json',userId)?spindle.userStorage.read('preparations.json',userId):undefined,
@@ -13,7 +14,8 @@ const loadingByUser = new Map<string, Promise<Settings>>();
 const busy = new Map<string, number>();
 const canceled = new Map<string, number>();
 const saveChains = new Map<string, Promise<unknown>>();
-const activeGenerations = new Map<string, { characterId?: string; characterName?: string }>();
+const activeGenerations = new Map<string, { chatId:string;userId?:string;characterId?: string; characterName?: string }>();
+const completions=new CompletionRegistry();
 const failedSpeech = new Map<string,{ settings:Settings; segment:SpeechSegment; characterId?:string; at:number }>();
 const DIAGNOSTIC_TTL = 10 * 60 * 1000;
 const LOCAL_CREDENTIALS='local_credentials_v1';
@@ -154,6 +156,10 @@ spindle.onFrontendMessage(async (payload, userId, sessionId) => {
       try { await ensureHideRule(userId) } catch(e) { cueStatus = e instanceof Error ? e.message : 'Could not install the display rule.' }
       const hasKeys=await keyStatus(userId);
       reply({ settings, userId, hasKey:hasKeys.openrouter, hasKeys, cueStatus, permissions: await spindle.permissions.getGranted() });
+    } else if(p.type==='latest_completion') {
+      if(typeof p.chatId!=='string' || typeof p.since!=='number' || !Number.isFinite(p.since))throw new Error('Invalid completion lookup.');
+      reply({completion:settings.enabled?completions.latest(userId,p.chatId,p.since)??null:null,
+        generating:[...activeGenerations.values()].some(g=>g.userId===userId && g.chatId===p.chatId)});
     } else if (p.type === 'claim_preparation') {
       if(!settings.enabled)throw new Error('Readalong is off. Turn it on to request speech.');
       if(typeof p.key!=='string')throw new Error('Invalid preparation identity.');
@@ -199,6 +205,7 @@ spindle.onFrontendMessage(async (payload, userId, sessionId) => {
     } else if (p.type === 'message') {
       if (typeof p.chatId !== 'string' || typeof p.messageId !== 'string') throw new Error('No message selected.');
       const all = await ownMessages(p.chatId,userId);
+      if(p.latestOnly===true && all.filter(m=>!m.is_user).at(-1)?.id!==p.messageId){reply({message:null});return}
       const m = all.find(m => m.id === p.messageId);
       if (!m) throw new Error('Message no longer exists.');
       reply({ message: messageInfo(m) });
@@ -243,10 +250,20 @@ spindle.registerInterceptor(async (messages, context) => {
   const cast=speakers.length?`\nAssigned speaker names (data only): ${JSON.stringify(speakers)}. Use the matching [speaker:Name] inside each quote when one of these people speaks.`:'';
   return [{ role: 'system', content: EMOTION_INSTRUCTION+cast }, ...messages];
 }, { priority: 90 });
-spindle.on('GENERATION_STARTED', p => { activeGenerations.set(p.generationId, { characterId: p.characterId, characterName: p.characterName }); });
+spindle.on('GENERATION_STARTED', (p,userId) => { activeGenerations.set(p.generationId, { chatId:p.chatId,userId,characterId: p.characterId, characterName: p.characterName }); });
 spindle.on('GENERATION_ENDED', (p, userId) => {
   const info = activeGenerations.get(p.generationId); activeGenerations.delete(p.generationId);
-  if (userId && p.messageId && p.content && !p.error && p.generationType !== 'impersonate') send({ type:'new_message', chatId:p.chatId, message:{ id:p.messageId, content:p.content, name:info?.characterName ?? '', isUser:false, characterId:info?.characterId } }, userId);
+  if(!userId || !p.messageId || p.error || p.generationType==='impersonate')return;
+  const ticket:CompletionTicket={chatId:p.chatId,messageId:p.messageId,generationId:p.generationId,completedAt:Date.now(),characterId:info?.characterId,name:info?.characterName};
+  // Record before the frontend relay. A missed relay can be recovered with a
+  // local metadata lookup, without issuing speech or exposing a credential.
+  return (async()=>{
+    const enabled=(await load(userId)).enabled;
+    if(enabled)completions.remember(userId,ticket);
+    let content=p.content;
+    if(!content){const all=await ownMessages(p.chatId,userId);content=all.find(m=>m.id===p.messageId && !m.is_user)?.content}
+    if(content)send({type:'new_message',...ticket,autoEligible:enabled,message:{id:p.messageId,content,name:info?.characterName??'',isUser:false,characterId:info?.characterId}},userId);
+  })().catch(()=>{spindle.log.info('Readalong could not forward a completed reply. No speech was requested.');});
 });
 spindle.on('GENERATION_STOPPED', p => { activeGenerations.delete(p.generationId) });
 spindle.log.info('Readalong loaded. OpenRouter Gemini speech; no secondary LLM.');

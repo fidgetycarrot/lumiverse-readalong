@@ -1203,6 +1203,47 @@ function earlyPlaybackPrefix(texts, clips) {
   return total > 0 && chars / total >= EARLY_PLAYBACK_FRACTION && seconds >= EARLY_PLAYBACK_SECONDS ? count : 0;
 }
 
+// src/auto-preparation.ts
+class CompletionInbox {
+  pending = new Map;
+  enabled;
+  since;
+  constructor(now = Date.now()) {
+    this.since = now;
+  }
+  initialize(enabled) {
+    this.enabled = enabled;
+    if (!enabled)
+      this.pending.clear();
+  }
+  reset(now = Date.now()) {
+    this.since = now;
+    this.pending.clear();
+  }
+  setEnabled(enabled, now = Date.now()) {
+    this.enabled = enabled;
+    this.reset(now);
+  }
+  receive(reply) {
+    if (this.enabled === false || reply.message.isUser || reply.completedAt < this.since)
+      return false;
+    const prior = this.pending.get(reply.chatId);
+    if (prior && prior.completedAt > reply.completedAt)
+      return false;
+    this.pending.set(reply.chatId, reply);
+    while (this.pending.size > 20)
+      this.pending.delete(this.pending.keys().next().value);
+    return true;
+  }
+  take(chatId) {
+    if (this.enabled !== true)
+      return;
+    const reply = this.pending.get(chatId);
+    this.pending.delete(chatId);
+    return reply;
+  }
+}
+
 // src/frontend.ts
 var STYLE = `
 ::highlight(lumiverse-readalong){background:rgba(245,190,80,.30);color:inherit;text-decoration:underline;text-decoration-color:#e7b24c;text-decoration-thickness:2px;}
@@ -1313,6 +1354,9 @@ function setup(ctx) {
   const audioCache = new AudioCache;
   let cacheUserId = "";
   const automaticPreparations = new Set;
+  const completionInbox = new CompletionInbox, knownCompletions = new Map;
+  const localGenerations = new Map;
+  let completionRecovery = null;
   let saveQueue = Promise.resolve(), saveVersion = 0;
   let currentPassages = [], preparedCount = 0, currentPassage = 0;
   let readingAbort = null, clockTimer = null;
@@ -1387,9 +1431,8 @@ function setup(ctx) {
       else
         p.resolve(payload.data);
     } else if (payload?.type === "new_message" && payload.chatId === ctx.getActiveChat().chatId && payload.message && !payload.message.isUser) {
-      messages = [...messages.filter((m) => m.id !== payload.message.id), payload.message];
-      selectedId = payload.message.id;
-      safe(() => autoPrepareMessage(payload.message));
+      if (payload.autoEligible !== false)
+        safe(() => receiveCompletion({ chatId: payload.chatId, messageId: payload.message.id, generationId: payload.generationId ?? payload.message.id, completedAt: typeof payload.completedAt === "number" ? payload.completedAt : Date.now(), message: payload.message }));
     }
   }));
   const marker = new PassageMarker(() => {});
@@ -1426,6 +1469,8 @@ function setup(ctx) {
     playAttempt = null;
     messageLoad = null;
     stopClock();
+    if (showStatus)
+      completionInbox.reset();
     readingAbort?.abort();
     readingAbort = null;
     for (const controller of nativeRequests)
@@ -1794,6 +1839,57 @@ function setup(ctx) {
   function activeNative(id = settings.connectionId) {
     return nativeConnections.find((c) => c.id === id);
   }
+  async function flushCompletion() {
+    if (!initialized || disposed || !settings.enabled)
+      return;
+    const chatId = ctx.getActiveChat().chatId;
+    if (!chatId)
+      return;
+    const reply = completionInbox.take(chatId);
+    if (reply)
+      await autoPrepareMessage(reply.message);
+  }
+  async function receiveCompletion(reply) {
+    if (disposed || reply.chatId !== ctx.getActiveChat().chatId || !completionInbox.receive(reply))
+      return;
+    knownCompletions.set(reply.chatId, reply.generationId);
+    while (knownCompletions.size > 20)
+      knownCompletions.delete(knownCompletions.keys().next().value);
+    messages = [...messages.filter((m) => m.id !== reply.message.id), reply.message];
+    selectedId = reply.message.id;
+    await flushCompletion();
+  }
+  async function recoverCompletion() {
+    if (!initialized || !settings.enabled || disposed || completionRecovery || !permissions.includes("chat_mutation") || !permissions.includes("generation"))
+      return;
+    const chatId = ctx.getActiveChat().chatId;
+    if (!chatId)
+      return;
+    const operation = {};
+    completionRecovery = operation;
+    const since = completionInbox.since;
+    const current = () => !disposed && settings.enabled && ctx.getActiveChat().chatId === chatId && completionInbox.since === since;
+    try {
+      const r = await rpc("latest_completion", { chatId, since });
+      const ticket = r.completion;
+      if (!current() || r.generating || !ticket || ticket.completedAt < since || knownCompletions.get(chatId) === ticket.generationId)
+        return;
+      for (const [id, g] of localGenerations)
+        if (g.chatId === chatId)
+          localGenerations.delete(id);
+      const loaded = await rpc("message", { chatId, messageId: ticket.messageId, latestOnly: true });
+      if (!current())
+        return;
+      if (!loaded.message) {
+        knownCompletions.set(chatId, ticket.generationId);
+        return;
+      }
+      await receiveCompletion({ ...ticket, message: { ...loaded.message, name: ticket.name || loaded.message.name, characterId: ticket.characterId ?? loaded.message.characterId } });
+    } finally {
+      if (completionRecovery === operation)
+        completionRecovery = null;
+    }
+  }
   async function prepareSpeech(segment, snapshot, signal) {
     signal?.throwIfAborted();
     if (snapshot.provider !== "lumiverse")
@@ -1815,9 +1911,11 @@ function setup(ctx) {
     const key = JSON.stringify([ctx.getActiveChat().chatId, message.id, message.content]);
     if (!force && (automaticPreparations.has(key) || currentMessage?.id === message.id && currentMessage.content === message.content))
       return;
-    automaticPreparations.add(key);
-    if (automaticPreparations.size > 20)
-      automaticPreparations.delete(automaticPreparations.values().next().value);
+    if (!restoreOnly) {
+      automaticPreparations.add(key);
+      if (automaticPreparations.size > 20)
+        automaticPreparations.delete(automaticPreparations.values().next().value);
+    }
     await startMessage(message, { automatic: true, restoreOnly });
   }
   async function prepareLatest(force = false, restoreOnly = false) {
@@ -1832,6 +1930,9 @@ function setup(ctx) {
   async function setEnabled(enabled) {
     if (settings.enabled === enabled)
       return;
+    completionInbox.setEnabled(enabled);
+    knownCompletions.clear();
+    localGenerations.clear();
     settings.enabled = enabled;
     if (!enabled)
       stop(false);
@@ -1848,6 +1949,11 @@ function setup(ctx) {
   async function startMessage(message, options = {}) {
     if (!settings.enabled)
       throw new Error("Readalong is off. Turn it on to prepare audio.");
+    if (!options.restoreOnly) {
+      automaticPreparations.add(JSON.stringify([ctx.getActiveChat().chatId, message.id, message.content]));
+      if (automaticPreparations.size > 20)
+        automaticPreparations.delete(automaticPreparations.values().next().value);
+    }
     stop(false);
     const token = playbackId;
     readingAbort = new AbortController;
@@ -2556,6 +2662,9 @@ function setup(ctx) {
     cleanups.push(ctx.events.on(name, (p) => fn(p)));
   }
   onEvent("CHAT_SWITCHED", () => {
+    completionInbox.reset();
+    localGenerations.clear();
+    completionRecovery = null;
     stop(false);
     messages = [];
     selectedId = "";
@@ -2581,17 +2690,62 @@ function setup(ctx) {
       safe(refreshMessages);
     });
   onEvent("GENERATION_STARTED", (p) => {
-    if (p?.chatId === ctx.getActiveChat().chatId && currentMessage)
+    if (p?.chatId !== ctx.getActiveChat().chatId)
+      return;
+    if (typeof p.generationId === "string") {
+      localGenerations.set(p.generationId, { chatId: p.chatId, name: p.characterName, characterId: p.characterId, eligible: initialized ? settings.enabled : undefined });
+      while (localGenerations.size > 20)
+        localGenerations.delete(localGenerations.keys().next().value);
+    }
+    if (currentMessage)
       stop(false);
   });
+  onEvent("GENERATION_ENDED", (p) => {
+    const info = localGenerations.get(p?.generationId);
+    localGenerations.delete(p?.generationId);
+    if (p?.chatId !== ctx.getActiveChat().chatId || !p.messageId || p.error || p.generationType === "impersonate" || info?.eligible === false)
+      return;
+    safe(async () => {
+      if (!info) {
+        await recoverCompletion();
+        return;
+      }
+      const since = completionInbox.since;
+      const message = p.content ? { id: p.messageId, content: p.content, name: info.name ?? "", characterId: info.characterId, isUser: false } : (await rpc("message", { chatId: p.chatId, messageId: p.messageId, latestOnly: true })).message;
+      if (!message || completionInbox.since !== since)
+        return;
+      await receiveCompletion({ chatId: p.chatId, messageId: p.messageId, generationId: p.generationId, completedAt: Date.now(), message });
+    });
+  });
   onEvent("GENERATION_STOPPED", (p) => {
+    localGenerations.delete(p?.generationId);
     if (p?.chatId === ctx.getActiveChat().chatId && currentMessage)
       stop();
   });
+  onEvent("CONNECTED", () => {
+    safe(recoverCompletion);
+  });
   onEvent("CHARACTER_MESSAGE_RENDERED", () => decorateMessages());
   cleanups.push(tab.onActivate(() => {
-    safe(refreshMessages);
+    safe(async () => {
+      await refreshMessages();
+      await recoverCompletion();
+    });
   }));
+  const onReturn = () => {
+    if (document.visibilityState === "visible")
+      safe(recoverCompletion);
+  };
+  document.addEventListener("visibilitychange", onReturn);
+  window.addEventListener("focus", onReturn);
+  cleanups.push(() => {
+    document.removeEventListener("visibilitychange", onReturn);
+    window.removeEventListener("focus", onReturn);
+  });
+  const recoveryTimer = setInterval(() => {
+    safe(recoverCompletion);
+  }, 15000);
+  cleanups.push(() => clearInterval(recoveryTimer));
   const action = ctx.ui.registerInputBarAction({ id: "readalong", label: "Readalong", subtitle: "Listen and find your place" });
   cleanups.push(action.onClick(() => {
     tab.activate();
@@ -2631,6 +2785,7 @@ function setup(ctx) {
     if (disposed)
       return;
     settings = normalizeSettings(r.settings);
+    completionInbox.initialize(settings.enabled);
     cacheUserId = typeof r.userId === "string" ? r.userId : "";
     Object.assign(hasKeys, r.hasKeys ?? { openrouter: r.hasKey, local: false });
     permissions = r.permissions;
@@ -2669,7 +2824,10 @@ function setup(ctx) {
       refreshCatalog().catch(() => {});
     if (permissions.includes("chat_mutation")) {
       await refreshMessages();
-      await prepareLatest(false, true);
+      await flushCompletion();
+      if (!currentMessage)
+        await prepareLatest(false, true);
+      await recoverCompletion();
     }
     if (!settings.enabled)
       notice("Readalong is off. No speech requests will be started.");

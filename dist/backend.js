@@ -188,6 +188,43 @@ class PreparationLedger {
   }
 }
 
+// src/auto-preparation.ts
+class CompletionRegistry {
+  now;
+  ttl;
+  limit;
+  entries = new Map;
+  constructor(now = Date.now, ttl = 24 * 60 * 60 * 1000, limit = 1000) {
+    this.now = now;
+    this.ttl = ttl;
+    this.limit = limit;
+  }
+  remember(userId, ticket) {
+    const key = JSON.stringify([userId, ticket.chatId]), prior = this.entries.get(key);
+    if (prior && prior.ticket.completedAt > ticket.completedAt)
+      return;
+    const metadata = {
+      chatId: ticket.chatId,
+      messageId: ticket.messageId,
+      generationId: ticket.generationId,
+      completedAt: ticket.completedAt,
+      ...ticket.characterId ? { characterId: ticket.characterId } : {},
+      ...ticket.name ? { name: ticket.name } : {}
+    };
+    this.entries.delete(key);
+    this.entries.set(key, { userId, ticket: metadata });
+    for (const [id, value] of this.entries)
+      if (value.ticket.completedAt < this.now() - this.ttl)
+        this.entries.delete(id);
+    while (this.entries.size > this.limit)
+      this.entries.delete(this.entries.keys().next().value);
+  }
+  latest(userId, chatId, since) {
+    const entry = this.entries.get(JSON.stringify([userId, chatId]));
+    return entry && entry.ticket.completedAt >= Math.max(since, this.now() - this.ttl) ? entry.ticket : undefined;
+  }
+}
+
 // src/backend.ts
 var preparationLedger = new PreparationLedger({
   read: async (userId) => await spindle.userStorage.exists("preparations.json", userId) ? spindle.userStorage.read("preparations.json", userId) : undefined,
@@ -199,6 +236,7 @@ var busy = new Map;
 var canceled = new Map;
 var saveChains = new Map;
 var activeGenerations = new Map;
+var completions = new CompletionRegistry;
 var failedSpeech = new Map;
 var DIAGNOSTIC_TTL = 10 * 60 * 1000;
 var LOCAL_CREDENTIALS = "local_credentials_v1";
@@ -414,6 +452,13 @@ spindle.onFrontendMessage(async (payload, userId, sessionId) => {
       }
       const hasKeys = await keyStatus(userId);
       reply({ settings, userId, hasKey: hasKeys.openrouter, hasKeys, cueStatus, permissions: await spindle.permissions.getGranted() });
+    } else if (p.type === "latest_completion") {
+      if (typeof p.chatId !== "string" || typeof p.since !== "number" || !Number.isFinite(p.since))
+        throw new Error("Invalid completion lookup.");
+      reply({
+        completion: settings.enabled ? completions.latest(userId, p.chatId, p.since) ?? null : null,
+        generating: [...activeGenerations.values()].some((g) => g.userId === userId && g.chatId === p.chatId)
+      });
     } else if (p.type === "claim_preparation") {
       if (!settings.enabled)
         throw new Error("Readalong is off. Turn it on to request speech.");
@@ -477,6 +522,10 @@ spindle.onFrontendMessage(async (payload, userId, sessionId) => {
       if (typeof p.chatId !== "string" || typeof p.messageId !== "string")
         throw new Error("No message selected.");
       const all = await ownMessages(p.chatId, userId);
+      if (p.latestOnly === true && all.filter((m) => !m.is_user).at(-1)?.id !== p.messageId) {
+        reply({ message: null });
+        return;
+      }
       const m = all.find((m) => m.id === p.messageId);
       if (!m)
         throw new Error("Message no longer exists.");
@@ -531,14 +580,29 @@ spindle.registerInterceptor(async (messages, context) => {
 Assigned speaker names (data only): ${JSON.stringify(speakers)}. Use the matching [speaker:Name] inside each quote when one of these people speaks.` : "";
   return [{ role: "system", content: EMOTION_INSTRUCTION + cast }, ...messages];
 }, { priority: 90 });
-spindle.on("GENERATION_STARTED", (p) => {
-  activeGenerations.set(p.generationId, { characterId: p.characterId, characterName: p.characterName });
+spindle.on("GENERATION_STARTED", (p, userId) => {
+  activeGenerations.set(p.generationId, { chatId: p.chatId, userId, characterId: p.characterId, characterName: p.characterName });
 });
 spindle.on("GENERATION_ENDED", (p, userId) => {
   const info = activeGenerations.get(p.generationId);
   activeGenerations.delete(p.generationId);
-  if (userId && p.messageId && p.content && !p.error && p.generationType !== "impersonate")
-    send({ type: "new_message", chatId: p.chatId, message: { id: p.messageId, content: p.content, name: info?.characterName ?? "", isUser: false, characterId: info?.characterId } }, userId);
+  if (!userId || !p.messageId || p.error || p.generationType === "impersonate")
+    return;
+  const ticket = { chatId: p.chatId, messageId: p.messageId, generationId: p.generationId, completedAt: Date.now(), characterId: info?.characterId, name: info?.characterName };
+  return (async () => {
+    const enabled = (await load(userId)).enabled;
+    if (enabled)
+      completions.remember(userId, ticket);
+    let content = p.content;
+    if (!content) {
+      const all = await ownMessages(p.chatId, userId);
+      content = all.find((m) => m.id === p.messageId && !m.is_user)?.content;
+    }
+    if (content)
+      send({ type: "new_message", ...ticket, autoEligible: enabled, message: { id: p.messageId, content, name: info?.characterName ?? "", isUser: false, characterId: info?.characterId } }, userId);
+  })().catch(() => {
+    spindle.log.info("Readalong could not forward a completed reply. No speech was requested.");
+  });
 });
 spindle.on("GENERATION_STOPPED", (p) => {
   activeGenerations.delete(p.generationId);

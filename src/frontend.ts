@@ -8,6 +8,7 @@ import { AudioCache, preparationHash } from './audio-cache';
 import {widgetDimensions as resolveWidgetDimensions,widgetPosition} from './widget-layout';
 import {patchPlaybackChildren} from './playback-ui';
 import {earlyPlaybackPrefix} from './early-playback';
+import {CompletionInbox,type CompletedReply} from './auto-preparation';
 
 const STYLE = `
 ::highlight(lumiverse-readalong){background:rgba(245,190,80,.30);color:inherit;text-decoration:underline;text-decoration-color:#e7b24c;text-decoration-thickness:2px;}
@@ -71,6 +72,9 @@ export function setup(ctx: SpindleFrontendContext) {
   const audioPlayer=new PreparedPlayer();
   const audioCache=new AudioCache();let cacheUserId='';
   const automaticPreparations=new Set<string>();
+  const completionInbox=new CompletionInbox(),knownCompletions=new Map<string,string>();
+  const localGenerations=new Map<string,{chatId:string;name?:string;characterId?:string;eligible?:boolean}>();
+  let completionRecovery:object|null=null;
   let saveQueue:Promise<unknown>=Promise.resolve(),saveVersion=0;
   let currentPassages:SpeechPassage[]=[],preparedCount=0,currentPassage=0;
   let readingAbort:AbortController|null=null,clockTimer:ReturnType<typeof setInterval>|null=null;
@@ -113,8 +117,7 @@ export function setup(ctx: SpindleFrontendContext) {
       if (typeof payload.canDiagnoseSpeech === 'boolean') showDiagnostics(payload.canDiagnoseSpeech);
       if (payload.error) p.reject(new Error(payload.error)); else p.resolve(payload.data);
     } else if (payload?.type === 'new_message' && payload.chatId === ctx.getActiveChat().chatId && payload.message && !payload.message.isUser) {
-      messages=[...messages.filter(m=>m.id!==payload.message.id),payload.message];selectedId=payload.message.id;
-      void safe(()=>autoPrepareMessage(payload.message));
+      if(payload.autoEligible!==false)void safe(()=>receiveCompletion({chatId:payload.chatId,messageId:payload.message.id,generationId:payload.generationId??payload.message.id,completedAt:typeof payload.completedAt==='number'?payload.completedAt:Date.now(),message:payload.message}));
     }
   }));
   const marker = new PassageMarker(()=>{});
@@ -135,6 +138,7 @@ export function setup(ctx: SpindleFrontendContext) {
   function stopClock() { if(clockTimer)clearInterval(clockTimer);clockTimer=null }
   function stop(showStatus = true) {
     playbackId++; playing = false; paused = false; phase='idle';checkingSavedAudio=false;preparingAudio=false;waitingForAudio=false;playAttempt=null;messageLoad=null;stopClock();
+    if(showStatus)completionInbox.reset();
     readingAbort?.abort();readingAbort=null;
     for(const controller of nativeRequests)controller.abort();nativeRequests.clear();
     audioPlayer.clear();
@@ -285,6 +289,35 @@ export function setup(ctx: SpindleFrontendContext) {
     });
   }
   function activeNative(id=settings.connectionId) { return nativeConnections.find(c=>c.id===id) }
+  async function flushCompletion(){
+    if(!initialized || disposed || !settings.enabled)return;
+    const chatId=ctx.getActiveChat().chatId;if(!chatId)return;
+    const reply=completionInbox.take(chatId);if(reply)await autoPrepareMessage(reply.message);
+  }
+  async function receiveCompletion(reply:CompletedReply){
+    if(disposed || reply.chatId!==ctx.getActiveChat().chatId || !completionInbox.receive(reply))return;
+    knownCompletions.set(reply.chatId,reply.generationId);
+    while(knownCompletions.size>20)knownCompletions.delete(knownCompletions.keys().next().value!);
+    messages=[...messages.filter(m=>m.id!==reply.message.id),reply.message];selectedId=reply.message.id;
+    await flushCompletion();
+  }
+  async function recoverCompletion(){
+    if(!initialized || !settings.enabled || disposed || completionRecovery || !permissions.includes('chat_mutation') || !permissions.includes('generation'))return;
+    const chatId=ctx.getActiveChat().chatId;if(!chatId)return;
+    const operation={};completionRecovery=operation;const since=completionInbox.since;
+    const current=()=>!disposed && settings.enabled && ctx.getActiveChat().chatId===chatId && completionInbox.since===since;
+    try {
+      const r=await rpc('latest_completion',{chatId,since});const ticket=r.completion;
+      if(!current() || r.generating || !ticket || ticket.completedAt<since || knownCompletions.get(chatId)===ticket.generationId)return;
+      // A missing end notification must not leave the frontend thinking a
+      // completed generation is still running. The backend confirms it ended.
+      for(const [id,g] of localGenerations)if(g.chatId===chatId)localGenerations.delete(id);
+      const loaded=await rpc('message',{chatId,messageId:ticket.messageId,latestOnly:true});
+      if(!current())return;
+      if(!loaded.message){knownCompletions.set(chatId,ticket.generationId);return}
+      await receiveCompletion({...ticket,message:{...loaded.message,name:ticket.name||loaded.message.name,characterId:ticket.characterId??loaded.message.characterId}});
+    }finally{if(completionRecovery===operation)completionRecovery=null}
+  }
   async function prepareSpeech(segment:SpeechSegment, snapshot:Settings, signal?:AbortSignal) {
     signal?.throwIfAborted();
     if(snapshot.provider!=='lumiverse')return rpc('speech',{segment,previewSettings:snapshot});
@@ -298,7 +331,7 @@ export function setup(ctx: SpindleFrontendContext) {
     if(!initialized || !settings.enabled || disposed || message.isUser)return;
     const key=JSON.stringify([ctx.getActiveChat().chatId,message.id,message.content]);
     if(!force && (automaticPreparations.has(key) || currentMessage?.id===message.id && currentMessage.content===message.content))return;
-    automaticPreparations.add(key);if(automaticPreparations.size>20)automaticPreparations.delete(automaticPreparations.values().next().value!);
+    if(!restoreOnly){automaticPreparations.add(key);if(automaticPreparations.size>20)automaticPreparations.delete(automaticPreparations.values().next().value!)}
     await startMessage(message,{automatic:true,restoreOnly});
   }
   async function prepareLatest(force=false,restoreOnly=false) {
@@ -308,6 +341,7 @@ export function setup(ctx: SpindleFrontendContext) {
   }
   async function setEnabled(enabled:boolean) {
     if(settings.enabled===enabled)return;
+    completionInbox.setEnabled(enabled);knownCompletions.clear();localGenerations.clear();
     settings.enabled=enabled;if(!enabled)stop(false);
     renderPlayer();renderVoices();renderAssignments();
     notice(enabled?'Readalong is on. Preparing the latest reply…':'Readalong is off. No speech requests will be started.');
@@ -316,6 +350,10 @@ export function setup(ctx: SpindleFrontendContext) {
   }
   async function startMessage(message: MessageInfo,options:{automatic?:boolean;restoreOnly?:boolean}={}) {
     if(!settings.enabled)throw new Error('Readalong is off. Turn it on to prepare audio.');
+    if(!options.restoreOnly){
+      automaticPreparations.add(JSON.stringify([ctx.getActiveChat().chatId,message.id,message.content]));
+      if(automaticPreparations.size>20)automaticPreparations.delete(automaticPreparations.values().next().value!);
+    }
     stop(false);
     const token=playbackId;readingAbort=new AbortController();const signal=readingAbort.signal;
     currentMessage={...message,characterId:message.characterId ?? speakerCharacterId(message.name,characters,ctx.getActiveChat().characterId ?? undefined)};
@@ -601,6 +639,7 @@ export function setup(ctx: SpindleFrontendContext) {
   }
   function onEvent(name:string,fn:(payload:any)=>void) {cleanups.push(ctx.events.on(name,p=>fn(p)))}
   onEvent('CHAT_SWITCHED',()=>{
+    completionInbox.reset();localGenerations.clear();completionRecovery=null;
     stop(false); messages=[]; selectedId='';automaticPreparations.clear();
     for (const handle of bubbleHandles.values()) ctx.dom.uninject(handle);
     bubbleHandles.clear(); notice(settings.enabled?'Looking for saved audio…':'Readalong is off.'); void safe(async()=>{await refreshMessages();await prepareLatest(false,true)});
@@ -610,10 +649,30 @@ export function setup(ctx: SpindleFrontendContext) {
     if(event==='MESSAGE_DELETED' && bubbleHandles.has(id)){ctx.dom.uninject(bubbleHandles.get(id)!);bubbleHandles.delete(id)}
     void safe(refreshMessages);
   });
-  onEvent('GENERATION_STARTED',p=>{if(p?.chatId===ctx.getActiveChat().chatId && currentMessage)stop(false)});
-  onEvent('GENERATION_STOPPED',p=>{if(p?.chatId===ctx.getActiveChat().chatId && currentMessage)stop()});
+  onEvent('GENERATION_STARTED',p=>{
+    if(p?.chatId!==ctx.getActiveChat().chatId)return;
+    if(typeof p.generationId==='string'){localGenerations.set(p.generationId,{chatId:p.chatId,name:p.characterName,characterId:p.characterId,eligible:initialized?settings.enabled:undefined});while(localGenerations.size>20)localGenerations.delete(localGenerations.keys().next().value!)}
+    if(currentMessage)stop(false);
+  });
+  onEvent('GENERATION_ENDED',p=>{
+    const info=localGenerations.get(p?.generationId);localGenerations.delete(p?.generationId);
+    if(p?.chatId!==ctx.getActiveChat().chatId || !p.messageId || p.error || p.generationType==='impersonate' || info?.eligible===false)return;
+    void safe(async()=>{
+      if(!info){await recoverCompletion();return}
+      const since=completionInbox.since;
+      const message=p.content?{id:p.messageId,content:p.content,name:info.name??'',characterId:info.characterId,isUser:false}:(await rpc('message',{chatId:p.chatId,messageId:p.messageId,latestOnly:true})).message;
+      if(!message || completionInbox.since!==since)return;
+      await receiveCompletion({chatId:p.chatId,messageId:p.messageId,generationId:p.generationId,completedAt:Date.now(),message});
+    });
+  });
+  onEvent('GENERATION_STOPPED',p=>{localGenerations.delete(p?.generationId);if(p?.chatId===ctx.getActiveChat().chatId && currentMessage)stop()});
+  onEvent('CONNECTED',()=>{void safe(recoverCompletion)});
   onEvent('CHARACTER_MESSAGE_RENDERED',()=>decorateMessages());
-  cleanups.push(tab.onActivate(()=>{void safe(refreshMessages)}));
+  cleanups.push(tab.onActivate(()=>{void safe(async()=>{await refreshMessages();await recoverCompletion()})}));
+  const onReturn=()=>{if(document.visibilityState==='visible')void safe(recoverCompletion)};
+  document.addEventListener('visibilitychange',onReturn);window.addEventListener('focus',onReturn);
+  cleanups.push(()=>{document.removeEventListener('visibilitychange',onReturn);window.removeEventListener('focus',onReturn)});
+  const recoveryTimer=setInterval(()=>{void safe(recoverCompletion)},15000);cleanups.push(()=>clearInterval(recoveryTimer));
   const action=ctx.ui.registerInputBarAction({id:'readalong',label:'Readalong',subtitle:'Listen and find your place'});cleanups.push(action.onClick(()=>{tab.activate();void safe(openWidget)}));
   function installEditor() {
     if(editorTab || !permissions.includes('characters'))return;
@@ -624,7 +683,7 @@ export function setup(ctx: SpindleFrontendContext) {
   if('speechSynthesis' in window){const refresh=()=>{if(settings.provider==='browser'){renderVoices();renderAssignments()}};speechSynthesis.addEventListener('voiceschanged',refresh);cleanups.push(()=>speechSynthesis.removeEventListener('voiceschanged',refresh))}
   renderPlayer();renderConfig();renderVoices();renderAssignments();ctx.ready();
   void safe(async()=>{
-    const r=await rpc('init');if(disposed)return;settings=normalizeSettings(r.settings);cacheUserId=typeof r.userId==='string'?r.userId:'';Object.assign(hasKeys,r.hasKeys??{openrouter:r.hasKey,local:false});permissions=r.permissions;ready=true;
+    const r=await rpc('init');if(disposed)return;settings=normalizeSettings(r.settings);completionInbox.initialize(settings.enabled);cacheUserId=typeof r.userId==='string'?r.userId:'';Object.assign(hasKeys,r.hasKeys??{openrouter:r.hasKey,local:false});permissions=r.permissions;ready=true;
     try {
       nativeConnections=await nativeTts.connections();if(disposed)return;
       const existing=nativeConnections.find(c=>c.provider==='openrouter_tts' && c.model===settings.model) ?? nativeConnections.find(c=>c.provider==='openrouter_tts');
@@ -636,7 +695,7 @@ export function setup(ctx: SpindleFrontendContext) {
     if(permissions.includes('characters')){try{const r=await rpc('characters');characters=r.characters;renderAssignments()}catch{}}
     initialized=true;
     if(settings.provider==='lumiverse' || permissions.includes('cors_proxy'))void refreshCatalog().catch(()=>{});
-    if(permissions.includes('chat_mutation')){await refreshMessages();await prepareLatest(false,true)}
+    if(permissions.includes('chat_mutation')){await refreshMessages();await flushCompletion();if(!currentMessage)await prepareLatest(false,true);await recoverCompletion()}
     if(!settings.enabled)notice('Readalong is off. No speech requests will be started.');
   });
   return()=>{
