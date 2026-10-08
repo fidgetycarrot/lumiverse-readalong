@@ -97,6 +97,13 @@ function applyPronunciations(text, entries) {
   const replace = (s) => s.replace(new RegExp(`(?<!${boundary})(?:${pattern})(?!${boundary})`, "giu"), (name) => map.get(normalized(name)) ?? name);
   return text.split(/(<[^<>]*>)/g).map((s) => s.startsWith("<") ? s : replace(s)).join("");
 }
+function pronunciationSample(entry, spelling) {
+  const names = [entry.name, ...entry.aliases];
+  const chosen = spelling === undefined ? names : names.filter((name) => name === spelling);
+  if (!chosen.length)
+    throw new Error("Choose a name or alternative from this pronunciation.");
+  return chosen.length === 1 ? `${chosen[0]} arrived. I looked at ${chosen[0]}. ${chosen[0]}'s voice was calm.` : chosen.map((name) => `${name} arrived.`).join(" ");
+}
 
 // src/shared.ts
 var EMOTIONS = ["neutral", "happy", "sad", "angry", "worried", "curious", "excited", "sarcastic", "tender", "afraid"];
@@ -1523,7 +1530,7 @@ function setup(ctx) {
   const hasKeys = { openrouter: false, local: false }, frontendId = crypto.randomUUID();
   const castDrafts = new Map, openCast = new Set;
   let castInitialized = false, addOpen = false, voiceQuery = "", fixName = "", fixSay = "", viewChosen = false;
-  const addedCast = new Set, addedNames = new Map, sayDrafts = new Map, moreOpen = new Set;
+  const addedCast = new Set, addedNames = new Map, sayDrafts = new Map, moreOpen = new Set, testPick = new Map;
   const validSpeaker = (name) => !!name && name.length <= 80 && !/[\[\]\r\n]/.test(name) && name.toLowerCase() !== "narrator";
   let canDiagnoseSpeech = false, diagnosing = false, diagnoseButton = null;
   let diagnoseHint = null;
@@ -2841,8 +2848,9 @@ function setup(ctx) {
     pronunciationEntries = normalizePronunciations(r.entries);
     pronunciationChatId = chatId;
   }
-  function testSaying(entry, voice, assignment) {
-    return preview(voice, assignment, { text: `${entry.name} arrived. I looked at ${entry.name}. ${entry.name}'s voice was calm.`, entries: normalizePronunciations({ [entry.name]: entry }) });
+  function testSaying(entry, voice, assignment, spelling) {
+    const only = spelling && [entry.name, ...entry.aliases].includes(spelling) ? spelling : undefined;
+    return preview(voice, assignment, { text: pronunciationSample(entry, only), entries: normalizePronunciations({ [entry.name]: entry }) });
   }
   function castForm(container, key, name, inList = true) {
     const saved = settings.assignments[key], spoken = baseName(name), known = sayingFor(spoken), hasStory = !!ctx.getActiveChat().chatId;
@@ -2873,7 +2881,7 @@ function setup(ctx) {
       sayInput.maxLength = 100;
       sayInput.placeholder = "For example, Eleese";
       sayInput.dataset.raSay = key;
-      const test = button("Test", () => safe(() => testSaying(sayingEntry(known?.name ?? spoken, say.spokenAs, say.aliases), draft.voice || settings.voice, draft)));
+      const test = button("Test", () => safe(() => testSaying(sayingEntry(known?.name ?? spoken, say.spokenAs, say.aliases), draft.voice || settings.voice, draft, testPick.get(key))));
       test.disabled = !settings.enabled;
       const sayRow = el("div", "", "ra-row ra-end");
       sayRow.append(field("Say the name as", sayInput), test);
@@ -2890,13 +2898,35 @@ function setup(ctx) {
       }
     });
     if (hasStory) {
+      const pick = el("select"), pickField = field("Which spelling to test", pick);
+      pick.onchange = () => {
+        if (pick.value)
+          testPick.set(key, pick.value);
+        else
+          testPick.delete(key);
+      };
+      const refreshPick = () => {
+        const names = [...new Set([known?.name ?? spoken, ...say.aliases.split(",").map((s) => s.trim())].filter(Boolean))];
+        if (!names.includes(testPick.get(key) ?? ""))
+          testPick.delete(key);
+        pick.replaceChildren();
+        for (const choice of [{ value: "", label: "All of them" }, ...names.map((value) => ({ value, label: value }))]) {
+          const option = el("option", choice.label);
+          option.value = choice.value;
+          pick.append(option);
+        }
+        pick.value = testPick.get(key) ?? "";
+        pickField.hidden = names.length < 2;
+      };
       const also = textInput(say.aliases, (v) => {
         say.aliases = v;
         touch();
+        refreshPick();
       });
       also.maxLength = 810;
       also.placeholder = "Nicknames or other spellings, with commas between";
-      more.body.append(field("Also goes by", also));
+      refreshPick();
+      more.body.append(field("Also goes by", also), pickField);
     }
     const moods = el("div", "", "ra-grid");
     moods.append(field("Usual mood", select(EMOTIONS.map((v) => ({ value: v, label: v })), draft.emotion, (v) => draft.emotion = v)), field("Usual way of speaking", select(DELIVERIES.map((v) => ({ value: v, label: v })), draft.delivery, (v) => draft.delivery = v)));
@@ -3215,6 +3245,7 @@ function setup(ctx) {
     pronunciationEntries = {};
     pronunciationChatId = "";
     sayDrafts.clear();
+    testPick.clear();
     fixName = "";
     fixSay = "";
     renderAssignments();

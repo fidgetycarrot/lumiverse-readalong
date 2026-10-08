@@ -1,10 +1,33 @@
 import {test,expect} from 'bun:test';
-import {applyPronunciations,learnPronunciations,normalizePronunciations,PronunciationStore,stripPronunciationCues,pronunciationInstruction} from '../src/pronunciation';
+import {applyPronunciations,learnPronunciations,normalizePronunciations,PronunciationStore,stripPronunciationCues,pronunciationInstruction,pronunciationSample,pronunciationEntry} from '../src/pronunciation';
 import {parseSegments,plainText,DEFAULTS,CUE_PATTERN} from '../src/shared';
 import {planSpeech} from '../src/playback-plan';
 import {nativeSpeechRequest} from '../src/native-tts';
 const entry={name:'Elys',spokenAs:'Eleese',aliases:['Elys-04'],source:'manual'};
 const saved=normalizePronunciations({elys:entry});
+test('pronunciation previews exercise each alternative and retain its original marker spelling',()=>{
+  const e=pronunciationEntry({...entry,aliases:['Elys-04','Ellis']},'manual')!;
+  const settings={...DEFAULTS,provider:'lumiverse' as const,voice:'Fenrir'};
+  for(const spelling of [undefined,e.name,...e.aliases]){
+    const text=pronunciationSample(e,spelling),segments=parseSegments(text,'Preview');
+    const passages=planSpeech(segments,settings,{characters:[],pronunciations:normalizePronunciations({e})});
+    expect(passages).toHaveLength(1);expect(passages[0].voice).toBe('Fenrir');
+    expect(passages[0].segment.text).not.toMatch(/Elys|Ellis/);
+    expect(passages[0].segment.text).toContain('Eleese arrived.');
+    expect(passages[0].segments.map(s=>s.text).join(' ')).toBe(text);
+    if(spelling)expect(text).toBe(`${spelling} arrived. I looked at ${spelling}. ${spelling}'s voice was calm.`);
+    else expect(text).toBe('Elys arrived. Elys-04 arrived. Ellis arrived.');
+  }
+  expect(()=>pronunciationSample(e,'Another person')).toThrow('Choose a name');
+});
+test('the maximum pronunciation preview fits one provider passage after substitutions',()=>{
+  const e=pronunciationEntry({name:'N'.repeat(80),spokenAs:'S'.repeat(100),aliases:Array.from({length:10},(_,i)=>'A'.repeat(79)+i)},'manual')!;
+  for(const provider of ['browser','openrouter','lumiverse','local'] as const){
+    const passages=planSpeech(parseSegments(pronunciationSample(e),'Preview'),{...DEFAULTS,provider},{characters:[],pronunciations:normalizePronunciations({e})});
+    expect(passages).toHaveLength(1);
+    expect(passages[0].segment.text).toBe(Array(11).fill('S'.repeat(100)+' arrived.').join(' '));
+  }
+});
 test('narrator and dialogue send the pronunciation but retain display names and speaker IDs',()=>{
   const raw='Elys waited. “[speaker:Elys] Elys-04 is my name.” Elys’s gaze softened.',segments=parseSegments(raw,'Elys');
   const settings={...DEFAULTS,provider:'lumiverse' as const,narratorVoice:'Autonoe',voice:'Kore',assignments:{'name:elys':{voice:'Fenrir',emotion:'neutral',delivery:'normal'}}};

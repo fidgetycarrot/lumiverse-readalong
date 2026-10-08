@@ -9,7 +9,7 @@ import {widgetDimensions as resolveWidgetDimensions,widgetPosition} from './widg
 import {patchPlaybackChildren} from './playback-ui';
 import {earlyPlaybackPrefix} from './early-playback';
 import {CompletionInbox,type CompletedReply} from './auto-preparation';
-import {normalizePronunciations,pronunciationEntry,type Pronunciations,type PronunciationEntry} from './pronunciation';
+import {normalizePronunciations,pronunciationEntry,pronunciationSample,type Pronunciations,type PronunciationEntry} from './pronunciation';
 
 const STYLE = `
 ::highlight(lumiverse-readalong){background:rgba(245,190,80,.30);color:inherit;text-decoration:underline;text-decoration-color:#e7b24c;text-decoration-thickness:2px;}
@@ -138,7 +138,7 @@ export function setup(ctx: SpindleFrontendContext) {
   let settings = normalizeSettings(DEFAULTS), ready = false, initialized = false, disposed = false;
   const hasKeys={openrouter:false,local:false},frontendId=crypto.randomUUID();
   const castDrafts=new Map<string,VoiceAssignment>(),openCast=new Set<string>();let castInitialized=false,addOpen=false,voiceQuery='',fixName='',fixSay='',viewChosen=false;
-  const addedCast=new Set<string>(),addedNames=new Map<string,string>(),sayDrafts=new Map<string,{spokenAs:string;aliases:string}>(),moreOpen=new Set<string>();
+  const addedCast=new Set<string>(),addedNames=new Map<string,string>(),sayDrafts=new Map<string,{spokenAs:string;aliases:string}>(),moreOpen=new Set<string>(),testPick=new Map<string,string>();
   const validSpeaker=(name:string)=>!!name && name.length<=80 && !/[\[\]\r\n]/.test(name) && name.toLowerCase()!=='narrator';
   let canDiagnoseSpeech = false, diagnosing = false, diagnoseButton: HTMLButtonElement | null = null;
   let diagnoseHint: HTMLElement | null = null;
@@ -780,8 +780,10 @@ export function setup(ctx: SpindleFrontendContext) {
     if(disposed || ctx.getActiveChat().chatId!==chatId)return;
     pronunciationEntries=normalizePronunciations(r.entries);pronunciationChatId=chatId;
   }
-  function testSaying(entry:PronunciationEntry,voice:string,assignment?:Partial<VoiceAssignment>){
-    return preview(voice,assignment,{text:`${entry.name} arrived. I looked at ${entry.name}. ${entry.name}'s voice was calm.`,entries:normalizePronunciations({[entry.name]:entry})});
+  function testSaying(entry:PronunciationEntry,voice:string,assignment?:Partial<VoiceAssignment>,spelling?:string){
+    // An unknown choice (the spelling was edited away) falls back to reading them all.
+    const only=spelling && [entry.name,...entry.aliases].includes(spelling)?spelling:undefined;
+    return preview(voice,assignment,{text:pronunciationSample(entry,only),entries:normalizePronunciations({[entry.name]:entry})});
   }
   /** Voice and name form for one cast member. Also used by the character editor tab. */
   function castForm(container:HTMLElement,key:string,name:string,inList=true) {
@@ -797,12 +799,23 @@ export function setup(ctx: SpindleFrontendContext) {
     if(settings.provider==='local')container.append(field('Voice name',textInput(draft.voice,v=>draft.voice=v)));
     if(hasStory) {
       const sayInput=textInput(say.spokenAs,v=>{say.spokenAs=v;touch()});sayInput.maxLength=100;sayInput.placeholder='For example, Eleese';sayInput.dataset.raSay=key;
-      const test=button('Test',()=>safe(()=>testSaying(sayingEntry(known?.name??spoken,say.spokenAs,say.aliases),draft.voice||settings.voice,draft)));test.disabled=!settings.enabled;
+      const test=button('Test',()=>safe(()=>testSaying(sayingEntry(known?.name??spoken,say.spokenAs,say.aliases),draft.voice||settings.voice,draft,testPick.get(key))));test.disabled=!settings.enabled;
       const sayRow=el('div','', 'ra-row ra-end');sayRow.append(field('Say the name as',sayInput),test);container.append(sayRow);
     } else container.append(el('p','Open a story to set how this name is said.','ra-muted'));
     const more=disclosure([el('strong','More')],moreOpen.has(key));
     more.details.addEventListener('toggle',()=>{if(more.details.isConnected){if(more.details.open)moreOpen.add(key);else moreOpen.delete(key)}});
-    if(hasStory){const also=textInput(say.aliases,v=>{say.aliases=v;touch()});also.maxLength=810;also.placeholder='Nicknames or other spellings, with commas between';more.body.append(field('Also goes by',also))}
+    if(hasStory){
+      const pick=el('select'),pickField=field('Which spelling to test',pick);pick.onchange=()=>{if(pick.value)testPick.set(key,pick.value);else testPick.delete(key)};
+      const refreshPick=()=>{
+        const names=[...new Set([known?.name??spoken,...say.aliases.split(',').map(s=>s.trim())].filter(Boolean))];
+        if(!names.includes(testPick.get(key)??''))testPick.delete(key);
+        pick.replaceChildren();
+        for(const choice of [{value:'',label:'All of them'},...names.map(value=>({value,label:value}))]){const option=el('option',choice.label);option.value=choice.value;pick.append(option)}
+        pick.value=testPick.get(key)??'';pickField.hidden=names.length<2;
+      };
+      const also=textInput(say.aliases,v=>{say.aliases=v;touch();refreshPick()});also.maxLength=810;also.placeholder='Nicknames or other spellings, with commas between';
+      refreshPick();more.body.append(field('Also goes by',also),pickField);
+    }
     const moods=el('div','', 'ra-grid');moods.append(field('Usual mood',select(EMOTIONS.map(v=>({value:v,label:v})),draft.emotion,v=>draft.emotion=v)),field('Usual way of speaking',select(DELIVERIES.map(v=>({value:v,label:v})),draft.delivery,v=>draft.delivery=v)));
     more.body.append(moods);container.append(more.details);
     const done=()=>{castDrafts.delete(key);sayDrafts.delete(key);renderAssignments();if(!inList)castForm(container,key,name,false)};
@@ -932,7 +945,7 @@ export function setup(ctx: SpindleFrontendContext) {
   function onEvent(name:string,fn:(payload:any)=>void) {cleanups.push(ctx.events.on(name,p=>fn(p)))}
   onEvent('CHAT_SWITCHED',()=>{
     completionInbox.reset();localGenerations.clear();completionRecovery=null;
-    pronunciationEpoch++;pronunciationEntries={};pronunciationChatId='';sayDrafts.clear();fixName='';fixSay='';renderAssignments();
+    pronunciationEpoch++;pronunciationEntries={};pronunciationChatId='';sayDrafts.clear();testPick.clear();fixName='';fixSay='';renderAssignments();
     stop(false); messages=[]; selectedId='';automaticPreparations.clear();
     for (const handle of bubbleHandles.values()) ctx.dom.uninject(handle);
     bubbleHandles.clear(); notice(settings.enabled?'Looking for saved audio…':'Readalong is off.'); void safe(async()=>{await refreshPronunciations();await refreshMessages();await prepareLatest(false,true)});
