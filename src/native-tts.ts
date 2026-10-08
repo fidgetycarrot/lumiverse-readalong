@@ -48,7 +48,7 @@ export function createNativeTtsClient(transport:typeof fetch = fetch) {
         const allowed=key==='asterisked'?['thought','narration','skip']:['speech','narration','skip'];
         if(allowed.includes(raw[key]))(rules as Record<string,string>)[key]=raw[key];
       }
-      return {rules:rules as SpeechRules,narrationVoice:readVoiceRef(value.narrationVoice)};
+      return {rules:rules as SpeechRules,narrationVoice:readVoiceRef(value.narrationVoice),automaticTts:value.ttsEnabled===true && value.ttsAutoPlay===true};
     },
     async connections():Promise<NativeConnection[]> {
       const all:NativeConnection[]=[];

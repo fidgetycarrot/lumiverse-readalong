@@ -50,14 +50,20 @@ describe('native Lumiverse TTS',()=>{
     const check=createNativeTtsClient((async()=>Response.json({success:false,message:'Invalid API key '+secret})) as unknown as typeof fetch);
     await expect(check.check(connection.id)).rejects.not.toThrow(secret);
   });
-  test('native preferences project only narration voice and valid detection rules',async()=>{
+  test('native preferences project safe narration, detection rules and the automatic-TTS flag',async()=>{
     const calls:any[]=[];const client=createNativeTtsClient((async(url:any,init:any)=>{calls.push({url,init});return Response.json({value:{narrationVoice:{connectionId:'narrator',voice:'Charon',other:'do-not-project'},speechDetectionRules:{quoted:'speech',asterisked:'skip',undecorated:'speech'},sttLanguage:'do-not-project'}})}) as unknown as typeof fetch);
-    expect(await client.preferences()).toEqual({narrationVoice:{connectionId:'narrator',voice:'Charon'},rules:{quoted:'speech',asterisked:'skip',undecorated:'speech'}});
+    expect(await client.preferences()).toEqual({narrationVoice:{connectionId:'narrator',voice:'Charon'},automaticTts:false,rules:{quoted:'speech',asterisked:'skip',undecorated:'speech'}});
     expect(calls[0].url).toBe('/api/v1/settings/voiceSettings');expect(calls[0].init.credentials).toBe('include');expect(calls[0].init.method).toBeUndefined();
   });
   test('malformed native voice preferences keep safe speech-detection defaults',async()=>{
     const client=createNativeTtsClient((async()=>Response.json({value:{narrationVoice:{voice:'missing connection'},speechDetectionRules:{quoted:'evil',asterisked:'speech',undecorated:'thought'}}})) as unknown as typeof fetch);
-    expect(await client.preferences()).toEqual({narrationVoice:undefined,rules:{quoted:'speech',asterisked:'narration',undecorated:'narration'}});
+    expect(await client.preferences()).toEqual({narrationVoice:undefined,automaticTts:false,rules:{quoted:'speech',asterisked:'narration',undecorated:'narration'}});
+  });
+  test('duplicate-automatic-TTS detection needs both host switches and exposes no credentials',async()=>{
+    for(const [ttsEnabled,ttsAutoPlay,automatic] of [[true,true,true],[true,false,false],[false,true,false],['true',true,false],[true,'true',false],[undefined,undefined,false]] as const){
+      const client=createNativeTtsClient((async()=>Response.json({value:{ttsEnabled,ttsAutoPlay,api_key:'private-fixture',connections:{secret:'private-fixture'}}})) as unknown as typeof fetch);
+      const preferences=await client.preferences();expect(preferences.automaticTts).toBe(automatic);expect(JSON.stringify(preferences)).not.toContain('private-fixture');
+    }
   });
   test('Gemini requests PCM through the saved connection without keys or spoken directions',()=>{
     expect(nativeSpeechRequest(connection,settings,segment)).toEqual({connectionId:'saved-router',model:DEFAULTS.model,text:'Are you sure?',voice:'Kore',parameters:{speed:1},outputFormat:'pcm'});

@@ -1089,7 +1089,7 @@ function createNativeTtsClient(transport = fetch) {
         if (allowed.includes(raw[key]))
           rules[key] = raw[key];
       }
-      return { rules, narrationVoice: readVoiceRef(value.narrationVoice) };
+      return { rules, narrationVoice: readVoiceRef(value.narrationVoice), automaticTts: value.ttsEnabled === true && value.ttsAutoPlay === true };
     },
     async connections() {
       const all = [];
@@ -1445,6 +1445,17 @@ function patchPlaybackChildren(parent, ...children) {
   sync(parent, children);
 }
 
+// src/message-update.ts
+function readingChanged(current, updated) {
+  if (!updated || typeof updated !== "object")
+    return;
+  const message = updated;
+  if (message.id !== current.id || typeof message.content !== "string")
+    return;
+  const isUser = typeof message.is_user === "boolean" ? message.is_user : message.isUser;
+  return message.content !== current.content || typeof message.name === "string" && message.name !== (current.name ?? "") || typeof isUser === "boolean" && isUser !== current.isUser;
+}
+
 // src/early-playback.ts
 var EARLY_PLAYBACK_FRACTION = 0.75;
 var EARLY_PLAYBACK_SECONDS = 30;
@@ -1763,6 +1774,12 @@ function setup(ctx) {
   let playbackSettler = null;
   const pending = new Map;
   const cleanups = [], bubbleHandles = new Map;
+  const speechActivity = { automatic: 0, manual: 0, preview: 0, diagnostic: 0 }, speechActivityNote = el("p", "", "ra-muted");
+  let lastPlaybackAction = "None";
+  function updateSpeechActivity() {
+    speechActivityNote.textContent = `Speech requests started in this window: ${speechActivity.automatic + speechActivity.manual + speechActivity.preview + speechActivity.diagnostic}. Automatic preparation: ${speechActivity.automatic}; manual preparation: ${speechActivity.manual}; samples: ${speechActivity.preview}; diagnostics: ${speechActivity.diagnostic}. Last control: ${lastPlaybackAction}. Loading and playing saved audio do not start speech requests. This is a request count, not a bill.`;
+  }
+  updateSpeechActivity();
   const primeAutomaticAudio = () => {
     if (!disposed && settings.enabled && settings.automaticPlayback && settings.provider !== "browser")
       audioPlayer.unlock();
@@ -2031,7 +2048,7 @@ function setup(ctx) {
   pointerMedia.addEventListener("change", resizeWidget);
   cleanups.push(() => pointerMedia.removeEventListener("change", resizeWidget));
   function playState() {
-    const label = !settings.enabled ? "Turn on" : playAttempt ? "Starting…" : messageLoad ? "Loading…" : phase === "preparing" ? checkingSavedAudio ? "Loading…" : "Preparing…" : phase === "idle" ? "Load saved" : phase === "paused" ? "Resume" : phase === "playing" ? "Pause" : phase === "finished" ? "Replay" : "Play";
+    const label = !settings.enabled ? "Off" : playAttempt ? "Starting…" : messageLoad ? "Loading…" : phase === "preparing" ? checkingSavedAudio ? "Loading…" : "Preparing…" : phase === "idle" ? "Load saved" : phase === "paused" ? "Resume" : phase === "playing" ? "Pause" : phase === "finished" ? "Replay" : "Play";
     const busy = settings.enabled && (!!playAttempt || !!messageLoad || phase === "preparing");
     const glyph = !settings.enabled ? "power" : phase === "playing" ? "pause" : phase === "finished" ? "replay" : "play";
     return { label, busy, glyph };
@@ -2057,8 +2074,8 @@ function setup(ctx) {
     widget.root.classList.toggle("ra-touch", widgetTouch());
     widget.root.classList.toggle("ra-narrow", widgetDimensions2().narrow);
     const { label: playLabel } = playState(), speaking = phase === "playing" || phase === "paused", hasTime = !!audioPlayer.duration;
-    const play = playButton(() => safe(settings.enabled ? playOrPause : () => setEnabled(true)));
-    play.disabled = !ready || !!playAttempt || !!messageLoad || settings.enabled && (phase === "preparing" || phase === "idle" && !selectedId || incompleteAudio && !audioPlayer.duration);
+    const play = playButton(() => safe(playOrPause));
+    play.disabled = !ready || !settings.enabled || !!playAttempt || !!messageLoad || phase === "preparing" || phase === "idle" && !selectedId || incompleteAudio && !audioPlayer.duration;
     const close = iconButton("close", "Hide floating player", () => widget?.setVisible(false));
     const resize = iconButton(settings.widgetMinimized ? "expand" : "minimize", settings.widgetMinimized ? "Expand floating player" : "Minimize floating player", () => safe(() => setWidgetMinimized(!settings.widgetMinimized)));
     resize.dataset.raControl = "resize";
@@ -2182,6 +2199,8 @@ function setup(ctx) {
     notice(automaticPlaybackError || text, !!automaticPlaybackError);
   }
   async function playOrPause(automatic = false) {
+    lastPlaybackAction = automatic ? "Automatic playback" : phase === "idle" ? "Load saved" : playState().label;
+    updateSpeechActivity();
     if (!automatic) {
       automaticPlayback.cancel();
       automaticPlaybackError = "";
@@ -2408,15 +2427,20 @@ function setup(ctx) {
         completionRecovery = null;
     }
   }
-  async function prepareSpeech(segment, snapshot, signal) {
+  async function prepareSpeech(segment, snapshot, kind, signal) {
     signal?.throwIfAborted();
-    if (snapshot.provider !== "lumiverse")
+    if (snapshot.provider !== "lumiverse") {
+      speechActivity[kind]++;
+      updateSpeechActivity();
       return rpc("speech", { segment, previewSettings: snapshot });
+    }
     const connection = activeNative(snapshot.connectionId);
     if (!connection)
       throw new Error("Choose a connection first. If the list is empty, add one in Lumiverse’s voice settings.");
     const controller = new AbortController;
     nativeRequests.add(controller);
+    speechActivity[kind]++;
+    updateSpeechActivity();
     try {
       return await nativeTts.speech(connection, snapshot, segment, undefined, AbortSignal.any([controller.signal, AbortSignal.timeout(300000), ...signal ? [signal] : []]));
     } finally {
@@ -2448,6 +2472,8 @@ function setup(ctx) {
   async function setEnabled(enabled) {
     if (settings.enabled === enabled)
       return;
+    lastPlaybackAction = enabled ? "Turn on" : "Turn off";
+    updateSpeechActivity();
     completionInbox.setEnabled(enabled);
     knownCompletions.clear();
     localGenerations.clear();
@@ -2506,12 +2532,13 @@ function setup(ctx) {
         mainSpeaker: message.name,
         pronunciations: await refreshPronunciations(chatId, options.restoreOnly ? undefined : message.id)
       };
-      let rules;
+      let rules, hostAutomaticTts = false;
       if (snapshot.provider === "lumiverse") {
         const results = await Promise.allSettled([nativeTts.preferences(), ctx.chats.getActive?.() ?? Promise.resolve(null)]);
         if (results[0].status === "fulfilled") {
           rules = results[0].value.rules;
           context.narrationVoice = results[0].value.narrationVoice;
+          hostAutomaticTts = results[0].value.automaticTts;
         }
         if (results[1].status === "fulfilled")
           context.overrides = results[1].value?.metadata?.voiceOverrides;
@@ -2599,6 +2626,16 @@ function setup(ctx) {
         const prepareParts = async (manual) => {
           if (token !== playbackId)
             return;
+          if (!manual && hostAutomaticTts) {
+            automaticPlayback.cancel();
+            if (parts.some(Boolean))
+              retainPartial();
+            else
+              stop(false);
+            notice("Readalong automatic preparation is paused because Lumiverse’s built-in automatic TTS is on. Turn that off in Lumiverse’s voice settings to avoid two recordings and two sets of speech requests. Readalong sent no new speech request.", true);
+            renderPlayer();
+            return;
+          }
           preparingAudio = true;
           incompleteAudio = false;
           checkingSavedAudio = false;
@@ -2622,7 +2659,7 @@ function setup(ctx) {
             const clips = await prepareAll(currentPassages, async (p, index, requestSignal) => {
               if (parts[index])
                 return parts[index];
-              const data = await prepareSpeech(p.segment, p.settings, requestSignal);
+              const data = await prepareSpeech(p.segment, p.settings, manual ? "manual" : "automatic", requestSignal);
               requestSignal.throwIfAborted();
               const clip = await prepareClip(data, requestSignal);
               requestSignal.throwIfAborted();
@@ -2671,6 +2708,8 @@ function setup(ctx) {
         retryPreparation = async () => {
           if (preparingAudio || token !== playbackId || !settings.enabled)
             return;
+          lastPlaybackAction = "Retry missing audio";
+          updateSpeechActivity();
           automaticPlayback.cancel();
           automaticPlaybackError = "";
           await prepareParts(true);
@@ -2732,7 +2771,7 @@ function setup(ctx) {
     notice(`Preparing ${voice}…`);
     try {
       if (snapshot.provider !== "browser") {
-        const data = await prepareSpeech(currentPassages[0].segment, currentPassages[0].settings, readingAbort.signal);
+        const data = await prepareSpeech(currentPassages[0].segment, currentPassages[0].settings, "preview", readingAbort.signal);
         if (token !== playbackId)
           return;
         const clip = await prepareClip(data, readingAbort.signal);
@@ -2850,6 +2889,8 @@ function setup(ctx) {
     messageLoad = operation;
     const token = playbackId;
     renderPlayer();
+    lastPlaybackAction = restoreOnly ? "Load saved" : "Prepare message";
+    updateSpeechActivity();
     try {
       const r = await rpc("message", { chatId, messageId: id });
       if (ctx.getActiveChat().chatId !== chatId || token !== playbackId || messageLoad !== operation)
@@ -2971,7 +3012,7 @@ function setup(ctx) {
     const sliders = el("div", "", "ra-grid");
     sliders.append(speedField, volumeField);
     const about = disclosure([el("strong", "About cost and saved audio")]);
-    about.body.append(el("p", "While Readalong is on, each new reply gets audio as soon as it is written. Automatic playback can start it for you; otherwise press Play.", "ra-muted"), el("p", "Each successful audio part is saved on this device. Reloading or switching chats reuses what is still saved. Play never requests speech.", "ra-muted"), el("p", "If preparation fails, Retry missing audio keeps the successful parts and requests only what is missing. That retry can cost money. Storage limits or clearing app data can remove saved audio.", "ra-muted"), el("p", "Changing a voice, or how a name is said, only changes new audio.", "ra-muted"), el("p", "The highlighted sentence is a close guess of where the voice is.", "ra-muted"));
+    about.body.append(el("p", "While Readalong is on, each new reply gets audio as soon as it is written. Automatic playback can start it for you; otherwise press Play.", "ra-muted"), el("p", "Each successful audio part is saved on this device. Reloading or switching chats reuses what is still saved. Play never requests speech.", "ra-muted"), el("p", "If preparation fails, Retry missing audio keeps the successful parts and requests only what is missing. That retry can cost money. Storage limits or clearing app data can remove saved audio.", "ra-muted"), speechActivityNote, el("p", "Changing a voice, or how a name is said, only changes new audio.", "ra-muted"), el("p", "The highlighted sentence is a close guess of where the voice is.", "ra-muted"));
     options.replaceChildren(sliders, toggle("Play replies automatically", settings.automaticPlayback, (v) => {
       safe(() => setAutomaticPlayback(v));
     }, "Start with the next new reply when enough audio is ready. Current and manually prepared messages wait for Play. Pause waits for Resume."), toggle("Scroll the chat to follow the voice", settings.follow, (v) => {
@@ -3108,6 +3149,9 @@ function setup(ctx) {
         stop(false);
         showDiagnostics(false);
         notice("Reading the error…");
+        lastPlaybackAction = "Show last error";
+        speechActivity.diagnostic++;
+        updateSpeechActivity();
         try {
           const r = await rpc("diagnose_speech");
           notice(r.message);
@@ -3630,8 +3674,29 @@ function setup(ctx) {
   for (const event of ["MESSAGE_EDITED", "MESSAGE_SWIPED", "SWIPE_EDITED", "MESSAGE_DELETED"])
     onEvent(event, (p) => {
       const id = p?.message?.id ?? p?.messageId;
-      if (currentMessage?.id === id)
-        stop();
+      if (p?.chatId && p.chatId !== ctx.getActiveChat().chatId)
+        return;
+      if (currentMessage && currentMessage.id === id) {
+        if (event === "MESSAGE_EDITED") {
+          const changed = readingChanged(currentMessage, p.message);
+          if (changed === true) {
+            stop();
+            notice("The message text or speaker changed. Saved audio was kept; prepare the changed passage explicitly if needed.");
+          } else if (changed === undefined) {
+            const token = playbackId, chatId = ctx.getActiveChat().chatId;
+            safe(async () => {
+              const result = await rpc("message", { chatId, messageId: id });
+              if (token !== playbackId || !currentMessage || currentMessage.id !== id || chatId !== ctx.getActiveChat().chatId)
+                return;
+              if (!result.message || readingChanged(currentMessage, result.message) === true) {
+                stop();
+                notice("The message changed. Saved audio was kept; prepare the changed passage explicitly if needed.");
+              }
+            });
+          }
+        } else
+          stop();
+      }
       if (event === "MESSAGE_DELETED" && bubbleHandles.has(id)) {
         ctx.dom.uninject(bubbleHandles.get(id));
         bubbleHandles.delete(id);
