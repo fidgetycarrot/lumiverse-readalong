@@ -1434,6 +1434,7 @@ var STYLE = `
 .ra-mini.ra-touch .ra-widget-tools{margin:0}
 .ra-mini.ra-collapsed.ra-narrow{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.ra-collapsed.ra-narrow .ra-compact-info{display:none}.ra-mini.ra-collapsed.ra-narrow button{width:100%;min-width:0;min-height:44px;border-radius:8px}
 `;
+var TAB_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6h11M12 12h8M9 18h9"/><path d="M3 9.2l5.2 2.8L3 14.8z" fill="currentColor"/></svg>`;
 var ICONS = {
   play: "M8 5v14l11-7z",
   pause: "M6 5h4v14H6zM14 5h4v14h-4z",
@@ -1579,7 +1580,7 @@ function setup(ctx) {
   const pending = new Map;
   const cleanups = [], bubbleHandles = new Map;
   let editorTab = null;
-  const tab = ctx.ui.registerDrawerTab({ id: "readalong", title: "Readalong", shortName: "Read", description: "Listen to passages, assign character voices, and follow the spoken text", keywords: ["tts", "voice", "speech", "audio"] });
+  const tab = ctx.ui.registerDrawerTab({ id: "readalong", title: "Readalong", shortName: "Read", description: "Listen to passages, assign character voices, and follow the spoken text", keywords: ["tts", "voice", "speech", "audio"], iconSvg: TAB_ICON });
   const root = tab.root;
   root.classList.add("ra");
   root.dataset.raUi = "true";
@@ -3343,7 +3344,7 @@ function setup(ctx) {
     safe(recoverCompletion);
   }, 15000);
   cleanups.push(() => clearInterval(recoveryTimer));
-  const action = ctx.ui.registerInputBarAction({ id: "readalong", label: "Readalong", subtitle: "Listen and find your place" });
+  const action = ctx.ui.registerInputBarAction({ id: "readalong", label: "Readalong", subtitle: "Listen and find your place", iconSvg: TAB_ICON });
   cleanups.push(action.onClick(() => {
     tab.activate();
     safe(openWidget);

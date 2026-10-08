@@ -105,6 +105,8 @@ const STYLE = `
 .ra-mini.ra-touch .ra-widget-tools{margin:0}
 .ra-mini.ra-collapsed.ra-narrow{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.ra-collapsed.ra-narrow .ra-compact-info{display:none}.ra-mini.ra-collapsed.ra-narrow button{width:100%;min-width:0;min-height:44px;border-radius:8px}
 `;
+/** Readalong's own symbol for the sidebar tab and input bar: lines of text with a play pointer on the current one. */
+const TAB_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6h11M12 12h8M9 18h9"/><path d="M3 9.2l5.2 2.8L3 14.8z" fill="currentColor"/></svg>`;
 const ICONS = {
   play:'M8 5v14l11-7z', pause:'M6 5h4v14H6zM14 5h4v14h-4z', stop:'M6 6h12v12H6z',
   replay:'M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z',
@@ -174,7 +176,7 @@ export function setup(ctx: SpindleFrontendContext) {
   const pending = new Map<string,{resolve:(data:any)=>void;reject:(err:Error)=>void;timer:ReturnType<typeof setTimeout>}>();
   const cleanups: (()=>void)[] = [], bubbleHandles = new Map<string,Element>();
   let editorTab: SpindleCharacterEditorTabHandle | null = null;
-  const tab = ctx.ui.registerDrawerTab({ id:'readalong', title:'Readalong', shortName:'Read', description:'Listen to passages, assign character voices, and follow the spoken text', keywords:['tts','voice','speech','audio'] });
+  const tab = ctx.ui.registerDrawerTab({ id:'readalong', title:'Readalong', shortName:'Read', description:'Listen to passages, assign character voices, and follow the spoken text', keywords:['tts','voice','speech','audio'], iconSvg:TAB_ICON });
   const root = tab.root; root.classList.add('ra'); root.dataset.raUi = 'true';
   cleanups.push(ctx.dom.addStyle(STYLE));
   const heading = el('h2','Readalong'), head = el('div','', 'ra-head');
@@ -978,7 +980,7 @@ export function setup(ctx: SpindleFrontendContext) {
   document.addEventListener('visibilitychange',onReturn);window.addEventListener('focus',onReturn);
   cleanups.push(()=>{document.removeEventListener('visibilitychange',onReturn);window.removeEventListener('focus',onReturn)});
   const recoveryTimer=setInterval(()=>{void safe(recoverCompletion)},15000);cleanups.push(()=>clearInterval(recoveryTimer));
-  const action=ctx.ui.registerInputBarAction({id:'readalong',label:'Readalong',subtitle:'Listen and find your place'});cleanups.push(action.onClick(()=>{tab.activate();void safe(openWidget)}));
+  const action=ctx.ui.registerInputBarAction({id:'readalong',label:'Readalong',subtitle:'Listen and find your place',iconSvg:TAB_ICON});cleanups.push(action.onClick(()=>{tab.activate();void safe(openWidget)}));
   function installEditor() {
     if(editorTab || !permissions.includes('characters'))return;
     editorTab=ctx.ui.registerCharacterEditorTab({id:'readalong-voice',title:'Readalong voice'});editorTab.root.classList.add('ra');editorTab.root.dataset.raUi='true';
