@@ -9,6 +9,7 @@ import {widgetDimensions as resolveWidgetDimensions,widgetPosition} from './widg
 import {patchPlaybackChildren} from './playback-ui';
 import {earlyPlaybackPrefix} from './early-playback';
 import {CompletionInbox,type CompletedReply} from './auto-preparation';
+import {normalizePronunciations,pronunciationEntry,type Pronunciations,type PronunciationEntry} from './pronunciation';
 
 const STYLE = `
 ::highlight(lumiverse-readalong){background:rgba(245,190,80,.30);color:inherit;text-decoration:underline;text-decoration-color:#e7b24c;text-decoration-thickness:2px;}
@@ -63,6 +64,8 @@ export function setup(ctx: SpindleFrontendContext) {
   let nativeConnections:NativeConnection[]=[], catalogEpoch=0;
   let characters: CharacterInfo[] = [], permissions: string[] = [];
   let messages: MessageInfo[] = [], selectedId = '';
+  let pronunciationEntries:Pronunciations={},pronunciationChatId='',pronunciationEpoch=0;
+  const openPronunciations=new Set<string>();
   let playbackId = 0, playing = false, paused = false, currentMessage: MessageInfo | null = null;
   let phase:'idle'|'preparing'|'ready'|'playing'|'paused'|'finished'='idle';
   let checkingSavedAudio=false;
@@ -94,8 +97,8 @@ export function setup(ctx: SpindleFrontendContext) {
   cleanups.push(ctx.dom.addStyle(STYLE));
   const heading = el('h2','Readalong'); const intro = el('p','Find your place at a glance. Give each character a voice.','ra-muted');
   const status = el('p','Loading…','ra-status'); status.setAttribute('role','status'); status.setAttribute('aria-live','polite');
-  const player = el('section','', 'ra-card'), config = el('section','', 'ra-card'), voicesCard = el('section','', 'ra-card'), assignmentsCard = el('section','', 'ra-card');
-  root.append(heading,intro,status,player,config,voicesCard,assignmentsCard);
+  const player = el('section','', 'ra-card'), config = el('section','', 'ra-card'), voicesCard = el('section','', 'ra-card'), assignmentsCard = el('section','', 'ra-card'),pronunciationsCard=el('section','','ra-card');
+  root.append(heading,intro,status,player,config,voicesCard,assignmentsCard,pronunciationsCard);
   function notice(text: string, error = false) { if (!disposed) { status.textContent = text; status.classList.toggle('ra-error',error);renderWidget() } }
   async function safe(work:()=>Promise<void>) { try { await work() } catch(e) { notice(e instanceof Error ? e.message : 'Readalong failed.',true) } }
   function showDiagnostics(available:boolean) {
@@ -301,6 +304,12 @@ export function setup(ctx: SpindleFrontendContext) {
     messages=[...messages.filter(m=>m.id!==reply.message.id),reply.message];selectedId=reply.message.id;
     await flushCompletion();
   }
+  async function refreshPronunciations(chatId=ctx.getActiveChat().chatId,messageId?:string):Promise<Pronunciations>{
+    if(!chatId)return {};
+    const epoch=++pronunciationEpoch,r=await rpc('pronunciations',{chatId,...(messageId?{messageId}:{})}),entries=normalizePronunciations(r.entries);
+    if(!disposed && epoch===pronunciationEpoch && ctx.getActiveChat().chatId===chatId){pronunciationChatId=chatId;pronunciationEntries=entries;renderPronunciations();renderAssignments()}
+    return entries;
+  }
   async function recoverCompletion(){
     if(!initialized || !settings.enabled || disposed || completionRecovery || !permissions.includes('chat_mutation') || !permissions.includes('generation'))return;
     const chatId=ctx.getActiveChat().chatId;if(!chatId)return;
@@ -343,7 +352,7 @@ export function setup(ctx: SpindleFrontendContext) {
     if(settings.enabled===enabled)return;
     completionInbox.setEnabled(enabled);knownCompletions.clear();localGenerations.clear();
     settings.enabled=enabled;if(!enabled)stop(false);
-    renderPlayer();renderVoices();renderAssignments();
+    renderPlayer();renderVoices();renderAssignments();renderPronunciations();
     notice(enabled?'Readalong is on. Preparing the latest reply…':'Readalong is off. No speech requests will be started.');
     await saveSettings();
     if(enabled && settings.enabled){await refreshMessages();await prepareLatest(true)}
@@ -360,7 +369,9 @@ export function setup(ctx: SpindleFrontendContext) {
     phase='preparing';preparingAudio=true;checkingSavedAudio=true;preparedCount=0;showWidget();notice('Looking for saved audio. No speech requested yet.');renderPlayer();
     try {
       const snapshot=normalizeSettings(settings);
-      const context:VoiceContext={characters,characterId:currentMessage.characterId,connections:nativeConnections};
+      const chatId=ctx.getActiveChat().chatId;
+      const context:VoiceContext={characters,characterId:currentMessage.characterId,connections:nativeConnections,
+        pronunciations:await refreshPronunciations(chatId,options.restoreOnly?undefined:message.id)};
       let rules;
       if(snapshot.provider==='lumiverse') {
         const results=await Promise.allSettled([nativeTts.preferences(),ctx.chats.getActive?.() ?? Promise.resolve(null)]);
@@ -423,13 +434,13 @@ export function setup(ctx: SpindleFrontendContext) {
       notice(restored?'Saved audio restored. No speech request or new charge. Press Play.':!saved?'Audio could not be saved for refresh. It will not regenerate automatically.':(phase as string)==='playing'?'Reading… The whole message is ready.':(phase as string)==='paused'?'Paused. The whole message is ready.':(phase as string)==='finished'?'Finished. Replay uses the prepared audio.':'The whole message is ready. Press Play.');renderPlayer();
     } catch(e) {if(token===playbackId){stop(false);throw e}}
   }
-  async function preview(voice: string, assignment?: Partial<VoiceAssignment>) {
+  async function preview(voice: string, assignment?: Partial<VoiceAssignment>,sample?:{text:string;entries:Pronunciations}) {
     if(!settings.enabled)throw new Error('Readalong is off. Turn it on to test a voice.');
     stop(false);const token=playbackId;readingAbort=new AbortController();
     if(settings.provider!=='browser')audioPlayer.unlock();
-    const segment={text:'The door was open. I took a breath, and stepped into the light.',speaker:'Preview',emotion:assignment?.emotion ?? 'neutral',delivery:assignment?.delivery ?? 'normal'};
+    const segment={text:sample?.text??'The door was open. I took a breath, and stepped into the light.',speaker:'Preview',emotion:assignment?.emotion ?? 'neutral',delivery:assignment?.delivery ?? 'normal'};
     const snapshot=normalizeSettings({...settings,voice,narratorVoice:'',assignments:{},inheritVoices:false});
-    currentPassages=planSpeech([segment],snapshot,{characters:[]});currentSegments=[segment];position=0;phase='preparing';showWidget();renderPlayer();notice(`Preparing ${voice}…`);
+    currentPassages=planSpeech([segment],snapshot,{characters:[],pronunciations:sample?.entries});currentSegments=[segment];position=0;phase='preparing';showWidget();renderPlayer();notice(`Preparing ${voice}…`);
     try {
       if(snapshot.provider!=='browser') {
         const data=await prepareSpeech(currentPassages[0].segment,currentPassages[0].settings,readingAbort.signal);
@@ -598,6 +609,53 @@ export function setup(ctx: SpindleFrontendContext) {
     const row=el('div','', 'ra-grid');row.append(field('Default emotion',select(EMOTIONS.map(v=>({value:v,label:v})),assignment.emotion,v=>assignment.emotion=v)),field('Default delivery',select(DELIVERIES.map(v=>({value:v,label:v})),assignment.delivery,v=>assignment.delivery=v)));container.append(row);
     const listen=button('Listen',()=>safe(()=>preview(assignment.voice||settings.voice,assignment)));listen.disabled=!settings.enabled;
     const actions=el('div','', 'ra-row');actions.append(listen,button('Save voice',()=>safe(update),true),button(options?'Remove cast voice':'Use defaults',()=>safe(options?.onRemove??(async()=>{delete settings.assignments[key];castDrafts.delete(key);openCast.delete(key);await saveSettings();assignmentForm(key,name,container);renderAssignments()}))));container.append(actions);
+    const pronunciation=el('details');pronunciation.append(el('summary','Name pronunciation for this story'));
+    pronunciationForm(pronunciation,name.split('||')[0].trim(),assignment.voice||settings.voice,assignment);container.append(pronunciation);
+  }
+  function pronunciationForm(container:HTMLElement,initialName:string,voice=settings.voice,assignment?:Partial<VoiceAssignment>,saved?:PronunciationEntry){
+    const chatId=ctx.getActiveChat().chatId;
+    const known=saved??Object.values(pronunciationEntries).find(e=>[e.name,...e.aliases].some(n=>n.toLowerCase()===initialName.toLowerCase()));
+    let name=known?.name??initialName,spokenAs=known?.spokenAs??'',aliases=(known?.aliases??[]).join(', ');
+    const nameInput=textInput(name,v=>name=v);nameInput.maxLength=80;nameInput.readOnly=!!saved;
+    const soundInput=textInput(spokenAs,v=>spokenAs=v);soundInput.maxLength=100;soundInput.placeholder='For example, Eleese';
+    const aliasInput=textInput(aliases,v=>aliases=v);aliasInput.maxLength=810;aliasInput.placeholder='For example, Elys-04';
+    container.append(field('Name in the story',nameInput),field('Pronounce as',soundInput),field('Other spellings or nicknames (comma separated)',aliasInput));
+    const candidate=()=>{
+      const entry=pronunciationEntry({name,spokenAs,aliases:aliases.split(',').map(s=>s.trim()).filter(Boolean)},'manual');
+      if(!entry)throw new Error('Enter a name and its spoken spelling first.');
+      if(!chatId || ctx.getActiveChat().chatId!==chatId)throw new Error('Select this story again before saving its pronunciation.');
+      return entry;
+    };
+    const test=button('Test pronunciation',()=>safe(async()=>{const entry=candidate();await preview(voice,assignment,{text:`${entry.name} arrived. I looked at ${entry.name}. ${entry.name}'s voice was calm.`,entries:normalizePronunciations({[entry.name]:entry})})}));test.disabled=!settings.enabled || !chatId;
+    const save=button('Save pronunciation',()=>safe(async()=>{
+      const entry=candidate(),r=await rpc('save_pronunciation',{chatId,entry});
+      if(disposed || ctx.getActiveChat().chatId!==chatId)return;
+      pronunciationEntries=normalizePronunciations(r.entries);pronunciationChatId=chatId!;renderPronunciations();renderAssignments();notice(`Pronunciation saved for ${entry.name}. Existing audio was not regenerated.`);
+    }),true);save.disabled=!chatId;
+    const actions=el('div','','ra-row');actions.append(test,save);
+    if(saved)actions.append(button('Remove pronunciation',()=>safe(async()=>{
+      if(ctx.getActiveChat().chatId!==chatId)return;
+      const r=await rpc('remove_pronunciation',{chatId,name:saved.name});
+      if(disposed || ctx.getActiveChat().chatId!==chatId)return;
+      pronunciationEntries=normalizePronunciations(r.entries);openPronunciations.delete(saved.name);renderPronunciations();renderAssignments();notice(`Pronunciation removed for ${saved.name}. Existing audio was not regenerated.`);
+    })));
+    container.append(actions,el('p','Saving changes future speech only. Test pronunciation uses one short speech request and may incur a provider charge.','ra-muted'));
+  }
+  function renderPronunciations(){
+    pronunciationsCard.replaceChildren(el('h3','Story pronunciations'));
+    pronunciationsCard.append(toggle('Automatically remember new character pronunciations',settings.promptPronunciations,v=>{settings.promptPronunciations=v;void safe(saveSettings)}),el('p','Readalong asks your existing chat model for a hidden cue when it introduces a new name. The first choice is saved for this chat; your corrections take priority. No preset edit or second LLM is needed. Names and reading markers keep their original spelling.','ra-muted'));
+    if(!ctx.getActiveChat().chatId){pronunciationsCard.append(el('p','Open a story to manage its pronunciations.','ra-muted'));return}
+    const entries=pronunciationChatId===ctx.getActiveChat().chatId?Object.values(pronunciationEntries):[];
+    pronunciationsCard.append(el('p',`${entries.length} saved pronunciations for this story. Existing recordings change only if you explicitly prepare them again; speech charges may apply.`,'ra-muted'));
+    for(const entry of entries.sort((a,b)=>a.name.localeCompare(b.name))){
+      const row=el('details','','ra-cast-entry');row.open=openPronunciations.has(entry.name);row.dataset.pronunciationName=entry.name;
+      row.append(el('summary',`${entry.name} → ${entry.spokenAs} · ${entry.source==='manual'?'Your correction':'Automatic'}`));
+      row.addEventListener('toggle',()=>{if(row.isConnected){if(row.open)openPronunciations.add(entry.name);else openPronunciations.delete(entry.name)}});
+      const names=[entry.name,...entry.aliases].map(n=>n.toLowerCase());
+      const character=characters.find(c=>names.includes(c.name.split('||')[0].trim().toLowerCase())),assigned=names.map(n=>settings.assignments[`name:${n}`]).find(Boolean)??(character?settings.assignments[`id:${character.id}`]:undefined);
+      pronunciationForm(row,entry.name,assigned?.voice||settings.voice,assigned,entry);pronunciationsCard.append(row);
+    }
+    const add=el('details');add.append(el('summary','Add or correct a name'));pronunciationForm(add,'');pronunciationsCard.append(add);
   }
   function renderAssignments() {
     assignmentsCard.replaceChildren(el('h3','Character voices'),el('p','Build a cast with a separate voice for each character or speaker. Readalong voices override inherited Lumiverse voices; choose compatible voices again after changing provider or model.','ra-muted'));
@@ -628,7 +686,7 @@ export function setup(ctx: SpindleFrontendContext) {
       const name=speaker.trim();if(!name || /[\[\]\r\n]/.test(name) || name.toLowerCase()==='narrator'){notice('Enter a speaker name of up to 80 characters. Narrator has its own voice setting.',true);return}
       addMember(`name:${name.toLowerCase()}`,name);
     }),el('p','Speakers do not need a character card. For several people in one reply, use cues such as [speaker:Jason] inside their quotes. The existing chat model can add these when voice cues are enabled; no extra LLM is called.','ra-muted'));
-    assignmentsCard.append(add);
+    assignmentsCard.append(add);renderPronunciations();
   }
   function decorateMessages() {
     for(const {messageId,element} of ctx.dom.listMessageElements()) {
@@ -640,9 +698,10 @@ export function setup(ctx: SpindleFrontendContext) {
   function onEvent(name:string,fn:(payload:any)=>void) {cleanups.push(ctx.events.on(name,p=>fn(p)))}
   onEvent('CHAT_SWITCHED',()=>{
     completionInbox.reset();localGenerations.clear();completionRecovery=null;
+    pronunciationEpoch++;pronunciationEntries={};pronunciationChatId='';openPronunciations.clear();renderPronunciations();renderAssignments();
     stop(false); messages=[]; selectedId='';automaticPreparations.clear();
     for (const handle of bubbleHandles.values()) ctx.dom.uninject(handle);
-    bubbleHandles.clear(); notice(settings.enabled?'Looking for saved audio…':'Readalong is off.'); void safe(async()=>{await refreshMessages();await prepareLatest(false,true)});
+    bubbleHandles.clear(); notice(settings.enabled?'Looking for saved audio…':'Readalong is off.'); void safe(async()=>{await refreshPronunciations();await refreshMessages();await prepareLatest(false,true)});
   });
   for(const event of ['MESSAGE_EDITED','MESSAGE_SWIPED','SWIPE_EDITED','MESSAGE_DELETED'])onEvent(event,p=>{
     const id=p?.message?.id??p?.messageId;if(currentMessage?.id===id)stop();
@@ -656,7 +715,7 @@ export function setup(ctx: SpindleFrontendContext) {
   });
   onEvent('GENERATION_ENDED',p=>{
     const info=localGenerations.get(p?.generationId);localGenerations.delete(p?.generationId);
-    if(p?.chatId!==ctx.getActiveChat().chatId || !p.messageId || p.error || p.generationType==='impersonate' || info?.eligible===false)return;
+    if(p?.chatId!==ctx.getActiveChat().chatId || !p.messageId || p.error || ['impersonate','quiet'].includes(p.generationType) || info?.eligible===false)return;
     void safe(async()=>{
       if(!info){await recoverCompletion();return}
       const since=completionInbox.since;
@@ -668,7 +727,7 @@ export function setup(ctx: SpindleFrontendContext) {
   onEvent('GENERATION_STOPPED',p=>{localGenerations.delete(p?.generationId);if(p?.chatId===ctx.getActiveChat().chatId && currentMessage)stop()});
   onEvent('CONNECTED',()=>{void safe(recoverCompletion)});
   onEvent('CHARACTER_MESSAGE_RENDERED',()=>decorateMessages());
-  cleanups.push(tab.onActivate(()=>{void safe(async()=>{await refreshMessages();await recoverCompletion()})}));
+  cleanups.push(tab.onActivate(()=>{void safe(async()=>{await refreshPronunciations();await refreshMessages();await recoverCompletion()})}));
   const onReturn=()=>{if(document.visibilityState==='visible')void safe(recoverCompletion)};
   document.addEventListener('visibilitychange',onReturn);window.addEventListener('focus',onReturn);
   cleanups.push(()=>{document.removeEventListener('visibilitychange',onReturn);window.removeEventListener('focus',onReturn)});
@@ -681,7 +740,7 @@ export function setup(ctx: SpindleFrontendContext) {
     cleanups.push(ctx.ui.characterEditor.onChange(render),editorTab.onActivate(render));render();
   }
   if('speechSynthesis' in window){const refresh=()=>{if(settings.provider==='browser'){renderVoices();renderAssignments()}};speechSynthesis.addEventListener('voiceschanged',refresh);cleanups.push(()=>speechSynthesis.removeEventListener('voiceschanged',refresh))}
-  renderPlayer();renderConfig();renderVoices();renderAssignments();ctx.ready();
+  renderPlayer();renderConfig();renderVoices();renderAssignments();renderPronunciations();ctx.ready();
   void safe(async()=>{
     const r=await rpc('init');if(disposed)return;settings=normalizeSettings(r.settings);completionInbox.initialize(settings.enabled);cacheUserId=typeof r.userId==='string'?r.userId:'';Object.assign(hasKeys,r.hasKeys??{openrouter:r.hasKey,local:false});permissions=r.permissions;ready=true;
     try {
@@ -690,12 +749,12 @@ export function setup(ctx: SpindleFrontendContext) {
       if(needsPcm(settings) && existing){chooseNative(existing,true);await saveSettings()}
       else if(settings.provider==='lumiverse' && !settings.connectionId && nativeConnections.length){chooseNative(existing??nativeConnections[0]);await saveSettings()}
     } catch { /* Direct/browser modes remain available if native TTS is absent. */ }
-    renderPlayer();renderConfig();renderVoices();renderAssignments();installEditor();
+    renderPlayer();renderConfig();renderVoices();renderAssignments();renderPronunciations();installEditor();
     if(r.cueStatus)notice(r.cueStatus,true);else notice('Ready. Choose a voice and listen to a sample.');
     if(permissions.includes('characters')){try{const r=await rpc('characters');characters=r.characters;renderAssignments()}catch{}}
     initialized=true;
     if(settings.provider==='lumiverse' || permissions.includes('cors_proxy'))void refreshCatalog().catch(()=>{});
-    if(permissions.includes('chat_mutation')){await refreshMessages();await flushCompletion();if(!currentMessage)await prepareLatest(false,true);await recoverCompletion()}
+    if(permissions.includes('chat_mutation')){await refreshPronunciations();await refreshMessages();await flushCompletion();if(!currentMessage)await prepareLatest(false,true);await recoverCompletion()}
     if(!settings.enabled)notice('Readalong is off. No speech requests will be started.');
   });
   return()=>{

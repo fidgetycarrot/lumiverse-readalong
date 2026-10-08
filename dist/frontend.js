@@ -46,11 +46,63 @@ function sanitizeSpeechText(raw, keepVocalTags = false) {
   return parts.join("").replace(/<\/?([a-z][a-z0-9:_-]*)(?:\s[^<>]*)?$/gi, " ");
 }
 
+// src/pronunciation.ts
+var PRONUNCIATION_CUE_PATTERN = String.raw`\[pronounce:[^\]\r\n]*(?:\]|(?=\r?\n)|$)`;
+var LIMIT = 500;
+var normalized = (s) => s.normalize("NFC").trim().toLowerCase();
+var escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+var boundary = String.raw`[\p{L}\p{M}\p{N}_-]`;
+function clean(value, max) {
+  if (typeof value !== "string")
+    return "";
+  const s = value.normalize("NFC").trim().replace(/[ \t]+/g, " ");
+  return s.length && s.length <= max && /^[\p{L}\p{M}\p{N} .’'ʼ\-]+$/u.test(s) && /[\p{L}\p{N}]/u.test(s) ? s : "";
+}
+function pronunciationEntry(raw, source) {
+  if (!raw || typeof raw !== "object")
+    return;
+  const r = raw, name = clean(r.name, 80), spokenAs = clean(r.spokenAs, 100);
+  if (!name || !spokenAs || ["__proto__", "constructor", "prototype", "narrator"].includes(normalized(name)))
+    return;
+  if (r.aliases !== undefined && (!Array.isArray(r.aliases) || r.aliases.length > 10 || r.aliases.some((v) => !clean(v, 80))))
+    return;
+  const aliases = Array.isArray(r.aliases) ? [...new Set(r.aliases.slice(0, 10).map((v) => clean(v, 80)).filter((v) => v && normalized(v) !== normalized(name)))] : [];
+  return { name, spokenAs, aliases, source };
+}
+function normalizePronunciations(raw) {
+  const result = Object.create(null);
+  if (raw && typeof raw === "object")
+    for (const value of Object.values(raw).slice(0, LIMIT)) {
+      const entry = pronunciationEntry(value, value?.source === "manual" ? "manual" : "automatic");
+      if (entry && !result[normalized(entry.name)])
+        result[normalized(entry.name)] = entry;
+    }
+  return result;
+}
+function stripPronunciationCues(text) {
+  return text.replace(new RegExp(PRONUNCIATION_CUE_PATTERN, "gi"), "");
+}
+function tokens(entries) {
+  const map = new Map;
+  for (const entry of Object.values(entries).sort((a, b) => Number(a.source === "manual") - Number(b.source === "manual")))
+    for (const name of [entry.name, ...entry.aliases])
+      map.set(normalized(name), entry.spokenAs);
+  return map;
+}
+function applyPronunciations(text, entries) {
+  const map = tokens(entries);
+  if (!map.size)
+    return text;
+  const pattern = [...map.keys()].sort((a, b) => b.length - a.length).map(escapeRegex).join("|");
+  const replace = (s) => s.replace(new RegExp(`(?<!${boundary})(?:${pattern})(?!${boundary})`, "giu"), (name) => map.get(normalized(name)) ?? name);
+  return text.split(/(<[^<>]*>)/g).map((s) => s.startsWith("<") ? s : replace(s)).join("");
+}
+
 // src/shared.ts
 var EMOTIONS = ["neutral", "happy", "sad", "angry", "worried", "curious", "excited", "sarcastic", "tender", "afraid"];
 var DELIVERIES = ["normal", "whispers", "shouts", "softly", "slowly", "laughs", "sighs"];
 var GEMINI_VOICES = ["Zephyr", "Puck", "Charon", "Kore", "Fenrir", "Leda", "Orus", "Aoede", "Callirrhoe", "Autonoe", "Enceladus", "Iapetus", "Umbriel", "Algieba", "Despina", "Erinome", "Algenib", "Rasalgethi", "Laomedeia", "Achernar", "Alnilam", "Schedar", "Gacrux", "Pulcherrima", "Achird", "Zubenelgenubi", "Vindemiatrix", "Sadachbia", "Sadaltager", "Sulafat"];
-var CUE_PATTERN = String.raw`\[(?:emotion|delivery|speaker):[^\]\r\n]{1,80}\]`;
+var CUE_PATTERN = String.raw`\[(?:emotion|delivery|speaker):[^\]\r\n]{1,80}\]|${PRONUNCIATION_CUE_PATTERN}`;
 var DEFAULTS = {
   provider: "openrouter",
   connectionId: "",
@@ -63,6 +115,7 @@ var DEFAULTS = {
   earlyPlayback: true,
   promptEmotions: true,
   useEmotions: true,
+  promptPronunciations: true,
   inheritVoices: true,
   widgetMinimized: false,
   widgetPosition: null,
@@ -110,6 +163,7 @@ function normalizeSettings(raw) {
     earlyPlayback: r.earlyPlayback !== false,
     promptEmotions: r.promptEmotions !== false,
     useEmotions: r.useEmotions !== false,
+    promptPronunciations: r.promptPronunciations !== false,
     inheritVoices: r.inheritVoices !== false,
     widgetMinimized: r.widgetMinimized === true,
     widgetPosition,
@@ -128,7 +182,7 @@ function stripCues(text) {
   return text.replace(new RegExp(CUE_PATTERN, "gi"), "");
 }
 function plainText(text, keepVocalTags = false) {
-  return sanitizeSpeechText(text, keepVocalTags).replace(/!\[[^\]]*\]\([^)]*\)/g, " ").replace(/\[([^\]]+)\]\([^)]*\)/g, "$1").replace(/^[ \t]*(?:#{1,6}\s+|>\s*|[-+]\s+|\d+\.\s+)/gm, "").replace(/[*_`~]/g, "").replace(/&quot;/g, '"').replace(/&amp;/g, "&").replace(/&#39;/g, "'").replace(/\s+/g, " ").trim();
+  return stripPronunciationCues(sanitizeSpeechText(text, keepVocalTags)).replace(/!\[[^\]]*\]\([^)]*\)/g, " ").replace(/\[([^\]]+)\]\([^)]*\)/g, "$1").replace(/^[ \t]*(?:#{1,6}\s+|>\s*|[-+]\s+|\d+\.\s+)/gm, "").replace(/[*_`~]/g, "").replace(/&quot;/g, '"').replace(/&amp;/g, "&").replace(/&#39;/g, "'").replace(/\s+/g, " ").trim();
 }
 function splitSentences(text) {
   const detection = stripVocalTags(text, true);
@@ -152,7 +206,7 @@ function splitSentences(text) {
   });
 }
 function parseSegments(raw, defaultSpeaker = "", rules = DEFAULT_SPEECH_RULES) {
-  raw = sanitizeSpeechText(raw, true).replace(/!\[[^\]]*\]\([^)]*\)/g, " ").replace(/\[([^\]]+)\]\([^)]*\)/g, "$1");
+  raw = stripPronunciationCues(sanitizeSpeechText(raw, true)).replace(/!\[[^\]]*\]\([^)]*\)/g, " ").replace(/\[([^\]]+)\]\([^)]*\)/g, "$1");
   const cue = new RegExp(`\\[(emotion|delivery|speaker):([^\\]\\r\\n]{1,80})\\]`, "gi");
   const pieces = [];
   let speaker = defaultSpeaker, explicitSpeaker = false, emotion = "", delivery = "";
@@ -964,14 +1018,18 @@ function planSpeech(segments, settings, context) {
     const styleSupported = /gemini-3\.1.*tts|gpt-4o-mini-tts/i.test(snapshot.model) && snapshot.provider !== "browser";
     const emotion = styleSupported ? assignment.emotion : "neutral", delivery = styleSupported ? assignment.delivery : "normal";
     const key = JSON.stringify([snapshot.provider, snapshot.connectionId, snapshot.model, snapshot.voice, emotion, delivery]);
-    const last = passages.at(-1);
     const limit = snapshot.provider === "lumiverse" && /gemini-.*tts/i.test(snapshot.model) ? MAX_NATIVE_PASSAGE_CHARS : MAX_PASSAGE_CHARS;
-    if (last && previousKey === key && last.segment.text.length + segment.text.length + 1 <= limit) {
-      last.segment.text += " " + segment.text;
-      last.segments.push(segment);
-    } else
-      passages.push({ segment: { ...segment, emotion, delivery }, segments: [segment], settings: snapshot, voice: snapshot.voice });
-    previousKey = key;
+    const audioText = applyPronunciations(segment.text, context.pronunciations ?? {});
+    for (const text of audioText.length <= limit ? [audioText] : splitSentences(audioText)) {
+      const last = passages.at(-1);
+      if (last && previousKey === key && last.segment.text.length + text.length + 1 <= limit) {
+        last.segment.text += " " + text;
+        if (last.segments.at(-1) !== segment)
+          last.segments.push(segment);
+      } else
+        passages.push({ segment: { ...segment, text, emotion, delivery }, segments: [segment], settings: snapshot, voice: snapshot.voice });
+      previousKey = key;
+    }
   }
   return passages;
 }
@@ -1344,6 +1402,8 @@ function setup(ctx) {
   let nativeConnections = [], catalogEpoch = 0;
   let characters = [], permissions = [];
   let messages = [], selectedId = "";
+  let pronunciationEntries = {}, pronunciationChatId = "", pronunciationEpoch = 0;
+  const openPronunciations = new Set;
   let playbackId = 0, playing = false, paused = false, currentMessage = null;
   let phase = "idle";
   let checkingSavedAudio = false;
@@ -1381,8 +1441,8 @@ function setup(ctx) {
   const status = el("p", "Loading…", "ra-status");
   status.setAttribute("role", "status");
   status.setAttribute("aria-live", "polite");
-  const player = el("section", "", "ra-card"), config = el("section", "", "ra-card"), voicesCard = el("section", "", "ra-card"), assignmentsCard = el("section", "", "ra-card");
-  root.append(heading, intro, status, player, config, voicesCard, assignmentsCard);
+  const player = el("section", "", "ra-card"), config = el("section", "", "ra-card"), voicesCard = el("section", "", "ra-card"), assignmentsCard = el("section", "", "ra-card"), pronunciationsCard = el("section", "", "ra-card");
+  root.append(heading, intro, status, player, config, voicesCard, assignmentsCard, pronunciationsCard);
   function notice(text, error = false) {
     if (!disposed) {
       status.textContent = text;
@@ -1859,6 +1919,18 @@ function setup(ctx) {
     selectedId = reply.message.id;
     await flushCompletion();
   }
+  async function refreshPronunciations(chatId = ctx.getActiveChat().chatId, messageId) {
+    if (!chatId)
+      return {};
+    const epoch = ++pronunciationEpoch, r = await rpc("pronunciations", { chatId, ...messageId ? { messageId } : {} }), entries = normalizePronunciations(r.entries);
+    if (!disposed && epoch === pronunciationEpoch && ctx.getActiveChat().chatId === chatId) {
+      pronunciationChatId = chatId;
+      pronunciationEntries = entries;
+      renderPronunciations();
+      renderAssignments();
+    }
+    return entries;
+  }
   async function recoverCompletion() {
     if (!initialized || !settings.enabled || disposed || completionRecovery || !permissions.includes("chat_mutation") || !permissions.includes("generation"))
       return;
@@ -1939,6 +2011,7 @@ function setup(ctx) {
     renderPlayer();
     renderVoices();
     renderAssignments();
+    renderPronunciations();
     notice(enabled ? "Readalong is on. Preparing the latest reply…" : "Readalong is off. No speech requests will be started.");
     await saveSettings();
     if (enabled && settings.enabled) {
@@ -1968,7 +2041,13 @@ function setup(ctx) {
     renderPlayer();
     try {
       const snapshot = normalizeSettings(settings);
-      const context = { characters, characterId: currentMessage.characterId, connections: nativeConnections };
+      const chatId = ctx.getActiveChat().chatId;
+      const context = {
+        characters,
+        characterId: currentMessage.characterId,
+        connections: nativeConnections,
+        pronunciations: await refreshPronunciations(chatId, options.restoreOnly ? undefined : message.id)
+      };
       let rules;
       if (snapshot.provider === "lumiverse") {
         const results = await Promise.allSettled([nativeTts.preferences(), ctx.chats.getActive?.() ?? Promise.resolve(null)]);
@@ -2092,7 +2171,7 @@ function setup(ctx) {
       }
     }
   }
-  async function preview(voice, assignment) {
+  async function preview(voice, assignment, sample) {
     if (!settings.enabled)
       throw new Error("Readalong is off. Turn it on to test a voice.");
     stop(false);
@@ -2100,9 +2179,9 @@ function setup(ctx) {
     readingAbort = new AbortController;
     if (settings.provider !== "browser")
       audioPlayer.unlock();
-    const segment = { text: "The door was open. I took a breath, and stepped into the light.", speaker: "Preview", emotion: assignment?.emotion ?? "neutral", delivery: assignment?.delivery ?? "normal" };
+    const segment = { text: sample?.text ?? "The door was open. I took a breath, and stepped into the light.", speaker: "Preview", emotion: assignment?.emotion ?? "neutral", delivery: assignment?.delivery ?? "normal" };
     const snapshot = normalizeSettings({ ...settings, voice, narratorVoice: "", assignments: {}, inheritVoices: false });
-    currentPassages = planSpeech([segment], snapshot, { characters: [] });
+    currentPassages = planSpeech([segment], snapshot, { characters: [], pronunciations: sample?.entries });
     currentSegments = [segment];
     position = 0;
     phase = "preparing";
@@ -2561,6 +2640,100 @@ function setup(ctx) {
       renderAssignments();
     }))));
     container.append(actions);
+    const pronunciation = el("details");
+    pronunciation.append(el("summary", "Name pronunciation for this story"));
+    pronunciationForm(pronunciation, name.split("||")[0].trim(), assignment.voice || settings.voice, assignment);
+    container.append(pronunciation);
+  }
+  function pronunciationForm(container, initialName, voice = settings.voice, assignment, saved) {
+    const chatId = ctx.getActiveChat().chatId;
+    const known = saved ?? Object.values(pronunciationEntries).find((e) => [e.name, ...e.aliases].some((n) => n.toLowerCase() === initialName.toLowerCase()));
+    let name = known?.name ?? initialName, spokenAs = known?.spokenAs ?? "", aliases = (known?.aliases ?? []).join(", ");
+    const nameInput = textInput(name, (v) => name = v);
+    nameInput.maxLength = 80;
+    nameInput.readOnly = !!saved;
+    const soundInput = textInput(spokenAs, (v) => spokenAs = v);
+    soundInput.maxLength = 100;
+    soundInput.placeholder = "For example, Eleese";
+    const aliasInput = textInput(aliases, (v) => aliases = v);
+    aliasInput.maxLength = 810;
+    aliasInput.placeholder = "For example, Elys-04";
+    container.append(field("Name in the story", nameInput), field("Pronounce as", soundInput), field("Other spellings or nicknames (comma separated)", aliasInput));
+    const candidate = () => {
+      const entry = pronunciationEntry({ name, spokenAs, aliases: aliases.split(",").map((s) => s.trim()).filter(Boolean) }, "manual");
+      if (!entry)
+        throw new Error("Enter a name and its spoken spelling first.");
+      if (!chatId || ctx.getActiveChat().chatId !== chatId)
+        throw new Error("Select this story again before saving its pronunciation.");
+      return entry;
+    };
+    const test = button("Test pronunciation", () => safe(async () => {
+      const entry = candidate();
+      await preview(voice, assignment, { text: `${entry.name} arrived. I looked at ${entry.name}. ${entry.name}'s voice was calm.`, entries: normalizePronunciations({ [entry.name]: entry }) });
+    }));
+    test.disabled = !settings.enabled || !chatId;
+    const save = button("Save pronunciation", () => safe(async () => {
+      const entry = candidate(), r = await rpc("save_pronunciation", { chatId, entry });
+      if (disposed || ctx.getActiveChat().chatId !== chatId)
+        return;
+      pronunciationEntries = normalizePronunciations(r.entries);
+      pronunciationChatId = chatId;
+      renderPronunciations();
+      renderAssignments();
+      notice(`Pronunciation saved for ${entry.name}. Existing audio was not regenerated.`);
+    }), true);
+    save.disabled = !chatId;
+    const actions = el("div", "", "ra-row");
+    actions.append(test, save);
+    if (saved)
+      actions.append(button("Remove pronunciation", () => safe(async () => {
+        if (ctx.getActiveChat().chatId !== chatId)
+          return;
+        const r = await rpc("remove_pronunciation", { chatId, name: saved.name });
+        if (disposed || ctx.getActiveChat().chatId !== chatId)
+          return;
+        pronunciationEntries = normalizePronunciations(r.entries);
+        openPronunciations.delete(saved.name);
+        renderPronunciations();
+        renderAssignments();
+        notice(`Pronunciation removed for ${saved.name}. Existing audio was not regenerated.`);
+      })));
+    container.append(actions, el("p", "Saving changes future speech only. Test pronunciation uses one short speech request and may incur a provider charge.", "ra-muted"));
+  }
+  function renderPronunciations() {
+    pronunciationsCard.replaceChildren(el("h3", "Story pronunciations"));
+    pronunciationsCard.append(toggle("Automatically remember new character pronunciations", settings.promptPronunciations, (v) => {
+      settings.promptPronunciations = v;
+      safe(saveSettings);
+    }), el("p", "Readalong asks your existing chat model for a hidden cue when it introduces a new name. The first choice is saved for this chat; your corrections take priority. No preset edit or second LLM is needed. Names and reading markers keep their original spelling.", "ra-muted"));
+    if (!ctx.getActiveChat().chatId) {
+      pronunciationsCard.append(el("p", "Open a story to manage its pronunciations.", "ra-muted"));
+      return;
+    }
+    const entries = pronunciationChatId === ctx.getActiveChat().chatId ? Object.values(pronunciationEntries) : [];
+    pronunciationsCard.append(el("p", `${entries.length} saved pronunciations for this story. Existing recordings change only if you explicitly prepare them again; speech charges may apply.`, "ra-muted"));
+    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+      const row = el("details", "", "ra-cast-entry");
+      row.open = openPronunciations.has(entry.name);
+      row.dataset.pronunciationName = entry.name;
+      row.append(el("summary", `${entry.name} → ${entry.spokenAs} · ${entry.source === "manual" ? "Your correction" : "Automatic"}`));
+      row.addEventListener("toggle", () => {
+        if (row.isConnected) {
+          if (row.open)
+            openPronunciations.add(entry.name);
+          else
+            openPronunciations.delete(entry.name);
+        }
+      });
+      const names = [entry.name, ...entry.aliases].map((n) => n.toLowerCase());
+      const character = characters.find((c) => names.includes(c.name.split("||")[0].trim().toLowerCase())), assigned = names.map((n) => settings.assignments[`name:${n}`]).find(Boolean) ?? (character ? settings.assignments[`id:${character.id}`] : undefined);
+      pronunciationForm(row, entry.name, assigned?.voice || settings.voice, assigned, entry);
+      pronunciationsCard.append(row);
+    }
+    const add = el("details");
+    add.append(el("summary", "Add or correct a name"));
+    pronunciationForm(add, "");
+    pronunciationsCard.append(add);
   }
   function renderAssignments() {
     assignmentsCard.replaceChildren(el("h3", "Character voices"), el("p", "Build a cast with a separate voice for each character or speaker. Readalong voices override inherited Lumiverse voices; choose compatible voices again after changing provider or model.", "ra-muted"));
@@ -2645,6 +2818,7 @@ function setup(ctx) {
       addMember(`name:${name.toLowerCase()}`, name);
     }), el("p", "Speakers do not need a character card. For several people in one reply, use cues such as [speaker:Jason] inside their quotes. The existing chat model can add these when voice cues are enabled; no extra LLM is called.", "ra-muted"));
     assignmentsCard.append(add);
+    renderPronunciations();
   }
   function decorateMessages() {
     for (const { messageId, element } of ctx.dom.listMessageElements()) {
@@ -2665,6 +2839,12 @@ function setup(ctx) {
     completionInbox.reset();
     localGenerations.clear();
     completionRecovery = null;
+    pronunciationEpoch++;
+    pronunciationEntries = {};
+    pronunciationChatId = "";
+    openPronunciations.clear();
+    renderPronunciations();
+    renderAssignments();
     stop(false);
     messages = [];
     selectedId = "";
@@ -2674,6 +2854,7 @@ function setup(ctx) {
     bubbleHandles.clear();
     notice(settings.enabled ? "Looking for saved audio…" : "Readalong is off.");
     safe(async () => {
+      await refreshPronunciations();
       await refreshMessages();
       await prepareLatest(false, true);
     });
@@ -2703,7 +2884,7 @@ function setup(ctx) {
   onEvent("GENERATION_ENDED", (p) => {
     const info = localGenerations.get(p?.generationId);
     localGenerations.delete(p?.generationId);
-    if (p?.chatId !== ctx.getActiveChat().chatId || !p.messageId || p.error || p.generationType === "impersonate" || info?.eligible === false)
+    if (p?.chatId !== ctx.getActiveChat().chatId || !p.messageId || p.error || ["impersonate", "quiet"].includes(p.generationType) || info?.eligible === false)
       return;
     safe(async () => {
       if (!info) {
@@ -2728,6 +2909,7 @@ function setup(ctx) {
   onEvent("CHARACTER_MESSAGE_RENDERED", () => decorateMessages());
   cleanups.push(tab.onActivate(() => {
     safe(async () => {
+      await refreshPronunciations();
       await refreshMessages();
       await recoverCompletion();
     });
@@ -2779,6 +2961,7 @@ function setup(ctx) {
   renderConfig();
   renderVoices();
   renderAssignments();
+  renderPronunciations();
   ctx.ready();
   safe(async () => {
     const r = await rpc("init");
@@ -2807,6 +2990,7 @@ function setup(ctx) {
     renderConfig();
     renderVoices();
     renderAssignments();
+    renderPronunciations();
     installEditor();
     if (r.cueStatus)
       notice(r.cueStatus, true);
@@ -2823,6 +3007,7 @@ function setup(ctx) {
     if (settings.provider === "lumiverse" || permissions.includes("cors_proxy"))
       refreshCatalog().catch(() => {});
     if (permissions.includes("chat_mutation")) {
+      await refreshPronunciations();
       await refreshMessages();
       await flushCompletion();
       if (!currentMessage)

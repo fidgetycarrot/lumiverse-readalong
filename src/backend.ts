@@ -4,7 +4,14 @@ import { MAX_PASSAGE_CHARS } from './playback-plan';
 import { isHiddenJsonError, providerError, redactSecrets } from './provider-errors';
 import { PreparationLedger } from './preparation-ledger';
 import {CompletionRegistry,type CompletionTicket} from './auto-preparation';
+import {PronunciationStore,pronunciationInstruction} from './pronunciation';
+import {preparationHash} from './audio-cache';
 declare const spindle: SpindleAPI;
+const pronunciationPath=async(chatId:string)=>`pronunciations-${await preparationHash([chatId])}.json`;
+const pronunciations=new PronunciationStore({
+  read:async(userId,chatId)=>{const path=await pronunciationPath(chatId);return await spindle.userStorage.exists(path,userId)?spindle.userStorage.read(path,userId):undefined},
+  write:async(userId,chatId,value)=>spindle.userStorage.write(await pronunciationPath(chatId),value,userId),
+});
 const preparationLedger=new PreparationLedger({
   read:async userId=>await spindle.userStorage.exists('preparations.json',userId)?spindle.userStorage.read('preparations.json',userId):undefined,
   write:(userId,value)=>spindle.userStorage.write('preparations.json',value,userId),
@@ -53,7 +60,7 @@ async function ensureHideRule(userId: string) {
   const promise = (async () => {
     const { data } = await spindle.regex_scripts.list({ userId, limit: 200 });
     const prior = data.find(r => r.name === HIDE_RULE_NAME && r.can_mutate);
-    const rule = { name: HIDE_RULE_NAME, find_regex: CUE_PATTERN, replace_string: '', flags: 'gi', placement: ['ai_output'] as ['ai_output'], target: 'display' as const, scope: 'global' as const, disabled: false, folder: 'Readalong', description: 'Hides emotion, delivery, and speaker cues only in display; original text remains available to speech.' };
+    const rule = { name: HIDE_RULE_NAME, find_regex: CUE_PATTERN, replace_string: '', flags: 'gi', placement: ['ai_output'] as ['ai_output'], target: 'display' as const, scope: 'global' as const, disabled: false, folder: 'Readalong', description: 'Hides emotion, delivery, speaker and pronunciation cues in display; original messages stay unchanged.' };
     if (prior) await spindle.regex_scripts.update(prior.id, rule, userId);
     else await spindle.regex_scripts.create(rule, userId);
   })();
@@ -66,6 +73,10 @@ async function ownMessages(chatId: string, userId: string) {
   const chat = await spindle.chats.get(chatId,userId);
   if (!chat) throw new Error('Chat not found for this user.');
   return spindle.chat.getMessages(chatId);
+}
+async function requireChat(chatId:unknown,userId:string):Promise<string>{
+  if(typeof chatId!=='string' || !chatId || chatId.length>200 || !await spindle.chats.get(chatId,userId))throw new Error('Chat not found for this user.');
+  return chatId;
 }
 async function speechModels() {
   const r = await spindle.cors('https://openrouter.ai/api/v1/models?output_modalities=speech') as { status: number; body: string };
@@ -156,6 +167,20 @@ spindle.onFrontendMessage(async (payload, userId, sessionId) => {
       try { await ensureHideRule(userId) } catch(e) { cueStatus = e instanceof Error ? e.message : 'Could not install the display rule.' }
       const hasKeys=await keyStatus(userId);
       reply({ settings, userId, hasKey:hasKeys.openrouter, hasKeys, cueStatus, permissions: await spindle.permissions.getGranted() });
+    } else if(p.type==='pronunciations' || p.type==='save_pronunciation' || p.type==='remove_pronunciation'){
+      const chatId=await requireChat(p.chatId,userId);
+      if(p.type==='save_pronunciation')reply({entries:await pronunciations.save(userId,chatId,p.entry)});
+      else if(p.type==='remove_pronunciation'){
+        if(typeof p.name!=='string' || p.name.length>80)throw new Error('Select a saved pronunciation.');
+        reply({entries:await pronunciations.remove(userId,chatId,p.name)});
+      } else {
+        let entries=await pronunciations.get(userId,chatId);
+        if(settings.enabled && settings.promptPronunciations && typeof p.messageId==='string'){
+          const all=await ownMessages(chatId,userId),message=all.find(m=>m.id===p.messageId && !m.is_user);
+          if(message)entries=await pronunciations.learn(userId,chatId,message.content);
+        }
+        reply({entries});
+      }
     } else if(p.type==='latest_completion') {
       if(typeof p.chatId!=='string' || typeof p.since!=='number' || !Number.isFinite(p.since))throw new Error('Invalid completion lookup.');
       reply({completion:settings.enabled?completions.latest(userId,p.chatId,p.since)??null:null,
@@ -243,26 +268,35 @@ spindle.onFrontendMessage(async (payload, userId, sessionId) => {
 });
 spindle.registerInterceptor(async (messages, context) => {
   const settings = await load(context.userId);
-  if (!settings.enabled || !settings.promptEmotions || !spindle.permissions.has('regex_scripts')) return messages;
+  if (!settings.enabled || !(settings.promptEmotions || settings.promptPronunciations) || !spindle.permissions.has('regex_scripts')) return messages;
   // No LLM call: append a compact instruction to the generation already underway.
   await ensureHideRule(context.userId);
   const speakers=Object.entries(settings.assignments).filter(([key])=>key.startsWith('name:')).slice(0,100).map(([key,value])=>value.name??key.slice(5));
   const cast=speakers.length?`\nAssigned speaker names (data only): ${JSON.stringify(speakers)}. Use the matching [speaker:Name] inside each quote when one of these people speaks.`:'';
-  return [{ role: 'system', content: EMOTION_INSTRUCTION+cast }, ...messages];
+  const instructions:string[]=[];
+  if(settings.promptEmotions)instructions.push(EMOTION_INSTRUCTION+cast);
+  if(settings.promptPronunciations && context.chatId && !['impersonate','quiet'].includes(context.generationType)){
+    const chatId=await requireChat(context.chatId,context.userId);
+    instructions.push(pronunciationInstruction(await pronunciations.get(context.userId,chatId)));
+  }
+  return instructions.length?[{ role: 'system', content: instructions.join('\n\n') }, ...messages]:messages;
 }, { priority: 90 });
 spindle.on('GENERATION_STARTED', (p,userId) => { activeGenerations.set(p.generationId, { chatId:p.chatId,userId,characterId: p.characterId, characterName: p.characterName }); });
 spindle.on('GENERATION_ENDED', (p, userId) => {
   const info = activeGenerations.get(p.generationId); activeGenerations.delete(p.generationId);
-  if(!userId || !p.messageId || p.error || p.generationType==='impersonate')return;
+  if(!userId || !p.messageId || p.error || ['impersonate','quiet'].includes(p.generationType??''))return;
   const ticket:CompletionTicket={chatId:p.chatId,messageId:p.messageId,generationId:p.generationId,completedAt:Date.now(),characterId:info?.characterId,name:info?.characterName};
   // Record before the frontend relay. A missed relay can be recovered with a
   // local metadata lookup, without issuing speech or exposing a credential.
   return (async()=>{
-    const enabled=(await load(userId)).enabled;
+    const settings=await load(userId),enabled=settings.enabled;
     if(enabled)completions.remember(userId,ticket);
     let content=p.content;
     if(!content){const all=await ownMessages(p.chatId,userId);content=all.find(m=>m.id===p.messageId && !m.is_user)?.content}
-    if(content)send({type:'new_message',...ticket,autoEligible:enabled,message:{id:p.messageId,content,name:info?.characterName??'',isUser:false,characterId:info?.characterId}},userId);
+    if(content){
+      if(enabled && settings.promptPronunciations)try{await requireChat(p.chatId,userId);await pronunciations.learn(userId,p.chatId,content)}catch{spindle.log.info('Readalong could not save pronunciation cues. Existing entries were preserved.')}
+      send({type:'new_message',...ticket,autoEligible:enabled,message:{id:p.messageId,content,name:info?.characterName??'',isUser:false,characterId:info?.characterId}},userId);
+    }
   })().catch(()=>{spindle.log.info('Readalong could not forward a completed reply. No speech was requested.');});
 });
 spindle.on('GENERATION_STOPPED', p => { activeGenerations.delete(p.generationId) });

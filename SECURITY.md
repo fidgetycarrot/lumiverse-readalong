@@ -1,6 +1,6 @@
 # Readalong security and privacy notes
 
-Review date: 2026-10-08. Applies to Readalong **0.2.0–0.2.3**. The 0.2.3 update recovers missed completion notifications and preserves the reviewed playback and credential protections. This is a source review and automated/mock verification, not an independent security certification or a guarantee against every possible compromise.
+Review date: 2026-10-08. Applies to Readalong **0.2.0–0.2.4**. The 0.2.4 update adds per-story pronunciation metadata and preserves the reviewed playback and credential protections. This is a source review and automated/mock verification, not an independent security certification or a guarantee against every possible compromise.
 
 ## Where credentials go
 
@@ -33,7 +33,7 @@ Fresh installs start **off**. Turn on explicitly to prepare the latest unattempt
 - Reviewed frontend/backend credential flows, authenticated user scoping, native request targets, error handling, persistence, packaging and permission use.
 - Compared host behavior with the locally inspected Lumiverse source at commit `7398fa5f4fc73eaee1aaa767804312765e84ea79` and Spindle types `0.6.39`. Host behavior can change independently of this extension.
 - Automated tests cover forged-user payloads, other-user credential isolation, blank/failed replacement saves, confirmed removal, URL binding, remote HTTPS, retained legacy credentials, arbitrary secret formats in errors, native error sanitization, initial opt-in and multiple cast voices. Browser checks use synthetic passages, fake credentials and mock speech only.
-- Scanned 77 distinct historical repository blobs through 0.1.9, plus the 0.2.0, 0.2.1, 0.2.2 and 0.2.3 release files, for common OpenRouter/OpenAI/Google key and private-key patterns. No credential matches were found. Pattern scanning cannot identify every possible secret format; test fixtures contain deliberately fake keys.
+- Scanned 77 distinct historical repository blobs through 0.1.9, plus the 0.2.0, 0.2.1, 0.2.2, 0.2.3 and 0.2.4 release files, for common OpenRouter/OpenAI/Google key and private-key patterns. No credential matches were found. Pattern scanning cannot identify every possible secret format; test fixtures contain deliberately fake keys.
 - The distributable contains source, tests, documentation, manifest and prebuilt bundles only. It excludes local settings, keys, audio caches, host databases, test harness data, `.env` files and dependency directories. Builds have no third-party runtime dependency.
 
 No real user credential or paid provider request was used for this review. Acoustic quality and real-provider performance remain separate from these checks. A reasonable release label is **public beta**, with these limits visible to testers.
@@ -41,3 +41,11 @@ No real user credential or paid provider request was used for this review. Acous
 ## Reporting a security concern
 
 Do not put API keys, authorization headers, private chat excerpts, or unredacted logs in public issues or Discord. Share the extension/host versions and a sanitized description first. Revoke a suspected exposed key through its provider. Repository security reports can use GitHub's private reporting option if the owner has enabled it; otherwise contact the maintainer privately before publishing sensitive details.
+
+## Pronunciation metadata
+
+Pronunciations are names, phonetic spellings and aliases, stored as per-user extension files keyed by a SHA-256 of the chat ID. They are not credentials and are not written to the key enclave or chat metadata. Read/save/remove and message-assisted learning RPCs verify the authenticated user owns the chat; supplied user IDs or client text cannot bypass that check. Completed-generation learning uses the host event owner. Automatic learning is disabled when Readalong is off or its automatic-pronunciation setting is off.
+
+The existing chat model receives a compact pronunciation instruction and a bounded saved-name/alias list (80 entries, 4,000 characters), explicitly treated as data. No second model is called. Generated pronunciation cues are untrusted: only readable assistant prose is parsed, names must appear in that prose, fields have restricted characters and lengths, metadata blocks are excluded, and a cue cannot change a saved first choice or manual correction. Entries are bounded to 500 per chat and 10 aliases per name. Manual edits and learning serialize; failed writes and corrupt saved files do not deliberately clear previous rules.
+
+Speech substitutions preserve the displayed story and voice/speaker identity. Pronunciation previews are explicit paid-capable actions. Saving or removing a rule does not synthesize or regenerate recordings; transcript changes participate in audio cache identity and retain the no-automatic-retry ledger. Story names are private user metadata: do not publish runtime user-storage files with an extension package. This release contains only source, built bundles, documentation and fake test fixtures.

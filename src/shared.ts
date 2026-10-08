@@ -1,16 +1,17 @@
 import { sanitizeSpeechText,stripVocalTags } from './speech-text';
+import {PRONUNCIATION_CUE_PATTERN,stripPronunciationCues} from './pronunciation';
 
 export const EMOTIONS = ['neutral', 'happy', 'sad', 'angry', 'worried', 'curious', 'excited', 'sarcastic', 'tender', 'afraid'] as const;
 export const DELIVERIES = ['normal', 'whispers', 'shouts', 'softly', 'slowly', 'laughs', 'sighs'] as const;
 export const GEMINI_VOICES = ['Zephyr','Puck','Charon','Kore','Fenrir','Leda','Orus','Aoede','Callirrhoe','Autonoe','Enceladus','Iapetus','Umbriel','Algieba','Despina','Erinome','Algenib','Rasalgethi','Laomedeia','Achernar','Alnilam','Schedar','Gacrux','Pulcherrima','Achird','Zubenelgenubi','Vindemiatrix','Sadachbia','Sadaltager','Sulafat'];
-export const CUE_PATTERN = String.raw`\[(?:emotion|delivery|speaker):[^\]\r\n]{1,80}\]`;
+export const CUE_PATTERN = String.raw`\[(?:emotion|delivery|speaker):[^\]\r\n]{1,80}\]|${PRONUNCIATION_CUE_PATTERN}`;
 export const HIDE_RULE_NAME = 'Readalong • Hide voice cues';
 export interface VoiceAssignment { voice: string; emotion: string; delivery: string; name?:string }
 export interface Settings {
   provider: 'lumiverse' | 'openrouter' | 'browser' | 'local';
   connectionId: string;
   model: string; voice: string; narratorVoice: string; localUrl: string;
-  enabled: boolean; follow: boolean; earlyPlayback:boolean; promptEmotions: boolean; useEmotions: boolean;
+  enabled: boolean; follow: boolean; earlyPlayback:boolean; promptEmotions: boolean; useEmotions: boolean;promptPronunciations:boolean;
   inheritVoices: boolean; widgetMinimized: boolean; widgetPosition: {x:number;y:number}|null;
   speed: number; volume: number;
   assignments: Record<string, VoiceAssignment>;
@@ -18,7 +19,7 @@ export interface Settings {
 export const DEFAULTS: Settings = {
   provider: 'openrouter', connectionId:'', model: 'google/gemini-3.8-flash-tts', voice: 'Kore', narratorVoice: '',
   localUrl: 'http://localhost:8880/v1', enabled: false, follow: false, earlyPlayback:true,
-  promptEmotions: true, useEmotions: true, inheritVoices:true, widgetMinimized:false, widgetPosition:null, speed: 1, volume: 0.85, assignments: {},
+  promptEmotions: true, useEmotions: true, promptPronunciations:true, inheritVoices:true, widgetMinimized:false, widgetPosition:null, speed: 1, volume: 0.85, assignments: {},
 };
 export interface SpeechSegment { text: string; speaker: string; emotion: string; delivery: string }
 export interface SpeechModel { id: string; name: string; voices: string[] }
@@ -55,7 +56,7 @@ export function normalizeSettings(raw: unknown): Settings {
     model: str(r.model, DEFAULTS.model), voice: str(r.voice, DEFAULTS.voice), narratorVoice: str(r.narratorVoice, ''),
     localUrl: str(r.localUrl, DEFAULTS.localUrl, 500),
     enabled: typeof r.enabled==='boolean'?r.enabled:DEFAULTS.enabled, follow: r.follow === true, earlyPlayback:r.earlyPlayback!==false,
-    promptEmotions: r.promptEmotions !== false, useEmotions: r.useEmotions !== false, inheritVoices:r.inheritVoices!==false, widgetMinimized:r.widgetMinimized===true, widgetPosition,
+    promptEmotions: r.promptEmotions !== false, useEmotions: r.useEmotions !== false,promptPronunciations:r.promptPronunciations!==false, inheritVoices:r.inheritVoices!==false, widgetMinimized:r.widgetMinimized===true, widgetPosition,
     speed: clamp(r.speed, 0.5, 2, 1), volume: clamp(r.volume, 0, 1, .85), assignments,
   };
 }
@@ -64,7 +65,7 @@ function enumValue(v: unknown, values: readonly string[], fallback: string) { re
 export function stripCues(text: string) { return text.replace(new RegExp(CUE_PATTERN, 'gi'), '') }
 // Match rendered prose without depending on React's DOM structure or changing stored messages.
 export function plainText(text: string,keepVocalTags=false): string {
-  return sanitizeSpeechText(text,keepVocalTags).replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
+  return stripPronunciationCues(sanitizeSpeechText(text,keepVocalTags)).replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
     .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
     .replace(/^[ \t]*(?:#{1,6}\s+|>\s*|[-+]\s+|\d+\.\s+)/gm, '')
     .replace(/[*_`~]/g, '').replace(/&quot;/g, '"').replace(/&amp;/g, '&').replace(/&#39;/g, "'")
@@ -90,7 +91,7 @@ export function splitSentences(text: string): string[] {
     });
 }
 export function parseSegments(raw: string, defaultSpeaker = '', rules:SpeechRules=DEFAULT_SPEECH_RULES): SpeechSegment[] {
-  raw = sanitizeSpeechText(raw,true).replace(/!\[[^\]]*\]\([^)]*\)/g,' ')
+  raw = stripPronunciationCues(sanitizeSpeechText(raw,true)).replace(/!\[[^\]]*\]\([^)]*\)/g,' ')
     .replace(/\[([^\]]+)\]\([^)]*\)/g,'$1');
   const cue = new RegExp(`\\[(emotion|delivery|speaker):([^\\]\\r\\n]{1,80})\\]`, 'gi');
   const pieces:SpeechSegment[]=[];
@@ -176,4 +177,4 @@ export function speechRequest(settings: Settings, segment: SpeechSegment, charac
   }
   return body;
 }
-export const EMOTION_INSTRUCTION = `When vocal delivery matters, add sparse voice cues immediately before the affected sentence, using [emotion:neutral|happy|sad|angry|worried|curious|excited|sarcastic|tender|afraid] and optionally [delivery:normal|whispers|shouts|softly|slowly|laughs|sighs]. Choose one value per cue, not the list. Put [speaker:Character Name] inside the opening quotation mark of that character's dialogue. Quoted dialogue ends that speaker's cues; surrounding prose automatically uses the narrator. Repeat a speaker cue for each quote that needs a different character. For intentional unquoted speech, cues persist until [speaker:narrator] or another speaker cue; a speaker change resets emotion and delivery. Use the character's name, preserve ordinary prose and formatting, and avoid tagging every sentence. These cues are hidden from the reader and used only for speech. Do not add any other square-bracket audio instructions. Preserve inline vocal tags requested by the preset.`;
+export const EMOTION_INSTRUCTION = `When vocal delivery matters, add sparse voice cues immediately before the affected sentence, using [emotion:neutral|happy|sad|angry|worried|curious|excited|sarcastic|tender|afraid] and optionally [delivery:normal|whispers|shouts|softly|slowly|laughs|sighs]. Choose one value per cue, not the list. Put [speaker:Character Name] inside the opening quotation mark of that character's dialogue. Quoted dialogue ends that speaker's cues; surrounding prose automatically uses the narrator. Repeat a speaker cue for each quote that needs a different character. For intentional unquoted speech, cues persist until [speaker:narrator] or another speaker cue; a speaker change resets emotion and delivery. Use the character's name, preserve ordinary prose and formatting, and avoid tagging every sentence. These cues are hidden from the reader and used only for speech. Do not add unrelated square-bracket audio instructions. Preserve inline vocal tags requested by the preset.`;

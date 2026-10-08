@@ -1,11 +1,12 @@
 import { selectVoice, speakerCharacterId, splitSentences, readVoiceRef, type CharacterInfo, type NativeVoiceRef, type Settings, type SpeechSegment } from './shared';
 import type { NativeConnection } from './native-tts';
 import { stripVocalTags } from './speech-text';
+import {applyPronunciations,type Pronunciations} from './pronunciation';
 
 export const MAX_PASSAGE_CHARS=3000;
 export const MAX_NATIVE_PASSAGE_CHARS=12000;
 export interface SpeechPassage { segment:SpeechSegment;segments:SpeechSegment[];settings:Settings;voice:string }
-export interface VoiceContext { characters:CharacterInfo[];characterId?:string;connections?:NativeConnection[];narrationVoice?:NativeVoiceRef;overrides?:{narrator?:unknown;characters?:Record<string,unknown>} }
+export interface VoiceContext { characters:CharacterInfo[];characterId?:string;connections?:NativeConnection[];narrationVoice?:NativeVoiceRef;pronunciations?:Pronunciations;overrides?:{narrator?:unknown;characters?:Record<string,unknown>} }
 
 /** Resolve voices before batching, so narrator/character boundaries survive. */
 export function planSpeech(segments:SpeechSegment[], settings:Settings, context:VoiceContext):SpeechPassage[] {
@@ -33,12 +34,17 @@ export function planSpeech(segments:SpeechSegment[], settings:Settings, context:
     const styleSupported=/gemini-3\.1.*tts|gpt-4o-mini-tts/i.test(snapshot.model) && snapshot.provider!=='browser';
     const emotion=styleSupported?assignment.emotion:'neutral', delivery=styleSupported?assignment.delivery:'normal';
     const key=JSON.stringify([snapshot.provider,snapshot.connectionId,snapshot.model,snapshot.voice,emotion,delivery]);
-    const last=passages.at(-1);
     const limit=snapshot.provider==='lumiverse' && /gemini-.*tts/i.test(snapshot.model)?MAX_NATIVE_PASSAGE_CHARS:MAX_PASSAGE_CHARS;
-    if(last && previousKey===key && last.segment.text.length+segment.text.length+1<=limit) {
-      last.segment.text+=' '+segment.text;last.segments.push(segment);
-    } else passages.push({segment:{...segment,emotion,delivery},segments:[segment],settings:snapshot,voice:snapshot.voice});
-    previousKey=key;
+    const audioText=applyPronunciations(segment.text,context.pronunciations??{});
+    // A short spelling can expand substantially. Keep provider batches bounded
+    // without losing any audio or replacing the marker's original sentence.
+    for(const text of audioText.length<=limit?[audioText]:splitSentences(audioText)){
+      const last=passages.at(-1);
+      if(last && previousKey===key && last.segment.text.length+text.length+1<=limit) {
+        last.segment.text+=' '+text;if(last.segments.at(-1)!==segment)last.segments.push(segment);
+      } else passages.push({segment:{...segment,text,emotion,delivery},segments:[segment],settings:snapshot,voice:snapshot.voice});
+      previousKey=key;
+    }
   }
   return passages;
 }

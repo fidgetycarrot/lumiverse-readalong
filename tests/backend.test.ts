@@ -20,7 +20,7 @@ let messageReads=0;
   enclave:{has:async(k:string,u:string)=>keys.has(u+k),put:async(k:string,v:string,u:string)=>{if(saveFailure)throw new Error('Failed to save custom-secret-fixture');keys.set(u+k,v)},get:async(k:string,u:string)=>keys.get(u+k),delete:async(k:string,u:string)=>keys.delete(u+k)},
   regex_scripts:{list:async()=>({data:rules,total:rules.length}),create:async(r:any)=>{const s={...r,id:'rule',can_mutate:true};rules.push(s);return s},update:async()=>{}},
   characters:{list:async()=>({data:[{id:'mara',name:'Mara',extensions:{ttsVoice:{connectionId:'saved',voice:'Puck',metadata:'do-not-project'},other:'do-not-project'}}]})},
-  chats:{get:async(id:string,u:string)=>id===`${u}-chat`?{id}:null},
+  chats:{get:async(id:string,u:string)=>[`${u}-chat`,`${u}-second-chat`].includes(id)?{id}:null},
   chat:{getMessages:async()=>{messageReads++;return[{id:'m1',name:'Mara',is_user:false,content:'Hello.'}]}},
   cors:async(url:string,options:any)=>{
     requests.push({url,options});
@@ -42,6 +42,35 @@ async function call(type:string,data:any={},user='one',session:string|null='tab1
   return outgoing.find(r=>r.p.requestId===requestId);
 }
 describe('backend provider and session integration',()=>{
+  test('pronunciation cues are injected by Readalong independently of emotion settings with no model request',async()=>{
+    await call('save',{settings:{...DEFAULTS,promptEmotions:false}},'pronunciation-one');const before=requests.length;
+    const input=[{role:'user',content:'Continue.'}],context={userId:'pronunciation-one',chatId:'pronunciation-one-chat'};
+    const result=await interceptor(input,context);expect(result[0].content).toContain('[pronounce:Name|Spoken spelling]');expect(result[0].content).not.toContain('[emotion:');
+    expect(await interceptor(input,{...context,generationType:'quiet'})).toEqual(input);
+    await call('save',{settings:{...DEFAULTS,promptEmotions:false,promptPronunciations:false}},'pronunciation-one');expect(await interceptor(input,context)).toEqual(input);expect(requests.length).toBe(before);
+  });
+  test('completed introductions persist pronunciation once and manual corrections win without synthesis',async()=>{
+    await call('save',{settings:DEFAULTS},'pronunciation-one');const before=requests.length;
+    const complete=(id:string,as:string)=>listeners.get('GENERATION_ENDED')!({generationId:id,chatId:'pronunciation-one-chat',messageId:'m1',content:`[pronounce:Elys|${as}] Elys arrived.`},'pronunciation-one');
+    await complete('pron-g1','Ellis');expect((await call('pronunciations',{chatId:'pronunciation-one-chat'},'pronunciation-one')).p.data.entries.elys.spokenAs).toBe('Ellis');
+    await complete('pron-g2','Elise');expect((await call('pronunciations',{chatId:'pronunciation-one-chat'},'pronunciation-one')).p.data.entries.elys.spokenAs).toBe('Ellis');
+    await call('save_pronunciation',{chatId:'pronunciation-one-chat',entry:{name:'Elys',spokenAs:'Eleese',aliases:['Elys-04']}},'pronunciation-one');
+    await complete('pron-g3','Ellis');expect((await call('pronunciations',{chatId:'pronunciation-one-chat'},'pronunciation-one')).p.data.entries.elys).toMatchObject({spokenAs:'Eleese',source:'manual'});
+    const prompt=await interceptor([],{userId:'pronunciation-one',chatId:'pronunciation-one-chat'});expect(prompt[0].content).toContain('Elys-04');expect(requests.length).toBe(before);
+  });
+  test('pronunciation RPCs enforce ownership and story isolation; client text cannot seed automatic entries',async()=>{
+    for(const type of ['pronunciations','save_pronunciation','remove_pronunciation'])expect((await call(type,{chatId:'pronunciation-one-chat',userId:'pronunciation-one',entry:{name:'Elys',spokenAs:'Wrong'},name:'Elys'},'another-user')).p.error).toContain('Chat not found');
+    expect((await call('pronunciations',{chatId:'pronunciation-one-second-chat'},'pronunciation-one')).p.data.entries).toEqual({});
+    expect((await call('pronunciations',{chatId:'pronunciation-one-second-chat',messageId:'m1',content:'[pronounce:Fake|Fayk] Fake.'},'pronunciation-one')).p.data.entries).toEqual({});
+    await call('remove_pronunciation',{chatId:'pronunciation-one-chat',name:'Elys'},'pronunciation-one');expect((await call('pronunciations',{chatId:'pronunciation-one-chat'},'pronunciation-one')).p.data.entries).toEqual({});
+  });
+  test('off mode and disabled automatic pronunciation do not learn new names',async()=>{
+    for(const settings of [{...DEFAULTS,enabled:false},{...DEFAULTS,promptPronunciations:false}]){
+      await call('save',{settings},'pronunciation-off');
+      await listeners.get('GENERATION_ENDED')!({generationId:'pron-off-g',chatId:'pronunciation-off-chat',messageId:'m1',content:'[pronounce:Elys|Eleese] Elys arrived.'},'pronunciation-off');
+      expect((await call('pronunciations',{chatId:'pronunciation-off-chat',messageId:'m1'},'pronunciation-off')).p.data.entries).toEqual({});
+    }
+  });
   test('completion delivery and recovery are available while on without making speech',async()=>{
     await call('save',{settings:DEFAULTS},'completion-one');const before=requests.length;
     listeners.get('GENERATION_STARTED')!({generationId:'complete-g1',chatId:'completion-one-chat',characterId:'mara',characterName:'Mara'},'completion-one');
@@ -75,7 +104,7 @@ describe('backend provider and session integration',()=>{
   });
   test('failed, stopped and impersonated generations do not register automatic preparation',async()=>{
     await call('save',{settings:DEFAULTS},'completion-invalid');
-    for(const extra of [{error:'failed'},{generationType:'impersonate'},{messageId:undefined}])await listeners.get('GENERATION_ENDED')!({generationId:'bad-g',chatId:'completion-invalid-chat',messageId:'m1',content:'Skip.',...extra},'completion-invalid');
+    for(const extra of [{error:'failed'},{generationType:'impersonate'},{generationType:'quiet'},{messageId:undefined}])await listeners.get('GENERATION_ENDED')!({generationId:'bad-g',chatId:'completion-invalid-chat',messageId:'m1',content:'Skip.',...extra},'completion-invalid');
     expect((await call('latest_completion',{chatId:'completion-invalid-chat',since:0},'completion-invalid')).p.data.completion).toBeNull();
   });
   test('fresh installs stay off and updating existing settings preserves opt-in',async()=>{

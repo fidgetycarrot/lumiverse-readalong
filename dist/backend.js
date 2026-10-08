@@ -2,6 +2,7 @@
 // src/speech-text.ts
 var PROSE_TAGS = new Set(`p div span section article header footer main aside nav address blockquote q cite figure figcaption hgroup ul ol li dl dt dd menu br hr wbr h1 h2 h3 h4 h5 h6 b strong i em u s strike del ins mark small big sub sup abbr acronym dfn kbd samp var time font tt bdi bdo data ruby rb rp rt rtc a table thead tbody tfoot tr td th caption col colgroup label legend fieldset`.split(" "));
 var VOID_TAGS = new Set("area base br col embed hr img input link meta param source track wbr".split(" "));
+var ENTITIES = { nbsp: " ", amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", ldquo: "\u201C", rdquo: "\u201D", lsquo: "\u2018", rsquo: "\u2019" };
 var VOCAL_TAGS = ["laugh", "laughter", "chuckle", "chuckles", "giggle", "snicker", "cackle", "cheer", "gasp", "sigh", "sighs", "groan", "grunt", "grr", "growl", "hiss", "moan", "pant", "pff", "phew", "tsk", "whispers", "whispering", "shout", "argh", "whimper", "cry", "sob", "scream", "shriek", "snort", "breath", "heavy breath", "exhales", "cough", "throat-clearing", "sneeze", "yawn", "short pause", "long pause"];
 var vocalTags = new Set(VOCAL_TAGS);
 function vocalTag(tag) {
@@ -12,11 +13,188 @@ function vocalTag(tag) {
 function stripVocalTags(text, preserveOffsets = false) {
   return text.replace(/<[^<>]*>/g, (tag) => vocalTag(tag) ? " ".repeat(preserveOffsets ? tag.length : 1) : tag);
 }
+function decodeEntities(text) {
+  return text.replace(/&(#x[\da-f]+|#\d+|[a-z]+);/gi, (entity, name) => {
+    if (name[0] !== "#")
+      return ENTITIES[name.toLowerCase()] ?? entity;
+    const code = name[1].toLowerCase() === "x" ? parseInt(name.slice(2), 16) : parseInt(name.slice(1), 10);
+    return code > 0 && code <= 1114111 && !(code >= 55296 && code <= 57343) ? String.fromCodePoint(code) : entity;
+  });
+}
+function sanitizeSpeechText(raw, keepVocalTags = false) {
+  const text = decodeEntities(raw).replace(/<!--\s*([a-z0-9_]+)_START\s*-->[\s\S]*?(?:<!--\s*\1_END\s*-->|$)/gi, " ").replace(/<!--[\s\S]*?(?:-->|$)/g, " ").replace(/```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)/g, " ").replace(/(`+)[\s\S]*?\1/g, " ");
+  const tags = /<(\/?)([a-z][a-z0-9:_-]*)(?=[\s/>])(?:[^<>"']|"[^"]*"|'[^']*')*>/gi;
+  const blocked = [], parts = [];
+  let cursor = 0;
+  for (const match of text.matchAll(tags)) {
+    if (!blocked.length)
+      parts.push(text.slice(cursor, match.index), " ");
+    const tag = match[2].toLowerCase();
+    const vocal = vocalTag(match[0]);
+    if (vocal) {
+      if (!blocked.length && keepVocalTags)
+        parts.push(vocal, " ");
+    } else if (match[1]) {
+      const index = blocked.lastIndexOf(tag);
+      if (index !== -1)
+        blocked.splice(index);
+    } else if (!PROSE_TAGS.has(tag) && !VOID_TAGS.has(tag) && !/\/\s*>$/.test(match[0]))
+      blocked.push(tag);
+    cursor = match.index + match[0].length;
+  }
+  if (!blocked.length)
+    parts.push(text.slice(cursor));
+  return parts.join("").replace(/<\/?([a-z][a-z0-9:_-]*)(?:\s[^<>]*)?$/gi, " ");
+}
+
+// src/pronunciation.ts
+var PRONUNCIATION_CUE_PATTERN = String.raw`\[pronounce:[^\]\r\n]*(?:\]|(?=\r?\n)|$)`;
+var LIMIT = 500;
+var normalized = (s) => s.normalize("NFC").trim().toLowerCase();
+var escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+var boundary = String.raw`[\p{L}\p{M}\p{N}_-]`;
+function clean(value, max) {
+  if (typeof value !== "string")
+    return "";
+  const s = value.normalize("NFC").trim().replace(/[ \t]+/g, " ");
+  return s.length && s.length <= max && /^[\p{L}\p{M}\p{N} .\u2019'\u02BC\-]+$/u.test(s) && /[\p{L}\p{N}]/u.test(s) ? s : "";
+}
+function pronunciationEntry(raw, source) {
+  if (!raw || typeof raw !== "object")
+    return;
+  const r = raw, name = clean(r.name, 80), spokenAs = clean(r.spokenAs, 100);
+  if (!name || !spokenAs || ["__proto__", "constructor", "prototype", "narrator"].includes(normalized(name)))
+    return;
+  if (r.aliases !== undefined && (!Array.isArray(r.aliases) || r.aliases.length > 10 || r.aliases.some((v) => !clean(v, 80))))
+    return;
+  const aliases = Array.isArray(r.aliases) ? [...new Set(r.aliases.slice(0, 10).map((v) => clean(v, 80)).filter((v) => v && normalized(v) !== normalized(name)))] : [];
+  return { name, spokenAs, aliases, source };
+}
+function normalizePronunciations(raw) {
+  const result = Object.create(null);
+  if (raw && typeof raw === "object")
+    for (const value of Object.values(raw).slice(0, LIMIT)) {
+      const entry = pronunciationEntry(value, value?.source === "manual" ? "manual" : "automatic");
+      if (entry && !result[normalized(entry.name)])
+        result[normalized(entry.name)] = entry;
+    }
+  return result;
+}
+function stripPronunciationCues(text) {
+  return text.replace(new RegExp(PRONUNCIATION_CUE_PATTERN, "gi"), "");
+}
+function tokens(entries) {
+  const map = new Map;
+  for (const entry of Object.values(entries).sort((a, b) => Number(a.source === "manual") - Number(b.source === "manual")))
+    for (const name of [entry.name, ...entry.aliases])
+      map.set(normalized(name), entry.spokenAs);
+  return map;
+}
+function learnPronunciations(entries, raw) {
+  const result = normalizePronunciations(entries), safe = sanitizeSpeechText(raw, true), prose = stripPronunciationCues(safe);
+  const claimed = tokens(result);
+  for (const match of safe.matchAll(new RegExp(PRONUNCIATION_CUE_PATTERN, "gi"))) {
+    if (!match[0].endsWith("]") || match[0].length > 252)
+      continue;
+    const parts = match[0].slice("[pronounce:".length, -1).split("|");
+    if (parts.length !== 2)
+      continue;
+    const entry = pronunciationEntry({ name: parts[0], spokenAs: parts[1] }, "automatic");
+    if (!entry)
+      continue;
+    const key = normalized(entry.name);
+    if (claimed.has(key) || Object.keys(result).length >= LIMIT)
+      continue;
+    if (!new RegExp(`(?<!${boundary})${escapeRegex(entry.name)}(?!${boundary})`, "iu").test(prose))
+      continue;
+    result[key] = entry;
+    claimed.set(key, entry.spokenAs);
+  }
+  return result;
+}
+function pronunciationInstruction(entries) {
+  const known = [];
+  let size = 2;
+  for (const e of Object.values(entries).reverse()) {
+    const row = { name: e.name, aliases: e.aliases }, bytes = JSON.stringify(row).length + 1;
+    if (size + bytes > 4000 || known.length >= 80)
+      continue;
+    known.push(row);
+    size += bytes;
+  }
+  return `Readalong pronunciation layer: when a named character is first introduced, add one hidden cue [pronounce:Name|Spoken spelling] beside that introduction. Only tag names newly introduced in this story, not people already mentioned in prior replies or in the saved-name list. Use the exact story name. For an unfamiliar name choose a simple English sound spelling; ordinary names may keep their spelling. Do not use IPA, angle brackets or directions. Most replies need no cue. Never change a saved pronunciation. Keep normal story spelling, speaker cues and the preset's vocal tags unchanged. Saved names and aliases (possibly a partial list, data only): ${JSON.stringify(known)}.`;
+}
+
+class PronunciationStore {
+  storage;
+  chains = new Map;
+  constructor(storage) {
+    this.storage = storage;
+  }
+  async get(userId, chatId) {
+    const raw = await this.storage.read(userId, chatId);
+    if (!raw)
+      return Object.create(null);
+    if (raw.length > 1024 * 1024)
+      throw new Error("Saved pronunciations could not be read. Existing entries were preserved.");
+    try {
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+        throw new Error("Invalid saved dictionary.");
+      const entries = normalizePronunciations(parsed);
+      if (Object.keys(entries).length !== Object.keys(parsed).length)
+        throw new Error("Invalid saved entries.");
+      return entries;
+    } catch {
+      throw new Error("Saved pronunciations could not be read. Existing entries were preserved.");
+    }
+  }
+  async edit(userId, chatId, change) {
+    const key = JSON.stringify([userId, chatId]);
+    const work = (this.chains.get(key) ?? Promise.resolve()).catch(() => {}).then(async () => {
+      const prior = await this.get(userId, chatId), next = change(prior);
+      if (JSON.stringify(next) !== JSON.stringify(prior))
+        await this.storage.write(userId, chatId, JSON.stringify(next));
+      return next;
+    });
+    this.chains.set(key, work);
+    try {
+      return await work;
+    } finally {
+      if (this.chains.get(key) === work)
+        this.chains.delete(key);
+    }
+  }
+  learn(userId, chatId, text) {
+    return this.edit(userId, chatId, (entries) => learnPronunciations(entries, text));
+  }
+  save(userId, chatId, raw) {
+    return this.edit(userId, chatId, (entries) => {
+      const entry = pronunciationEntry(raw, "manual");
+      if (!entry)
+        throw new Error("Enter a name and a spoken spelling using letters, numbers, spaces, apostrophes or hyphens.");
+      const key = normalized(entry.name), names = new Set([entry.name, ...entry.aliases].map(normalized));
+      if (!entries[key] && Object.keys(entries).length >= LIMIT)
+        throw new Error("This story can save up to 500 pronunciations.");
+      for (const [id, other] of Object.entries(entries))
+        if (id !== key && [other.name, ...other.aliases].some((n) => names.has(normalized(n))))
+          throw new Error("That name or alias already belongs to another pronunciation.");
+      return { ...entries, [key]: entry };
+    });
+  }
+  remove(userId, chatId, name) {
+    return this.edit(userId, chatId, (entries) => {
+      const next = { ...entries };
+      delete next[normalized(name)];
+      return next;
+    });
+  }
+}
 
 // src/shared.ts
 var EMOTIONS = ["neutral", "happy", "sad", "angry", "worried", "curious", "excited", "sarcastic", "tender", "afraid"];
 var DELIVERIES = ["normal", "whispers", "shouts", "softly", "slowly", "laughs", "sighs"];
-var CUE_PATTERN = String.raw`\[(?:emotion|delivery|speaker):[^\]\r\n]{1,80}\]`;
+var CUE_PATTERN = String.raw`\[(?:emotion|delivery|speaker):[^\]\r\n]{1,80}\]|${PRONUNCIATION_CUE_PATTERN}`;
 var HIDE_RULE_NAME = "Readalong \u2022 Hide voice cues";
 var DEFAULTS = {
   provider: "openrouter",
@@ -30,6 +208,7 @@ var DEFAULTS = {
   earlyPlayback: true,
   promptEmotions: true,
   useEmotions: true,
+  promptPronunciations: true,
   inheritVoices: true,
   widgetMinimized: false,
   widgetPosition: null,
@@ -69,6 +248,7 @@ function normalizeSettings(raw) {
     earlyPlayback: r.earlyPlayback !== false,
     promptEmotions: r.promptEmotions !== false,
     useEmotions: r.useEmotions !== false,
+    promptPronunciations: r.promptPronunciations !== false,
     inheritVoices: r.inheritVoices !== false,
     widgetMinimized: r.widgetMinimized === true,
     widgetPosition,
@@ -124,7 +304,7 @@ function speechRequest(settings, segment, characterId) {
   }
   return body;
 }
-var EMOTION_INSTRUCTION = `When vocal delivery matters, add sparse voice cues immediately before the affected sentence, using [emotion:neutral|happy|sad|angry|worried|curious|excited|sarcastic|tender|afraid] and optionally [delivery:normal|whispers|shouts|softly|slowly|laughs|sighs]. Choose one value per cue, not the list. Put [speaker:Character Name] inside the opening quotation mark of that character's dialogue. Quoted dialogue ends that speaker's cues; surrounding prose automatically uses the narrator. Repeat a speaker cue for each quote that needs a different character. For intentional unquoted speech, cues persist until [speaker:narrator] or another speaker cue; a speaker change resets emotion and delivery. Use the character's name, preserve ordinary prose and formatting, and avoid tagging every sentence. These cues are hidden from the reader and used only for speech. Do not add any other square-bracket audio instructions. Preserve inline vocal tags requested by the preset.`;
+var EMOTION_INSTRUCTION = `When vocal delivery matters, add sparse voice cues immediately before the affected sentence, using [emotion:neutral|happy|sad|angry|worried|curious|excited|sarcastic|tender|afraid] and optionally [delivery:normal|whispers|shouts|softly|slowly|laughs|sighs]. Choose one value per cue, not the list. Put [speaker:Character Name] inside the opening quotation mark of that character's dialogue. Quoted dialogue ends that speaker's cues; surrounding prose automatically uses the narrator. Repeat a speaker cue for each quote that needs a different character. For intentional unquoted speech, cues persist until [speaker:narrator] or another speaker cue; a speaker change resets emotion and delivery. Use the character's name, preserve ordinary prose and formatting, and avoid tagging every sentence. These cues are hidden from the reader and used only for speech. Do not add unrelated square-bracket audio instructions. Preserve inline vocal tags requested by the preset.`;
 
 // src/playback-plan.ts
 var MAX_PASSAGE_CHARS = 3000;
@@ -225,7 +405,21 @@ class CompletionRegistry {
   }
 }
 
+// src/audio-cache.ts
+async function preparationHash(value) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(value)));
+  return Array.from(new Uint8Array(digest), (n) => n.toString(16).padStart(2, "0")).join("");
+}
+
 // src/backend.ts
+var pronunciationPath = async (chatId) => `pronunciations-${await preparationHash([chatId])}.json`;
+var pronunciations = new PronunciationStore({
+  read: async (userId, chatId) => {
+    const path = await pronunciationPath(chatId);
+    return await spindle.userStorage.exists(path, userId) ? spindle.userStorage.read(path, userId) : undefined;
+  },
+  write: async (userId, chatId, value) => spindle.userStorage.write(await pronunciationPath(chatId), value, userId)
+});
 var preparationLedger = new PreparationLedger({
   read: async (userId) => await spindle.userStorage.exists("preparations.json", userId) ? spindle.userStorage.read("preparations.json", userId) : undefined,
   write: (userId, value) => spindle.userStorage.write("preparations.json", value, userId)
@@ -300,7 +494,7 @@ async function ensureHideRule(userId) {
   const promise = (async () => {
     const { data } = await spindle.regex_scripts.list({ userId, limit: 200 });
     const prior = data.find((r) => r.name === HIDE_RULE_NAME && r.can_mutate);
-    const rule = { name: HIDE_RULE_NAME, find_regex: CUE_PATTERN, replace_string: "", flags: "gi", placement: ["ai_output"], target: "display", scope: "global", disabled: false, folder: "Readalong", description: "Hides emotion, delivery, and speaker cues only in display; original text remains available to speech." };
+    const rule = { name: HIDE_RULE_NAME, find_regex: CUE_PATTERN, replace_string: "", flags: "gi", placement: ["ai_output"], target: "display", scope: "global", disabled: false, folder: "Readalong", description: "Hides emotion, delivery, speaker and pronunciation cues in display; original messages stay unchanged." };
     if (prior)
       await spindle.regex_scripts.update(prior.id, rule, userId);
     else
@@ -322,6 +516,11 @@ async function ownMessages(chatId, userId) {
   if (!chat)
     throw new Error("Chat not found for this user.");
   return spindle.chat.getMessages(chatId);
+}
+async function requireChat(chatId, userId) {
+  if (typeof chatId !== "string" || !chatId || chatId.length > 200 || !await spindle.chats.get(chatId, userId))
+    throw new Error("Chat not found for this user.");
+  return chatId;
 }
 async function speechModels() {
   const r = await spindle.cors("https://openrouter.ai/api/v1/models?output_modalities=speech");
@@ -452,6 +651,23 @@ spindle.onFrontendMessage(async (payload, userId, sessionId) => {
       }
       const hasKeys = await keyStatus(userId);
       reply({ settings, userId, hasKey: hasKeys.openrouter, hasKeys, cueStatus, permissions: await spindle.permissions.getGranted() });
+    } else if (p.type === "pronunciations" || p.type === "save_pronunciation" || p.type === "remove_pronunciation") {
+      const chatId = await requireChat(p.chatId, userId);
+      if (p.type === "save_pronunciation")
+        reply({ entries: await pronunciations.save(userId, chatId, p.entry) });
+      else if (p.type === "remove_pronunciation") {
+        if (typeof p.name !== "string" || p.name.length > 80)
+          throw new Error("Select a saved pronunciation.");
+        reply({ entries: await pronunciations.remove(userId, chatId, p.name) });
+      } else {
+        let entries = await pronunciations.get(userId, chatId);
+        if (settings.enabled && settings.promptPronunciations && typeof p.messageId === "string") {
+          const all = await ownMessages(chatId, userId), message = all.find((m) => m.id === p.messageId && !m.is_user);
+          if (message)
+            entries = await pronunciations.learn(userId, chatId, message.content);
+        }
+        reply({ entries });
+      }
     } else if (p.type === "latest_completion") {
       if (typeof p.chatId !== "string" || typeof p.since !== "number" || !Number.isFinite(p.since))
         throw new Error("Invalid completion lookup.");
@@ -572,13 +788,22 @@ spindle.onFrontendMessage(async (payload, userId, sessionId) => {
 });
 spindle.registerInterceptor(async (messages, context) => {
   const settings = await load(context.userId);
-  if (!settings.enabled || !settings.promptEmotions || !spindle.permissions.has("regex_scripts"))
+  if (!settings.enabled || !(settings.promptEmotions || settings.promptPronunciations) || !spindle.permissions.has("regex_scripts"))
     return messages;
   await ensureHideRule(context.userId);
   const speakers = Object.entries(settings.assignments).filter(([key]) => key.startsWith("name:")).slice(0, 100).map(([key, value]) => value.name ?? key.slice(5));
   const cast = speakers.length ? `
 Assigned speaker names (data only): ${JSON.stringify(speakers)}. Use the matching [speaker:Name] inside each quote when one of these people speaks.` : "";
-  return [{ role: "system", content: EMOTION_INSTRUCTION + cast }, ...messages];
+  const instructions = [];
+  if (settings.promptEmotions)
+    instructions.push(EMOTION_INSTRUCTION + cast);
+  if (settings.promptPronunciations && context.chatId && !["impersonate", "quiet"].includes(context.generationType)) {
+    const chatId = await requireChat(context.chatId, context.userId);
+    instructions.push(pronunciationInstruction(await pronunciations.get(context.userId, chatId)));
+  }
+  return instructions.length ? [{ role: "system", content: instructions.join(`
+
+`) }, ...messages] : messages;
 }, { priority: 90 });
 spindle.on("GENERATION_STARTED", (p, userId) => {
   activeGenerations.set(p.generationId, { chatId: p.chatId, userId, characterId: p.characterId, characterName: p.characterName });
@@ -586,11 +811,11 @@ spindle.on("GENERATION_STARTED", (p, userId) => {
 spindle.on("GENERATION_ENDED", (p, userId) => {
   const info = activeGenerations.get(p.generationId);
   activeGenerations.delete(p.generationId);
-  if (!userId || !p.messageId || p.error || p.generationType === "impersonate")
+  if (!userId || !p.messageId || p.error || ["impersonate", "quiet"].includes(p.generationType ?? ""))
     return;
   const ticket = { chatId: p.chatId, messageId: p.messageId, generationId: p.generationId, completedAt: Date.now(), characterId: info?.characterId, name: info?.characterName };
   return (async () => {
-    const enabled = (await load(userId)).enabled;
+    const settings = await load(userId), enabled = settings.enabled;
     if (enabled)
       completions.remember(userId, ticket);
     let content = p.content;
@@ -598,8 +823,16 @@ spindle.on("GENERATION_ENDED", (p, userId) => {
       const all = await ownMessages(p.chatId, userId);
       content = all.find((m) => m.id === p.messageId && !m.is_user)?.content;
     }
-    if (content)
+    if (content) {
+      if (enabled && settings.promptPronunciations)
+        try {
+          await requireChat(p.chatId, userId);
+          await pronunciations.learn(userId, p.chatId, content);
+        } catch {
+          spindle.log.info("Readalong could not save pronunciation cues. Existing entries were preserved.");
+        }
       send({ type: "new_message", ...ticket, autoEligible: enabled, message: { id: p.messageId, content, name: info?.characterName ?? "", isUser: false, characterId: info?.characterId } }, userId);
+    }
   })().catch(() => {
     spindle.log.info("Readalong could not forward a completed reply. No speech was requested.");
   });
