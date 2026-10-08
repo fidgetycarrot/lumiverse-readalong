@@ -1,3 +1,37 @@
+// src/speech-text.ts
+var PROSE_TAGS = new Set(`p div span section article header footer main aside nav address blockquote q cite figure figcaption hgroup ul ol li dl dt dd menu br hr wbr h1 h2 h3 h4 h5 h6 b strong i em u s strike del ins mark small big sub sup abbr acronym dfn kbd samp var time font tt bdi bdo data ruby rb rp rt rtc a table thead tbody tfoot tr td th caption col colgroup label legend fieldset`.split(" "));
+var VOID_TAGS = new Set("area base br col embed hr img input link meta param source track wbr".split(" "));
+var ENTITIES = { nbsp: " ", amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", ldquo: "“", rdquo: "”", lsquo: "‘", rsquo: "’" };
+function decodeEntities(text) {
+  return text.replace(/&(#x[\da-f]+|#\d+|[a-z]+);/gi, (entity, name) => {
+    if (name[0] !== "#")
+      return ENTITIES[name.toLowerCase()] ?? entity;
+    const code = name[1].toLowerCase() === "x" ? parseInt(name.slice(2), 16) : parseInt(name.slice(1), 10);
+    return code > 0 && code <= 1114111 && !(code >= 55296 && code <= 57343) ? String.fromCodePoint(code) : entity;
+  });
+}
+function sanitizeSpeechText(raw) {
+  const text = decodeEntities(raw).replace(/<!--\s*([a-z0-9_]+)_START\s*-->[\s\S]*?(?:<!--\s*\1_END\s*-->|$)/gi, " ").replace(/<!--[\s\S]*?(?:-->|$)/g, " ").replace(/```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)/g, " ").replace(/(`+)[\s\S]*?\1/g, " ");
+  const tags = /<(\/?)([a-z][a-z0-9:_-]*)(?=[\s/>])(?:[^<>"']|"[^"]*"|'[^']*')*>/gi;
+  const blocked = [], parts = [];
+  let cursor = 0;
+  for (const match of text.matchAll(tags)) {
+    if (!blocked.length)
+      parts.push(text.slice(cursor, match.index), " ");
+    const tag = match[2].toLowerCase();
+    if (match[1]) {
+      const index = blocked.lastIndexOf(tag);
+      if (index !== -1)
+        blocked.splice(index);
+    } else if (!PROSE_TAGS.has(tag) && !VOID_TAGS.has(tag) && !/\/\s*>$/.test(match[0]))
+      blocked.push(tag);
+    cursor = match.index + match[0].length;
+  }
+  if (!blocked.length)
+    parts.push(text.slice(cursor));
+  return parts.join("").replace(/<\/?([a-z][a-z0-9:_-]*)(?:\s[^<>]*)?$/gi, " ");
+}
+
 // src/shared.ts
 var EMOTIONS = ["neutral", "happy", "sad", "angry", "worried", "curious", "excited", "sarcastic", "tender", "afraid"];
 var DELIVERIES = ["normal", "whispers", "shouts", "softly", "slowly", "laughs", "sighs"];
@@ -72,21 +106,21 @@ function stripCues(text) {
   return text.replace(new RegExp(CUE_PATTERN, "gi"), "");
 }
 function plainText(text) {
-  return text.replace(/```[^]*?```/g, " ").replace(/!\[[^\]]*\]\([^)]*\)/g, " ").replace(/\[([^\]]+)\]\([^)]*\)/g, "$1").replace(/<[^>]*>/g, " ").replace(/^[ \t]*(?:#{1,6}\s+|>\s*|[-+]\s+|\d+\.\s+)/gm, "").replace(/[*_`~]/g, "").replace(/&quot;/g, '"').replace(/&amp;/g, "&").replace(/&#39;/g, "'").replace(/\s+/g, " ").trim();
+  return sanitizeSpeechText(text).replace(/!\[[^\]]*\]\([^)]*\)/g, " ").replace(/\[([^\]]+)\]\([^)]*\)/g, "$1").replace(/^[ \t]*(?:#{1,6}\s+|>\s*|[-+]\s+|\d+\.\s+)/gm, "").replace(/[*_`~]/g, "").replace(/&quot;/g, '"').replace(/&amp;/g, "&").replace(/&#39;/g, "'").replace(/\s+/g, " ").trim();
 }
 function splitSentences(text) {
   return Array.from(new Intl.Segmenter(undefined, { granularity: "sentence" }).segment(text), (s) => s.segment.trim()).filter(Boolean).flatMap((s) => s.length <= 650 ? [s] : s.match(/.{1,600}(?:\s|$)|.{1,600}/gu).map((x) => x.trim()).filter(Boolean));
 }
 function parseSegments(raw, defaultSpeaker = "", rules = DEFAULT_SPEECH_RULES) {
-  raw = raw.replace(/```[^]*?```/g, " ").replace(/!\[[^\]]*\]\([^)]*\)/g, " ").replace(/\[([^\]]+)\]\([^)]*\)/g, "$1").replace(/<[^>]*>/g, " ").replace(/&quot;/g, '"');
+  raw = sanitizeSpeechText(raw).replace(/!\[[^\]]*\]\([^)]*\)/g, " ").replace(/\[([^\]]+)\]\([^)]*\)/g, "$1");
   const cue = new RegExp(`\\[(emotion|delivery|speaker):([^\\]\\r\\n]{1,80})\\]`, "gi");
   const pieces = [];
   let speaker = defaultSpeaker, explicitSpeaker = false, emotion = "", delivery = "";
   const classify = (text, action) => {
+    if (action === "skip")
+      return;
     let offset = 0, prefix = "", appended = false;
     const append = (prose) => {
-      if (!explicitSpeaker && action === "skip")
-        return;
       const text = plainText(prose);
       if (!text)
         return;
@@ -128,7 +162,14 @@ function parseSegments(raw, defaultSpeaker = "", rules = DEFAULT_SPEECH_RULES) {
   let cursor = 0;
   for (const match of detection.matchAll(pattern)) {
     classify(raw.slice(cursor, match.index), rules.undecorated);
-    classify(raw.slice(match.index, match.index + match[0].length), match[1] === undefined ? rules.quoted : rules.asterisked);
+    const quoted = match[1] === undefined;
+    classify(raw.slice(match.index, match.index + match[0].length), quoted ? rules.quoted : rules.asterisked);
+    if (quoted) {
+      speaker = defaultSpeaker;
+      explicitSpeaker = false;
+      emotion = "";
+      delivery = "";
+    }
     cursor = match.index + match[0].length;
   }
   classify(raw.slice(cursor), rules.undecorated);
@@ -1996,7 +2037,7 @@ function setup(ctx) {
         settings.inheritVoices = v;
         safe(saveSettings);
       }));
-    voicesCard.append(el("p", "Quoted dialogue uses the speaking character; surrounding prose uses the narrator. Speaker cues override this detection. Choose different voices to hear the switch.", "ra-muted"));
+    voicesCard.append(el("p", "Quoted dialogue uses the speaking character; surrounding prose uses the narrator. A speaker cue inside a quote selects its character and ends at the closing quote. Choose different voices to hear the switch.", "ra-muted"));
   }
   function assignmentForm(key, name, container) {
     const assignment = { ...settings.assignments[key] ?? { voice: "", emotion: "neutral", delivery: "normal" } };

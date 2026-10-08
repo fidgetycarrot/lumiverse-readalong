@@ -14,6 +14,13 @@ test('untagged straight and curly dialogue switches between narrator and charact
 test('explicit speaker cues override quote detection and persist until changed',()=>{
   expect(plan('[speaker:Rowan] No quotes needed. I am speaking. [speaker:narrator] “A quote in narration.”').map(p=>p.voice)).toEqual(['Puck','Charon']);
 });
+test('a speaker cue on quoted dialogue releases the narrator after the closing quote',()=>{
+  for(const [open,close] of [['“','”'],['"','"'],['«','»']]) {
+    const passages=plan(`The door opened. [speaker:Rowan][emotion:angry][delivery:shouts] ${open}Come in.${close} She waited. ${open}[speaker:Rowan] Thank you.${close} The room was quiet.`);
+    expect(passages.map(p=>p.voice)).toEqual(['Charon','Puck','Charon','Puck','Charon']);
+    expect(passages[2].segments[0]).toMatchObject({speaker:'narrator',emotion:'',delivery:''});
+  }
+});
 test('emotion cues alone do not prevent automatic narration detection',()=>{
   expect(plan('[emotion:worried] She frowned. “Is it safe?”').map(p=>p.voice)).toEqual(['Charon','Kore']);
   const tagged=plan('She frowned. “[emotion:worried] Is it safe? [delivery:softly] Please tell me.” Then she waited.');

@@ -1,11 +1,26 @@
 import { describe,test,expect } from 'bun:test';
 import { pcmToWav } from '../src/audio';
 import { createNativeTtsClient,nativeSpeechRequest,type NativeConnection } from '../src/native-tts';
-import { DEFAULTS } from '../src/shared';
+import { DEFAULTS,normalizeSettings,parseSegments } from '../src/shared';
+import {planSpeech} from '../src/playback-plan';
 const connection:NativeConnection={id:'saved-router',name:'My OpenRouter',provider:'openrouter_tts',model:DEFAULTS.model,voice:'Kore'};
 const settings={...DEFAULTS,provider:'lumiverse' as const,connectionId:connection.id};
 const segment={text:'Are you sure?',speaker:'Mara',emotion:'worried',delivery:'whispers'};
 describe('native Lumiverse TTS',()=>{
+  test('Autonoe narration and assigned Fenrir dialogue reach the native endpoint separately',async()=>{
+    const chosen=normalizeSettings({...settings,voice:'Autonoe',narratorVoice:'Autonoe',inheritVoices:true,assignments:{'id:elys':{voice:'Fenrir',emotion:'tender',delivery:'normal'}}});
+    const characters=[{id:'elys',name:'Elys-04 || I misclicked and now I have a femboy android maid',ttsVoice:{connectionId:'saved-router',voice:'Kore'}}];
+    const raw='He covered the screen. “[speaker:Elys-04][emotion:tender] May I see?” He turned the phone around. <scenecard><sc-stella>Hidden commentary.</sc-stella></scenecard> “[speaker:Elys-04] Thank you.”';
+    const passages=planSpeech(parseSegments(raw,'Elys-04'),chosen,{characters,characterId:'elys',connections:[connection],narrationVoice:{connectionId:connection.id,voice:'Kore'}});
+    const requests:any[]=[];
+    const client=createNativeTtsClient((async(_url:any,init:any)=>{requests.push(JSON.parse(init.body));return new Response(new Uint8Array(2),{headers:{'Content-Type':'audio/pcm'}})}) as unknown as typeof fetch);
+    for(const p of passages)await client.speech(connection,p.settings,p.segment);
+    expect(requests.map(r=>[r.voice,r.text])).toEqual([
+      ['Autonoe','He covered the screen.'],['Fenrir','“May I see?”'],['Autonoe','He turned the phone around.'],['Fenrir','“Thank you.”'],
+    ]);
+    expect(requests.every(r=>r.connectionId==='saved-router' && r.outputFormat==='pcm')).toBe(true);
+    expect(JSON.stringify(requests)).not.toMatch(/speaker:|emotion:|scenecard|commentary/);
+  });
   test('native preferences project only narration voice and valid detection rules',async()=>{
     const calls:any[]=[];const client=createNativeTtsClient((async(url:any,init:any)=>{calls.push({url,init});return Response.json({value:{narrationVoice:{connectionId:'narrator',voice:'Charon',other:'do-not-project'},speechDetectionRules:{quoted:'speech',asterisked:'skip',undecorated:'speech'},sttLanguage:'do-not-project'}})}) as unknown as typeof fetch);
     expect(await client.preferences()).toEqual({narrationVoice:{connectionId:'narrator',voice:'Charon'},rules:{quoted:'speech',asterisked:'skip',undecorated:'speech'}});

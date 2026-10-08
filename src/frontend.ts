@@ -464,7 +464,7 @@ export function setup(ctx: SpindleFrontendContext) {
     if(!names.length)voicesCard.append(el('p','This model has no voice list yet. Refresh models, or enter the voice ID below.','ra-muted'),field('Voice ID',textInput(settings.voice,v=>settings.voice=v)));
     voicesCard.append(field('Narrator voice',voiceSelect(settings.narratorVoice,v=>{settings.narratorVoice=v;void safe(saveSettings)},true)));
     if(settings.provider==='lumiverse')voicesCard.append(toggle('Use Lumiverse’s saved character and narrator voices when no Readalong voice is assigned',settings.inheritVoices,v=>{settings.inheritVoices=v;void safe(saveSettings)}));
-    voicesCard.append(el('p','Quoted dialogue uses the speaking character; surrounding prose uses the narrator. Speaker cues override this detection. Choose different voices to hear the switch.','ra-muted'));
+    voicesCard.append(el('p','Quoted dialogue uses the speaking character; surrounding prose uses the narrator. A speaker cue inside a quote selects its character and ends at the closing quote. Choose different voices to hear the switch.','ra-muted'));
   }
   function assignmentForm(key: string, name: string, container: HTMLElement) {
     const assignment={...(settings.assignments[key]??{voice:'',emotion:'neutral',delivery:'normal'})};
