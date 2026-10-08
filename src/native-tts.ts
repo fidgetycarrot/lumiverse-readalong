@@ -1,6 +1,6 @@
 import { pcmBlobToWav } from './prepared-audio';
 import { selectVoice, speechInput, readVoiceRef, DEFAULT_SPEECH_RULES, type SpeechRules, type Settings, type SpeechSegment } from './shared';
-import { providerError, redactSecrets } from './provider-errors';
+import { nativeProviderError } from './provider-errors';
 export interface NativeConnection { id:string;name:string;provider:string;model:string;voice:string;outputFormat?:string }
 const API = '/api/v1';
 async function boundedBytes(response:Response, limit:number):Promise<Uint8Array> {
@@ -35,9 +35,9 @@ export function createNativeTtsClient(transport:typeof fetch = fetch) {
   }
   async function readJson(response:Response):Promise<any> {
     const text=new TextDecoder().decode(await boundedBytes(response,1024*1024));
-    if (!response.ok) throw new Error(providerError('Lumiverse TTS',response.status,text));
+    if (!response.ok) throw new Error(nativeProviderError(response.status,text));
     let data:any;try{data=JSON.parse(text)}catch{throw new Error('Lumiverse returned an unexpected TTS response.')}
-    if (typeof data.error==='string')throw new Error(redactSecrets(data.error.slice(0,600)));return data;
+    if (typeof data.error==='string')throw new Error(nativeProviderError(response.status,text));return data;
   }
   return {
     async preferences() {
@@ -70,7 +70,7 @@ export function createNativeTtsClient(transport:typeof fetch = fetch) {
     },
     async check(id:string):Promise<string> {
       const result=await readJson(await request(`/tts-connections/${encodeURIComponent(id)}/test`,{method:'POST'}));
-      if(result.success!==true)throw new Error(typeof result.message==='string'?redactSecrets(result.message.slice(0,600)):'Lumiverse could not connect to this TTS provider.');
+      if(result.success!==true)throw new Error(`Connection check failed. ${nativeProviderError(200,JSON.stringify({error:result.message}))}`);
       return 'Lumiverse accepts this saved TTS connection. Click Listen to test a voice. No speech was generated.';
     },
     async speech(connection:NativeConnection, settings:Settings, segment:SpeechSegment, characterId?:string, signal?:AbortSignal):Promise<{blob:Blob;mime:string}> {
@@ -78,7 +78,7 @@ export function createNativeTtsClient(transport:typeof fetch = fetch) {
       const response=await request('/tts/synthesize',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal});
       const mime=response.headers.get('content-type')?.toLowerCase() ?? '';
       if(!response.ok || mime.includes('json')) {
-        const text=new TextDecoder().decode(await boundedBytes(response,64*1024));throw new Error(providerError('Lumiverse TTS',response.status,text));
+        const text=new TextDecoder().decode(await boundedBytes(response,64*1024));throw new Error(nativeProviderError(response.status,text));
       }
       if(!mime.startsWith('audio/') && !mime.startsWith('application/ogg'))throw new Error('Lumiverse returned an unsupported speech response.');
       const blob=await response.blob();signal?.throwIfAborted();

@@ -2,7 +2,8 @@ import { describe, test, expect } from 'bun:test';
 import { DEFAULTS, CUE_PATTERN, normalizeSettings, parseSegments, selectVoice, speakerCharacterId, speechInput, speechRequest, stripCues, plainText } from '../src/shared';
 import { locateText,normalizeText } from '../src/highlight';
 test('on/off settings persist and legacy autoplay does not restore automatic playback',()=>{
-  expect(normalizeSettings({autoPlay:true}).enabled).toBe(true);
+  expect(normalizeSettings({autoPlay:true}).enabled).toBe(false);
+  expect(normalizeSettings({enabled:true,autoPlay:true}).enabled).toBe(true);
   expect(normalizeSettings({enabled:false,autoPlay:true}).enabled).toBe(false);
   expect(normalizeSettings({autoPlay:true})).not.toHaveProperty('autoPlay');
 });

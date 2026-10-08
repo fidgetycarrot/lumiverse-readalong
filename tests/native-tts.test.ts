@@ -22,7 +22,7 @@ describe('native Lumiverse TTS',()=>{
   });
   test('Autonoe narration and assigned Fenrir dialogue reach the native endpoint separately',async()=>{
     const chosen=normalizeSettings({...settings,voice:'Autonoe',narratorVoice:'Autonoe',inheritVoices:true,assignments:{'id:elys':{voice:'Fenrir',emotion:'tender',delivery:'normal'}}});
-    const characters=[{id:'elys',name:'Elys-04 || I misclicked and now I have a femboy android maid',ttsVoice:{connectionId:'saved-router',voice:'Kore'}}];
+    const characters=[{id:'elys',name:'Elys-04 || Android mystery character',ttsVoice:{connectionId:'saved-router',voice:'Kore'}}];
     const raw='He covered the screen. “[speaker:Elys-04][emotion:tender] May I see?” He turned the phone around. <scenecard><sc-stella>Hidden commentary.</sc-stella></scenecard> “[speaker:Elys-04] Thank you.”';
     const passages=planSpeech(parseSegments(raw,'Elys-04'),chosen,{characters,characterId:'elys',connections:[connection],narrationVoice:{connectionId:connection.id,voice:'Kore'}});
     const requests:any[]=[];
@@ -33,6 +33,22 @@ describe('native Lumiverse TTS',()=>{
     ]);
     expect(requests.every(r=>r.connectionId==='saved-router' && r.outputFormat==='pcm')).toBe(true);
     expect(JSON.stringify(requests)).not.toMatch(/speaker:|emotion:|scenecard|commentary/);
+  });
+  test('a larger cast uses distinct native voices and releases narration between dialogue',async()=>{
+    const raw='The room went quiet. “[speaker:Elys-04] I saw him.” “[speaker:Jason] When?” “[speaker:Vasquez] Before dawn.” The clock stopped.';
+    const chosen=normalizeSettings({...settings,narratorVoice:'Autonoe',assignments:{'id:elys':{voice:'Fenrir'},'name:jason':{voice:'Charon',name:'Jason'},'name:vasquez':{voice:'Orus',name:'Vasquez'}}});
+    const passages=planSpeech(parseSegments(raw,'Elys-04'),chosen,{characters:[{id:'elys',name:'Android card'}],characterId:'elys'});
+    const requests:any[]=[];const client=createNativeTtsClient((async(_url:any,init:any)=>{requests.push(JSON.parse(init.body));return new Response(new Uint8Array(2),{headers:{'Content-Type':'audio/pcm'}})}) as unknown as typeof fetch);
+    for(const p of passages)await client.speech(connection,p.settings,p.segment);
+    expect(requests.map(r=>r.voice)).toEqual(['Autonoe','Fenrir','Charon','Orus','Autonoe']);
+    expect(JSON.stringify(requests)).not.toContain('speaker:');expect(JSON.stringify(requests)).not.toContain('api_key');
+  });
+  test('native errors and failed connection checks never echo arbitrary key formats',async()=>{
+    const secret='unknown-format-native-fixture';
+    const error=createNativeTtsClient((async()=>Response.json({error:'Rejected '+secret},{status:502})) as unknown as typeof fetch);
+    await expect(error.speech(connection,settings,segment)).rejects.not.toThrow(secret);
+    const check=createNativeTtsClient((async()=>Response.json({success:false,message:'Invalid API key '+secret})) as unknown as typeof fetch);
+    await expect(check.check(connection.id)).rejects.not.toThrow(secret);
   });
   test('native preferences project only narration voice and valid detection rules',async()=>{
     const calls:any[]=[];const client=createNativeTtsClient((async(url:any,init:any)=>{calls.push({url,init});return Response.json({value:{narrationVoice:{connectionId:'narrator',voice:'Charon',other:'do-not-project'},speechDetectionRules:{quoted:'speech',asterisked:'skip',undecorated:'speech'},sttLanguage:'do-not-project'}})}) as unknown as typeof fetch);

@@ -58,7 +58,7 @@ var DEFAULTS = {
   voice: "Kore",
   narratorVoice: "",
   localUrl: "http://localhost:8880/v1",
-  enabled: true,
+  enabled: false,
   follow: false,
   promptEmotions: true,
   useEmotions: true,
@@ -95,7 +95,7 @@ function normalizeSettings(raw) {
     for (const [key, v] of Object.entries(r.assignments).slice(0, 500)) {
       if (!v || typeof v !== "object" || ["__proto__", "constructor", "prototype"].includes(key))
         continue;
-      assignments[key.slice(0, 200)] = { voice: str(v.voice, "", 160), emotion: enumValue(v.emotion, EMOTIONS, "neutral"), delivery: enumValue(v.delivery, DELIVERIES, "normal") };
+      assignments[key.slice(0, 200)] = { voice: str(v.voice, "", 160), emotion: enumValue(v.emotion, EMOTIONS, "neutral"), delivery: enumValue(v.delivery, DELIVERIES, "normal"), ...typeof v.name === "string" ? { name: str(v.name, "", 80) } : {} };
     }
   return {
     connectionId: str(r.connectionId, "", 160),
@@ -104,7 +104,7 @@ function normalizeSettings(raw) {
     voice: str(r.voice, DEFAULTS.voice),
     narratorVoice: str(r.narratorVoice, ""),
     localUrl: str(r.localUrl, DEFAULTS.localUrl, 500),
-    enabled: r.enabled !== false,
+    enabled: typeof r.enabled === "boolean" ? r.enabled : DEFAULTS.enabled,
     follow: r.follow === true,
     promptEmotions: r.promptEmotions !== false,
     useEmotions: r.useEmotions !== false,
@@ -690,8 +690,26 @@ class PreparedPlayer {
 // src/provider-errors.ts
 function redactSecrets(message, secret) {
   if (secret)
-    message = message.split(secret).join("[redacted]");
-  return message.replace(/Bearer\s+[^\s"']+|sk-or-v1-[^\s"']+/gi, "[redacted]");
+    for (const value of new Set([secret, encodeURIComponent(secret), JSON.stringify(secret).slice(1, -1)]))
+      message = message.split(value).join("[redacted]");
+  return message.replace(/Bearer\s+[^\s"']+|sk-or-v1-[^\s"']+|\bsk-[a-z0-9_-]{8,}|\bAIza[a-z0-9_-]{20,}/gi, "[redacted]").replace(/((?:api[_ -]?key|authorization|access[_ -]?token|secret)\s*[=:]\s*)[^\s,;]+/gi, "$1[redacted]");
+}
+function nativeProviderError(status, body) {
+  let message = "";
+  try {
+    const data = JSON.parse(body);
+    message = typeof data.error === "string" ? data.error : data.error?.message ?? data.message ?? "";
+  } catch {}
+  const hints = [
+    [/only supports.*pcm|response_format.*pcm/i, "This Gemini model requires PCM audio."],
+    [/insufficient.*credit|credit.*(?:exhaust|balance)|payment required/i, "Check your speech credit and spending limit."],
+    [/api.?key|unauthori[sz]ed|authentication|credential/i, "Check the saved API key in Lumiverse’s voice settings."],
+    [/rate.?limit|too many requests/i, "The provider is rate limited. Wait before trying again."],
+    [/voice.*(?:reject|invalid|unsupported|not found)/i, "Check that the selected voice is supported by this model."],
+    [/model.*(?:unavailable|not found|unsupported|access)/i, "Check model availability and access for this connection."]
+  ];
+  const hint = hints.find(([pattern]) => pattern.test(String(message)))?.[1];
+  return `${status >= 400 ? providerError("Lumiverse TTS", status, "") : "Lumiverse could not complete the TTS request."}${hint ? ` ${hint}` : ""}`;
 }
 function providerError(label, status, body, secret) {
   let detail = "";
@@ -773,7 +791,7 @@ function createNativeTtsClient(transport = fetch) {
   async function readJson(response) {
     const text = new TextDecoder().decode(await boundedBytes(response, 1024 * 1024));
     if (!response.ok)
-      throw new Error(providerError("Lumiverse TTS", response.status, text));
+      throw new Error(nativeProviderError(response.status, text));
     let data;
     try {
       data = JSON.parse(text);
@@ -781,7 +799,7 @@ function createNativeTtsClient(transport = fetch) {
       throw new Error("Lumiverse returned an unexpected TTS response.");
     }
     if (typeof data.error === "string")
-      throw new Error(redactSecrets(data.error.slice(0, 600)));
+      throw new Error(nativeProviderError(response.status, text));
     return data;
   }
   return {
@@ -821,7 +839,7 @@ function createNativeTtsClient(transport = fetch) {
     async check(id) {
       const result = await readJson(await request(`/tts-connections/${encodeURIComponent(id)}/test`, { method: "POST" }));
       if (result.success !== true)
-        throw new Error(typeof result.message === "string" ? redactSecrets(result.message.slice(0, 600)) : "Lumiverse could not connect to this TTS provider.");
+        throw new Error(`Connection check failed. ${nativeProviderError(200, JSON.stringify({ error: result.message }))}`);
       return "Lumiverse accepts this saved TTS connection. Click Listen to test a voice. No speech was generated.";
     },
     async speech(connection, settings, segment, characterId, signal) {
@@ -830,7 +848,7 @@ function createNativeTtsClient(transport = fetch) {
       const mime = response.headers.get("content-type")?.toLowerCase() ?? "";
       if (!response.ok || mime.includes("json")) {
         const text = new TextDecoder().decode(await boundedBytes(response, 64 * 1024));
-        throw new Error(providerError("Lumiverse TTS", response.status, text));
+        throw new Error(nativeProviderError(response.status, text));
       }
       if (!mime.startsWith("audio/") && !mime.startsWith("application/ogg"))
         throw new Error("Lumiverse returned an unsupported speech response.");
@@ -1047,6 +1065,7 @@ var STYLE = `
 .ra .ra-status{font-size:13px;min-height:20px;line-height:1.45}.ra .ra-error{color:#e99087}.ra .ra-passage{margin:12px 0;padding:12px;border-left:3px solid #e7b24c;background:rgba(245,190,80,.08);line-height:1.6;font-size:15px;}
 .ra progress{width:100%;height:5px;accent-color:#e7b24c}.ra .ra-voice-list{display:flex;gap:7px;flex-wrap:wrap;max-height:240px;overflow:auto;padding:4px 0;}
 .ra .ra-voice-list button{padding:6px 10px;font-size:12px}.ra .ra-voice-list button[aria-pressed=true]{border-color:#e7b24c;background:rgba(245,190,80,.12)}
+.ra .ra-cast-entry{border:1px solid var(--lumiverse-border,#555);border-radius:9px;padding:10px 12px;margin:10px 0;}.ra .ra-cast-entry>summary{font-weight:600;overflow-wrap:anywhere;}.ra .ra-cast-entry .ra-cast-form{padding-top:5px;}
 .ra-bubble{display:flex;gap:8px;align-items:center;padding:5px 0;font-size:12px}.ra-bubble button{padding:5px 9px;font-size:12px;}.ra details>summary{cursor:pointer;font-size:13px;margin:8px 0;}
 .ra-mini{font:13px/1.4 system-ui,sans-serif;color:var(--lumiverse-text,#eee);padding:12px;background:var(--lumiverse-bg,#202026);height:100%;box-sizing:border-box;}
 .ra-mini .ra-row{display:flex;gap:7px;align-items:center}.ra-mini .ra-caption{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin:7px 0;color:var(--lumiverse-text-muted,#aaa);}
@@ -1078,6 +1097,7 @@ function button(text, action, primary = false) {
 }
 function field(label, input) {
   const l = el("label", "", "ra-field");
+  input.setAttribute("aria-label", label);
   l.append(el("span", label), input);
   return l;
 }
@@ -1112,7 +1132,10 @@ function timeLabel(seconds) {
   return `${Math.floor(value / 60)}:${String(value % 60).padStart(2, "0")}`;
 }
 function setup(ctx) {
-  let settings = normalizeSettings(DEFAULTS), hasKey = false, ready = false, initialized = false, disposed = false;
+  let settings = normalizeSettings(DEFAULTS), ready = false, initialized = false, disposed = false;
+  const hasKeys = { openrouter: false, local: false }, frontendId = crypto.randomUUID();
+  const castDrafts = new Map, openCast = new Set;
+  let castInitialized = false;
   let canDiagnoseSpeech = false, diagnosing = false, diagnoseButton = null;
   let diagnoseHint = null;
   let models = [{ id: DEFAULTS.model, name: "Google: Gemini 3.8 Flash TTS", voices: GEMINI_VOICES }];
@@ -1198,7 +1221,7 @@ function setup(ctx) {
         reject(new Error("Readalong timed out. Check the extension permissions and connection."));
       }, 70000);
       pending.set(requestId, { resolve, reject, timer });
-      ctx.sendToBackend({ type, requestId, ...payload });
+      ctx.sendToBackend({ type, requestId, frontendId, ...payload });
     });
   }
   cleanups.push(ctx.onBackendMessage((payload) => {
@@ -2051,23 +2074,29 @@ function setup(ctx) {
     if (settings.provider === "local")
       config.append(field("API base URL", textInput(settings.localUrl, (v) => settings.localUrl = v)), field("Model ID", textInput(settings.model, (v) => settings.model = v)));
     if (settings.provider !== "browser" && settings.provider !== "lumiverse") {
+      const provider = settings.provider;
       const key = textInput("", () => {}, "password");
       key.autocomplete = "off";
-      key.placeholder = settings.provider === "openrouter" && hasKey ? "Key saved · leave blank to keep it" : "Paste your API key";
+      key.placeholder = hasKeys[provider] ? "Key saved · leave blank to keep it" : "Paste your API key";
       config.append(field("API key", key), button("Save key", () => safe(async () => {
         if (!key.value.trim())
           throw new Error("Paste a key first.");
-        const r = await rpc("save_key", { key: key.value, provider: settings.provider });
-        hasKey = r.hasKey;
+        const r = await rpc("save_key", { key: key.value, provider, localUrl: settings.localUrl });
+        hasKeys[provider] = r.hasKey;
         key.value = "";
         key.placeholder = "Key saved";
         notice("API key saved securely.");
       })), button("Remove saved key", () => safe(async () => {
-        await rpc("save_key", { key: "", provider: settings.provider });
-        hasKey = false;
+        const result = await ctx.ui.showConfirm({ title: "Remove saved key?", message: `Remove the Readalong ${provider === "local" ? "local-provider" : "OpenRouter"} key? Lumiverse’s saved TTS connections are unaffected.`, variant: "danger", confirmLabel: "Remove key" });
+        if (!result.confirmed)
+          return;
+        await rpc("remove_key", { provider, confirmed: true });
+        hasKeys[provider] = false;
         key.placeholder = "Paste your API key";
         notice("Saved key removed.");
       })));
+      if (provider === "local")
+        config.append(el("p", "A local key is bound to this exact server address. Changing the address requires saving a key for it again. Remote servers with keys must use HTTPS.", "ra-muted"));
       config.append(el("p", "Your key stays in encrypted extension storage. Each preview or reading makes a speech request to this connection.", "ra-muted"));
       config.append(button("Check connection", () => safe(async () => {
         notice("Checking connection…");
@@ -2145,12 +2174,19 @@ function setup(ctx) {
       }));
     voicesCard.append(el("p", "Quoted dialogue uses the speaking character; surrounding prose uses the narrator. A speaker cue inside a quote selects its character and ends at the closing quote. Choose different voices to hear the switch.", "ra-muted"));
   }
-  function assignmentForm(key, name, container) {
-    const assignment = { ...settings.assignments[key] ?? { voice: "", emotion: "neutral", delivery: "normal" } };
+  function assignmentForm(key, name, container, options) {
+    const assignment = options?.draft ?? { ...settings.assignments[key] ?? { voice: "", emotion: "neutral", delivery: "normal" } };
     container.replaceChildren(el("h3", `Voice for ${name}`));
     const update = async () => {
-      settings.assignments[key] = assignment;
+      settings.assignments[key] = { ...assignment };
       await saveSettings();
+      if (options)
+        options.onSaved();
+      else {
+        castDrafts.delete(key);
+        renderAssignments();
+      }
+      notice(`Voice saved for ${name}.`);
     };
     container.append(field("Voice", voiceSelect(assignment.voice, (v) => assignment.voice = v, true)));
     if (settings.provider === "local")
@@ -2161,41 +2197,99 @@ function setup(ctx) {
     const listen = button("Listen", () => safe(() => preview(assignment.voice || settings.voice, assignment)));
     listen.disabled = !settings.enabled;
     const actions = el("div", "", "ra-row");
-    actions.append(listen, button("Save voice", () => safe(update), true), button("Use defaults", () => safe(async () => {
+    actions.append(listen, button("Save voice", () => safe(update), true), button(options ? "Remove cast voice" : "Use defaults", () => safe(options?.onRemove ?? (async () => {
       delete settings.assignments[key];
+      castDrafts.delete(key);
+      openCast.delete(key);
       await saveSettings();
       assignmentForm(key, name, container);
-    })));
+      renderAssignments();
+    }))));
     container.append(actions);
   }
   function renderAssignments() {
-    assignmentsCard.replaceChildren(el("h3", "Character voices"), el("p", "Readalong assignments use this speech connection and override inherited Lumiverse voices. Choose a voice again after changing provider or model.", "ra-muted"));
-    const sub = el("div");
-    let character = characters[0];
+    assignmentsCard.replaceChildren(el("h3", "Character voices"), el("p", "Build a cast with a separate voice for each character or speaker. Readalong voices override inherited Lumiverse voices; choose compatible voices again after changing provider or model.", "ra-muted"));
+    const keys = new Set([...Object.keys(settings.assignments).filter((key) => /^(id|name):/.test(key)), ...castDrafts.keys()]);
+    if (!keys.size && !castInitialized) {
+      const id = ctx.getActiveChat().characterId ?? characters[0]?.id;
+      if (id && characters.some((c) => c.id === id)) {
+        const key = `id:${id}`;
+        castDrafts.set(key, { voice: "", emotion: "neutral", delivery: "normal" });
+        keys.add(key);
+      }
+    }
+    if (!castInitialized && keys.size) {
+      openCast.add([...keys][0]);
+      castInitialized = true;
+    }
+    assignmentsCard.append(el("p", `${Object.keys(settings.assignments).filter((key) => /^(id|name):/.test(key)).length} saved cast voices. Add more below. Each row opens independently.`, "ra-muted"));
+    for (const key of keys) {
+      if (!castDrafts.has(key))
+        castDrafts.set(key, { ...settings.assignments[key] });
+      const draft = castDrafts.get(key), name = key.startsWith("id:") ? characters.find((c) => c.id === key.slice(3))?.name ?? `Character ${key.slice(3)}` : draft.name ?? key.slice(5);
+      const entry = el("details", "", "ra-cast-entry");
+      entry.open = openCast.has(key);
+      entry.dataset.castKey = key;
+      entry.append(el("summary", `${name} · ${settings.assignments[key]?.voice || "Uses defaults"}${!settings.assignments[key] ? " · not saved" : ""}`));
+      entry.addEventListener("toggle", () => {
+        if (entry.isConnected) {
+          if (entry.open)
+            openCast.add(key);
+          else
+            openCast.delete(key);
+        }
+      });
+      const form = el("div", "", "ra-cast-form");
+      entry.append(form);
+      assignmentsCard.append(entry);
+      assignmentForm(key, name, form, { draft, onSaved: () => {
+        castDrafts.delete(key);
+        renderAssignments();
+      }, onRemove: async () => {
+        delete settings.assignments[key];
+        castDrafts.delete(key);
+        openCast.delete(key);
+        await saveSettings();
+        renderAssignments();
+      } });
+    }
+    function addMember(key, name) {
+      if (!keys.has(key) && keys.size >= 500) {
+        notice("The cast can contain up to 500 voice assignments.", true);
+        return;
+      }
+      if (!castDrafts.has(key))
+        castDrafts.set(key, { ...settings.assignments[key] ?? { voice: "", emotion: "neutral", delivery: "normal" }, ...name ? { name } : {} });
+      openCast.add(key);
+      castInitialized = true;
+      renderAssignments();
+    }
+    const add = el("details");
+    add.append(el("summary", "Add cast member"));
+    let characterId = characters.find((c) => c.id === ctx.getActiveChat().characterId)?.id ?? characters[0]?.id ?? "";
     if (characters.length)
-      assignmentsCard.append(field("Character", select(characters.map((c) => ({ value: c.id, label: c.name })), character?.id ?? "", (v) => {
-        character = characters.find((c) => c.id === v);
-        if (character)
-          assignmentForm(`id:${character.id}`, character.name, sub);
-      })));
-    assignmentsCard.append(button("Refresh characters", () => safe(async () => {
+      add.append(field("Character from your library", select(characters.map((c) => ({ value: c.id, label: c.name })), characterId, (v) => characterId = v)), button("Add character voice", () => {
+        if (characterId)
+          addMember(`id:${characterId}`);
+      }));
+    add.append(button("Refresh characters", () => safe(async () => {
       const r = await rpc("characters");
       characters = r.characters;
       renderAssignments();
-    })), sub);
-    if (character)
-      assignmentForm(`id:${character.id}`, character.name, sub);
-    const details = el("details");
-    details.append(el("summary", "Add a voice for a speaker mentioned in a passage"));
+    })));
     let speaker = "";
     const speakerInput = textInput("", (v) => speaker = v);
-    speakerInput.placeholder = "Exact speaker name";
-    const named = el("div");
-    details.append(field("Speaker name", speakerInput), button("Choose voice", () => {
-      if (speaker.trim())
-        assignmentForm(`name:${speaker.trim().toLowerCase()}`, speaker.trim(), named);
-    }), named);
-    assignmentsCard.append(details);
+    speakerInput.placeholder = "For example, Jason";
+    speakerInput.maxLength = 80;
+    add.append(field("Speaker name in the story", speakerInput), button("Add speaker voice", () => {
+      const name = speaker.trim();
+      if (!name || /[\[\]\r\n]/.test(name) || name.toLowerCase() === "narrator") {
+        notice("Enter a speaker name of up to 80 characters. Narrator has its own voice setting.", true);
+        return;
+      }
+      addMember(`name:${name.toLowerCase()}`, name);
+    }), el("p", "Speakers do not need a character card. For several people in one reply, use cues such as [speaker:Jason] inside their quotes. The existing chat model can add these when voice cues are enabled; no extra LLM is called.", "ra-muted"));
+    assignmentsCard.append(add);
   }
   function decorateMessages() {
     for (const { messageId, element } of ctx.dom.listMessageElements()) {
@@ -2289,7 +2383,7 @@ function setup(ctx) {
       return;
     settings = normalizeSettings(r.settings);
     cacheUserId = typeof r.userId === "string" ? r.userId : "";
-    hasKey = r.hasKey;
+    Object.assign(hasKeys, r.hasKeys ?? { openrouter: r.hasKey, local: false });
     permissions = r.permissions;
     ready = true;
     try {

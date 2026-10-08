@@ -2,12 +2,12 @@ import { describe,test,expect } from 'bun:test';
 import { DEFAULTS as GEMINI_DEFAULTS } from '../src/shared';
 import manifest from '../spindle.json';
 const granted=new Set<string>(manifest.permissions);
-const DEFAULTS={...GEMINI_DEFAULTS,model:'mistralai/voxtral-mini-tts-2603'};
+const DEFAULTS={...GEMINI_DEFAULTS,enabled:true,model:'mistralai/voxtral-mini-tts-2603'};
 const files=new Map<string,string>(),keys=new Map<string,string>(),rules:any[]=[];
 const outgoing:any[]=[],requests:any[]=[];
 let handler:(p:any,user:string,session?:string)=>Promise<void>, interceptor:(messages:any[],ctx:any)=>Promise<any[]>;
 const listeners=new Map<string,Function>();
-let failure=false;
+let failure=false,arbitraryFailure=false,saveFailure=false;
 let hiddenJson=false, diagnosticStatus=402;
 let keyStatus=200, keyRemaining:number|null=null;
 let messageReads=0;
@@ -17,7 +17,7 @@ let messageReads=0;
   registerInterceptor:(h:any)=>{interceptor=h},log:{info:()=>{}},
   permissions:{has:(permission:string)=>granted.has(permission),getGranted:async()=>[...granted]},
   userStorage:{exists:async(path:string,u:string)=>files.has(u+path),read:async(path:string,u:string)=>files.get(u+path),write:async(path:string,value:string,u:string)=>{files.set(u+path,value)}},
-  enclave:{has:async(k:string,u:string)=>keys.has(u+k),put:async(k:string,v:string,u:string)=>keys.set(u+k,v),get:async(k:string,u:string)=>keys.get(u+k),delete:async(k:string,u:string)=>keys.delete(u+k)},
+  enclave:{has:async(k:string,u:string)=>keys.has(u+k),put:async(k:string,v:string,u:string)=>{if(saveFailure)throw new Error('Failed to save custom-secret-fixture');keys.set(u+k,v)},get:async(k:string,u:string)=>keys.get(u+k),delete:async(k:string,u:string)=>keys.delete(u+k)},
   regex_scripts:{list:async()=>({data:rules,total:rules.length}),create:async(r:any)=>{const s={...r,id:'rule',can_mutate:true};rules.push(s);return s},update:async()=>{}},
   characters:{list:async()=>({data:[{id:'mara',name:'Mara',extensions:{ttsVoice:{connectionId:'saved',voice:'Puck',metadata:'do-not-project'},other:'do-not-project'}}]})},
   chats:{get:async(id:string,u:string)=>id===`${u}-chat`?{id}:null},
@@ -25,6 +25,7 @@ let messageReads=0;
   cors:async(url:string,options:any)=>{
     requests.push({url,options});
     if(failure)throw new Error('Bearer sk-or-v1-secret failed');
+    if(arbitraryFailure)throw new Error('Rejected custom-local-fixture and '+encodeURIComponent('custom-local-fixture'));
     if(url.endsWith('/key'))return{status:keyStatus,body:JSON.stringify(keyStatus===200?{data:{limit:keyRemaining===null?null:10,limit_remaining:keyRemaining}}:{error:{message:'Invalid key sk-or-v1-secret'}})};
     if(url.endsWith('/audio/speech') && hiddenJson) {
       if(options?.responseType==='arraybuffer')throw new Error('CORS proxy transparent proxy only serves audio data (received Content-Type: application/json)');
@@ -36,11 +37,16 @@ let messageReads=0;
 };
 await import('../src/backend');
 let seq=0;
-async function call(type:string,data:any={},user='one',session='tab1'){
-  const requestId=String(++seq);await handler({type,requestId,...data},user,session);
+async function call(type:string,data:any={},user='one',session:string|null='tab1'){
+  const requestId=String(++seq);await handler({type,requestId,...data},user,session??undefined);
   return outgoing.find(r=>r.p.requestId===requestId);
 }
 describe('backend provider and session integration',()=>{
+  test('fresh installs stay off and updating existing settings preserves opt-in',async()=>{
+    expect((await call('init',{},'fresh')).p.data.settings.enabled).toBe(false);
+    await call('save',{settings:DEFAULTS});
+    expect((await call('init')).p.data.settings.enabled).toBe(true);
+  });
   test('widget permission is declared and init reports actual grants after revocation',async()=>{
     expect(manifest.permissions).toContain('ui_panels');
     expect((await call('init')).p.data.permissions).toContain('ui_panels');
@@ -60,16 +66,73 @@ describe('backend provider and session integration',()=>{
     const before=requests.length,key='a'.repeat(64);
     expect((await call('claim_preparation',{key})).p.data.allowed).toBe(true);
     await call('init');expect((await call('claim_preparation',{key},'one','tab2')).p.data.allowed).toBe(false);
+    await call('save',{settings:DEFAULTS},'two');
     expect((await call('claim_preparation',{key},'two')).p.data.allowed).toBe(true);
     expect((await call('claim_preparation',{key,manual:true})).p.data.allowed).toBe(true);
     expect(requests.length).toBe(before);expect(JSON.parse(files.get('onepreparations.json')!)).toContain(key);
   });
   test('keys never enter settings or replies and are isolated by user',async()=>{
-    await call('save_key',{key:'sk-or-v1-secret'});
+    await call('save_key',{key:'sk-or-v1-secret',provider:'openrouter'});
     expect((await call('init')).p.data.hasKey).toBe(true);
     expect((await call('init',{},'two')).p.data.hasKey).toBe(false);
     expect(JSON.stringify(outgoing)).not.toContain('sk-or-v1-secret');
     expect(Array.from(files.values()).join('')).not.toContain('sk-or-v1-secret');
+    await call('save',{settings:DEFAULTS});
+  });
+  test('a forged user ID cannot read or change another user’s key',async()=>{
+    const before=keys.get('oneopenrouter_key');
+    expect((await call('init',{userId:'one'},'forged')).p.data.hasKey).toBe(false);
+    await call('save_key',{key:'attacker-fixture',provider:'openrouter',userId:'one'},'forged');
+    expect(keys.get('oneopenrouter_key')).toBe(before);expect(keys.get('forgedopenrouter_key')).toBe('attacker-fixture');
+    expect((await call('init',{userId:'one'},'forged')).p.data.userId).toBe('forged');
+  });
+  test('blank and failed key saves preserve existing keys; removal requires an explicit confirmation',async()=>{
+    const before=keys.get('oneopenrouter_key');
+    expect((await call('save_key',{key:'',provider:'openrouter'})).p.error).toContain('never removes');
+    expect((await call('remove_key',{provider:'openrouter'})).p.error).toContain('Confirm');
+    expect(keys.get('oneopenrouter_key')).toBe(before);
+    saveFailure=true;const failed=await call('save_key',{key:'custom-secret-fixture',provider:'openrouter'});saveFailure=false;
+    expect(failed.p.error).not.toContain('custom-secret-fixture');expect(keys.get('oneopenrouter_key')).toBe(before);
+    await call('save_key',{key:'removable-fixture',provider:'openrouter'},'remove-test');
+    await call('remove_key',{provider:'openrouter',confirmed:true},'remove-test');
+    expect(keys.has('remove-testopenrouter_key')).toBe(false);expect(keys.get('oneopenrouter_key')).toBe(before);
+  });
+  test('local keys are bound to their exact URL and cannot be redirected by preview settings',async()=>{
+    const local={...DEFAULTS,provider:'local',localUrl:'https://speech.example/v1'};
+    await call('save_key',{provider:'local',key:'custom-local-fixture',localUrl:local.localUrl});
+    await call('speech',{segment:{text:'Hi.'},previewSettings:local});
+    expect(requests.at(-1).url).toBe('https://speech.example/v1/audio/speech');expect(requests.at(-1).options.headers.Authorization).toBe('Bearer custom-local-fixture');
+    const n=requests.length;
+    for(const url of ['https://other.example/v1','https://speech.example/other','http://speech.example/v1'])expect((await call('speech',{segment:{text:'Hi.'},previewSettings:{...local,localUrl:url}})).p.error).toContain('another server');
+    expect(requests.length).toBe(n);
+    arbitraryFailure=true;const failure=await call('speech',{segment:{text:'Hi.'},previewSettings:local});arbitraryFailure=false;
+    expect(failure.p.error).not.toContain('custom-local-fixture');expect(failure.p.error).toContain('[redacted]');
+    expect(JSON.stringify(outgoing)).not.toContain('custom-local-fixture');expect(Array.from(files.values()).join('')).not.toContain('custom-local-fixture');
+  });
+  test('remote cleartext key saves fail; legacy local keys are retained until deliberately rebound',async()=>{
+    const n=requests.length;
+    expect((await call('save_key',{provider:'local',key:'unsafe-fixture',localUrl:'http://remote.example/v1'})).p.error).toContain('HTTPS');
+    expect((await call('save_key',{provider:'local',key:'unsafe-fixture',localUrl:'https://user:pass@remote.example/v1'})).p.error).toContain('without credentials');
+    keys.set('legacylocal_key','legacy-preserved-fixture');
+    const result=await call('check_connection',{settings:{...DEFAULTS,provider:'local'}},'legacy');
+    expect(result.p.error).toContain('preserved');expect(keys.get('legacylocal_key')).toBe('legacy-preserved-fixture');expect(requests.length).toBe(n);
+    await call('save_key',{provider:'local',key:'loopback-fixture',localUrl:'http://localhost:8880/v1'},'loopback');
+    expect((await call('check_connection',{settings:{...DEFAULTS,provider:'local'}},'loopback')).p.data.message).toContain('accepted');
+  });
+  test('diagnostics stay in their originating frontend even when the host omits session IDs',async()=>{
+    hiddenJson=true;
+    await call('speech',{frontendId:'client-a',segment:{text:'Hi.'}},'one',null);const n=requests.length;
+    expect((await call('diagnose_speech',{frontendId:'client-b'},'one',null)).p.error).toContain('No recent');
+    expect((await call('diagnose_speech',{},'one',null)).p.error).toContain('Reload');expect(requests.length).toBe(n);
+    expect((await call('diagnose_speech',{frontendId:'client-a'},'one',null)).p.error).toContain('HTTP 402');expect(requests.length).toBe(n+1);
+    hiddenJson=false;
+  });
+  test('cast settings persist per user and the existing prompt includes named speakers without another request',async()=>{
+    const assignments={'name:jason':{name:'Jason',voice:'Charon',emotion:'curious',delivery:'normal'},'name:vasquez':{name:'Vasquez',voice:'Orus',emotion:'neutral',delivery:'normal'}};
+    await call('save',{settings:{...DEFAULTS,assignments}});const n=requests.length;
+    expect((await call('init')).p.data.settings.assignments).toEqual(assignments);
+    expect((await call('init',{},'fresh')).p.data.settings.assignments).toEqual({});
+    const prompt=await interceptor([],{userId:'one'});expect(prompt[0].content).toContain('["Jason","Vasquez"]');expect(requests.length).toBe(n);
     await call('save',{settings:DEFAULTS});
   });
   test('models return the complete model-specific voice list',async()=>{

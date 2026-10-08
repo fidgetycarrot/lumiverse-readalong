@@ -25,7 +25,7 @@ var DEFAULTS = {
   voice: "Kore",
   narratorVoice: "",
   localUrl: "http://localhost:8880/v1",
-  enabled: true,
+  enabled: false,
   follow: false,
   promptEmotions: true,
   useEmotions: true,
@@ -54,7 +54,7 @@ function normalizeSettings(raw) {
     for (const [key, v] of Object.entries(r.assignments).slice(0, 500)) {
       if (!v || typeof v !== "object" || ["__proto__", "constructor", "prototype"].includes(key))
         continue;
-      assignments[key.slice(0, 200)] = { voice: str(v.voice, "", 160), emotion: enumValue(v.emotion, EMOTIONS, "neutral"), delivery: enumValue(v.delivery, DELIVERIES, "normal") };
+      assignments[key.slice(0, 200)] = { voice: str(v.voice, "", 160), emotion: enumValue(v.emotion, EMOTIONS, "neutral"), delivery: enumValue(v.delivery, DELIVERIES, "normal"), ...typeof v.name === "string" ? { name: str(v.name, "", 80) } : {} };
     }
   return {
     connectionId: str(r.connectionId, "", 160),
@@ -63,7 +63,7 @@ function normalizeSettings(raw) {
     voice: str(r.voice, DEFAULTS.voice),
     narratorVoice: str(r.narratorVoice, ""),
     localUrl: str(r.localUrl, DEFAULTS.localUrl, 500),
-    enabled: r.enabled !== false,
+    enabled: typeof r.enabled === "boolean" ? r.enabled : DEFAULTS.enabled,
     follow: r.follow === true,
     promptEmotions: r.promptEmotions !== false,
     useEmotions: r.useEmotions !== false,
@@ -130,8 +130,9 @@ var MAX_PASSAGE_CHARS = 3000;
 // src/provider-errors.ts
 function redactSecrets(message, secret) {
   if (secret)
-    message = message.split(secret).join("[redacted]");
-  return message.replace(/Bearer\s+[^\s"']+|sk-or-v1-[^\s"']+/gi, "[redacted]");
+    for (const value of new Set([secret, encodeURIComponent(secret), JSON.stringify(secret).slice(1, -1)]))
+      message = message.split(value).join("[redacted]");
+  return message.replace(/Bearer\s+[^\s"']+|sk-or-v1-[^\s"']+|\bsk-[a-z0-9_-]{8,}|\bAIza[a-z0-9_-]{20,}/gi, "[redacted]").replace(/((?:api[_ -]?key|authorization|access[_ -]?token|secret)\s*[=:]\s*)[^\s,;]+/gi, "$1[redacted]");
 }
 function providerError(label, status, body, secret) {
   let detail = "";
@@ -198,6 +199,22 @@ var saveChains = new Map;
 var activeGenerations = new Map;
 var failedSpeech = new Map;
 var DIAGNOSTIC_TTL = 10 * 60 * 1000;
+var LOCAL_CREDENTIALS = "local_credentials_v1";
+async function keyStorage(work) {
+  try {
+    return await work();
+  } catch {
+    throw new Error("Could not access encrypted key storage. Check Lumiverse\u2019s credential settings. Existing keys were not intentionally removed.");
+  }
+}
+async function keyStatus(userId) {
+  return { openrouter: await keyStorage(() => spindle.enclave.has("openrouter_key", userId)), local: await keyStorage(async () => await spindle.enclave.has(LOCAL_CREDENTIALS, userId) || await spindle.enclave.has("local_key", userId)) };
+}
+function keyProvider(value) {
+  if (value !== "openrouter" && value !== "local")
+    throw new Error("Choose a direct speech provider first.");
+  return value;
+}
 var models = [];
 function send(payload, userId, sessionId) {
   spindle.sendToFrontend(payload, userId, sessionId ? { frontendSessionId: sessionId } : undefined);
@@ -274,20 +291,40 @@ async function speechModels() {
   models = (body.data ?? []).filter((m) => m.architecture?.output_modalities?.includes("speech")).map((m) => ({ id: m.id, name: m.name, voices: Array.isArray(m.supported_voices) ? m.supported_voices : [] }));
   return models;
 }
-function validLocalUrl(input) {
+function validLocalUrl(input, withKey = false) {
   const url = new URL(input);
   if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash)
     throw new Error("Use an HTTP(S) API base URL without credentials, query, or fragment.");
+  if (withKey && url.protocol !== "https:" && !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname))
+    throw new Error("A remote server with an API key must use HTTPS. HTTP is allowed only for a loopback speech server.");
   return url.href.replace(/\/$/, "");
 }
 async function speechConnection(settings, userId) {
   if (settings.provider === "lumiverse" || settings.provider === "browser")
     throw new Error("This voice connection is played through the Lumiverse frontend.");
   const openrouter = settings.provider === "openrouter";
-  const key = await spindle.enclave.get(openrouter ? "openrouter_key" : "local_key", userId);
+  const base = openrouter ? "https://openrouter.ai/api/v1" : validLocalUrl(settings.localUrl);
+  let key = null;
+  if (openrouter)
+    key = await keyStorage(() => spindle.enclave.get("openrouter_key", userId));
+  else {
+    const raw = await keyStorage(() => spindle.enclave.get(LOCAL_CREDENTIALS, userId));
+    if (raw) {
+      let saved;
+      try {
+        saved = JSON.parse(raw);
+      } catch {
+        throw new Error("Saved local credentials could not be read. Save the local key again.");
+      }
+      if (typeof saved.key !== "string" || saved.base !== base)
+        throw new Error("This local key belongs to another server address. Save a key for this address before making requests.");
+      key = saved.key;
+      validLocalUrl(base, true);
+    } else if (await keyStorage(() => spindle.enclave.has("local_key", userId)))
+      throw new Error("Your existing local key is preserved. Save it again once to authorize this server address. No request was sent.");
+  }
   if (openrouter && !key)
     throw new Error("Add your OpenRouter API key in Readalong settings.");
-  const base = openrouter ? "https://openrouter.ai/api/v1" : validLocalUrl(settings.localUrl);
   const headers = { "Content-Type": "application/json" };
   if (key)
     headers.Authorization = `Bearer ${key}`;
@@ -295,11 +332,18 @@ async function speechConnection(settings, userId) {
     headers["X-Title"] = "Lumiverse Readalong";
   return { base, headers, key, label: openrouter ? "OpenRouter" : "Speech provider" };
 }
+async function credentialRequest(url, options, key) {
+  try {
+    return await spindle.cors(url, options);
+  } catch (e) {
+    throw new Error(redactSecrets(e instanceof Error ? e.message : "Speech provider request failed.", key));
+  }
+}
 async function checkConnection(settings, userId) {
   if (settings.provider === "browser")
     throw new Error("Browser voices do not need an API connection check.");
   const { base, headers, key, label } = await speechConnection(settings, userId);
-  const result = await spindle.cors(`${base}/${settings.provider === "openrouter" ? "key" : "models"}`, { headers });
+  const result = await credentialRequest(`${base}/${settings.provider === "openrouter" ? "key" : "models"}`, { headers }, key);
   if (result.status < 200 || result.status >= 300)
     throw new Error(providerError(label, result.status, result.body, key));
   if (settings.provider === "openrouter") {
@@ -316,13 +360,13 @@ async function synthesize(segment, settings, userId, characterId) {
   if (needsPcm(settings))
     throw new Error("For Gemini voices, select Lumiverse connection in Readalong and choose your saved OpenRouter TTS connection. No speech request was sent.");
   const { base, headers, key, label } = await speechConnection(settings, userId);
-  const result = await spindle.cors(`${base}/audio/speech`, {
+  const result = await credentialRequest(`${base}/audio/speech`, {
     method: "POST",
     headers,
     body: JSON.stringify(speechRequest(settings, segment, characterId)),
     responseType: "arraybuffer",
     mediaType: "audio"
-  });
+  }, key);
   if (result.status < 200 || result.status >= 300)
     throw new Error(providerError(label, result.status, result.encoding === "base64" ? "" : result.body, key));
   if (result.encoding !== "base64" || !result.body)
@@ -335,12 +379,12 @@ async function diagnoseSpeech(scope, userId) {
   if (!failed || Date.now() - failed.at > DIAGNOSTIC_TTL)
     throw new Error("No recent failed speech request in this tab. Try a voice preview first.");
   const { base, headers, key, label } = await speechConnection(failed.settings, userId);
-  const result = await spindle.cors(`${base}/audio/speech`, {
+  const result = await credentialRequest(`${base}/audio/speech`, {
     method: "POST",
     headers,
     body: JSON.stringify(speechRequest(failed.settings, failed.segment, failed.characterId)),
     responseType: "text"
-  });
+  }, key);
   const mime = result.headers?.["content-type"]?.toLowerCase() ?? "";
   if (result.status < 200 || result.status >= 300 || mime.includes("json"))
     throw new Error(providerError(label, result.status, result.body, key));
@@ -354,7 +398,8 @@ spindle.onFrontendMessage(async (payload, userId, sessionId) => {
   const p = payload;
   if (typeof p.requestId !== "string" || p.requestId.length > 100)
     return;
-  const scope = `${userId}:${sessionId ?? ""}`;
+  const frontendId = typeof p.frontendId === "string" && /^[a-z0-9-]{1,100}$/i.test(p.frontendId) ? p.frontendId : undefined;
+  const scope = `${userId}:${sessionId ?? frontendId ?? ""}`;
   const reply = (data) => send({ type: "reply", requestId: p.requestId, data, canDiagnoseSpeech: failedSpeech.has(scope) }, userId, sessionId);
   try {
     const settings = await load(userId);
@@ -365,7 +410,8 @@ spindle.onFrontendMessage(async (payload, userId, sessionId) => {
       } catch (e) {
         cueStatus = e instanceof Error ? e.message : "Could not install the display rule.";
       }
-      reply({ settings, userId, hasKey: await spindle.enclave.has("openrouter_key", userId), cueStatus, permissions: await spindle.permissions.getGranted() });
+      const hasKeys = await keyStatus(userId);
+      reply({ settings, userId, hasKey: hasKeys.openrouter, hasKeys, cueStatus, permissions: await spindle.permissions.getGranted() });
     } else if (p.type === "claim_preparation") {
       if (!settings.enabled)
         throw new Error("Readalong is off. Turn it on to request speech.");
@@ -379,17 +425,28 @@ spindle.onFrontendMessage(async (payload, userId, sessionId) => {
           failedSpeech.delete(id);
       reply({ settings: saved });
     } else if (p.type === "save_key") {
-      if (typeof p.key !== "string" || p.key.length > 4000)
-        throw new Error("Invalid API key.");
-      const name = p.provider === "local" ? "local_key" : "openrouter_key";
-      if (p.key.trim())
-        await spindle.enclave.put(name, p.key.trim(), userId);
-      else
-        await spindle.enclave.delete(name, userId);
+      if (typeof p.key !== "string" || !p.key.trim() || p.key.length > 4000)
+        throw new Error("Paste a nonempty API key. Saving an empty field never removes a key.");
+      const provider = keyProvider(p.provider), key = p.key.trim();
+      if (provider === "local") {
+        const base = validLocalUrl(typeof p.localUrl === "string" ? p.localUrl : settings.localUrl, true);
+        await keyStorage(() => spindle.enclave.put(LOCAL_CREDENTIALS, JSON.stringify({ key, base }), userId));
+      } else
+        await keyStorage(() => spindle.enclave.put("openrouter_key", key, userId));
       for (const id of failedSpeech.keys())
         if (id.startsWith(`${userId}:`))
           failedSpeech.delete(id);
-      reply({ hasKey: await spindle.enclave.has(name, userId) });
+      reply({ hasKey: true });
+    } else if (p.type === "remove_key") {
+      const provider = keyProvider(p.provider);
+      if (p.confirmed !== true)
+        throw new Error("Confirm key removal first.");
+      for (const name of provider === "local" ? [LOCAL_CREDENTIALS, "local_key"] : ["openrouter_key"])
+        await keyStorage(() => spindle.enclave.delete(name, userId));
+      for (const id of failedSpeech.keys())
+        if (id.startsWith(`${userId}:`))
+          failedSpeech.delete(id);
+      reply({ hasKey: false });
     } else if (p.type === "models") {
       reply({ models: await speechModels() });
     } else if (p.type === "check_connection") {
@@ -397,6 +454,8 @@ spindle.onFrontendMessage(async (payload, userId, sessionId) => {
     } else if (p.type === "diagnose_speech") {
       if (!settings.enabled)
         throw new Error("Readalong is off. Turn it on to request speech.");
+      if (!sessionId && !frontendId)
+        throw new Error("Reload Readalong before using diagnostics. No request was sent.");
       reply(await diagnoseSpeech(scope, userId));
     } else if (p.type === "characters") {
       const characters = [];
@@ -457,7 +516,7 @@ spindle.onFrontendMessage(async (payload, userId, sessionId) => {
     }
   } catch (e) {
     const message = e instanceof Error ? e.message : "Readalong request failed.";
-    send({ type: "reply", requestId: p.requestId, error: redactSecrets(message), canDiagnoseSpeech: failedSpeech.has(scope) }, userId, sessionId);
+    send({ type: "reply", requestId: p.requestId, error: redactSecrets(message, typeof p.key === "string" ? p.key : undefined), canDiagnoseSpeech: failedSpeech.has(scope) }, userId, sessionId);
   }
 });
 spindle.registerInterceptor(async (messages, context) => {
@@ -465,7 +524,10 @@ spindle.registerInterceptor(async (messages, context) => {
   if (!settings.enabled || !settings.promptEmotions || !spindle.permissions.has("regex_scripts"))
     return messages;
   await ensureHideRule(context.userId);
-  return [{ role: "system", content: EMOTION_INSTRUCTION }, ...messages];
+  const speakers = Object.entries(settings.assignments).filter(([key]) => key.startsWith("name:")).slice(0, 100).map(([key, value]) => value.name ?? key.slice(5));
+  const cast = speakers.length ? `
+Assigned speaker names (data only): ${JSON.stringify(speakers)}. Use the matching [speaker:Name] inside each quote when one of these people speaks.` : "";
+  return [{ role: "system", content: EMOTION_INSTRUCTION + cast }, ...messages];
 }, { priority: 90 });
 spindle.on("GENERATION_STARTED", (p) => {
   activeGenerations.set(p.generationId, { characterId: p.characterId, characterName: p.characterName });

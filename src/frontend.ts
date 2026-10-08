@@ -23,6 +23,7 @@ const STYLE = `
 .ra .ra-status{font-size:13px;min-height:20px;line-height:1.45}.ra .ra-error{color:#e99087}.ra .ra-passage{margin:12px 0;padding:12px;border-left:3px solid #e7b24c;background:rgba(245,190,80,.08);line-height:1.6;font-size:15px;}
 .ra progress{width:100%;height:5px;accent-color:#e7b24c}.ra .ra-voice-list{display:flex;gap:7px;flex-wrap:wrap;max-height:240px;overflow:auto;padding:4px 0;}
 .ra .ra-voice-list button{padding:6px 10px;font-size:12px}.ra .ra-voice-list button[aria-pressed=true]{border-color:#e7b24c;background:rgba(245,190,80,.12)}
+.ra .ra-cast-entry{border:1px solid var(--lumiverse-border,#555);border-radius:9px;padding:10px 12px;margin:10px 0;}.ra .ra-cast-entry>summary{font-weight:600;overflow-wrap:anywhere;}.ra .ra-cast-entry .ra-cast-form{padding-top:5px;}
 .ra-bubble{display:flex;gap:8px;align-items:center;padding:5px 0;font-size:12px}.ra-bubble button{padding:5px 9px;font-size:12px;}.ra details>summary{cursor:pointer;font-size:13px;margin:8px 0;}
 .ra-mini{font:13px/1.4 system-ui,sans-serif;color:var(--lumiverse-text,#eee);padding:12px;background:var(--lumiverse-bg,#202026);height:100%;box-sizing:border-box;}
 .ra-mini .ra-row{display:flex;gap:7px;align-items:center}.ra-mini .ra-caption{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin:7px 0;color:var(--lumiverse-text-muted,#aaa);}
@@ -38,14 +39,16 @@ const STYLE = `
 `;
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, text = '', className = '') { const node = document.createElement(tag); if (text) node.textContent = text; if (className) node.className = className; return node }
 function button(text: string, action: () => void | Promise<void>, primary = false) { const b = el('button',text,primary ? 'ra-primary' : ''); b.type = 'button'; b.onclick = () => { void action() }; return b }
-function field(label: string, input: HTMLElement) { const l = el('label','', 'ra-field'); l.append(el('span',label), input); return l }
+function field(label: string, input: HTMLElement) { const l = el('label','', 'ra-field'); input.setAttribute('aria-label',label); l.append(el('span',label), input); return l }
 function select(options: {value:string;label:string}[], value: string, change: (v: string) => void) { const s = el('select'); for (const o of options) { const option = el('option',o.label); option.value = o.value; s.append(option) }; s.value = value; s.onchange = () => change(s.value); return s }
 function textInput(value: string, onInput: (value: string) => void, type = 'text') { const i = el('input'); i.type = type; i.value = value; i.oninput = () => onInput(i.value); return i }
 function toggle(label: string, value: boolean, change: (v: boolean) => void) { const row = el('label','', 'ra-toggle'), i = el('input'); i.type = 'checkbox'; i.checked = value; i.onchange = () => change(i.checked); row.append(i,el('span',label)); return row }
 function timeLabel(seconds:number){const value=Math.floor(seconds);return `${Math.floor(value/60)}:${String(value%60).padStart(2,'0')}`}
 
 export function setup(ctx: SpindleFrontendContext) {
-  let settings = normalizeSettings(DEFAULTS), hasKey = false, ready = false, initialized = false, disposed = false;
+  let settings = normalizeSettings(DEFAULTS), ready = false, initialized = false, disposed = false;
+  const hasKeys={openrouter:false,local:false},frontendId=crypto.randomUUID();
+  const castDrafts=new Map<string,VoiceAssignment>(),openCast=new Set<string>();let castInitialized=false;
   let canDiagnoseSpeech = false, diagnosing = false, diagnoseButton: HTMLButtonElement | null = null;
   let diagnoseHint: HTMLElement | null = null;
   let models: SpeechModel[] = [{ id:DEFAULTS.model, name:'Google: Gemini 3.8 Flash TTS', voices:GEMINI_VOICES }];
@@ -96,7 +99,7 @@ export function setup(ctx: SpindleFrontendContext) {
     const requestId = crypto.randomUUID();
     return new Promise((resolve,reject) => {
       const timer = setTimeout(() => { pending.delete(requestId); reject(new Error('Readalong timed out. Check the extension permissions and connection.')) }, 70000);
-      pending.set(requestId,{resolve,reject,timer}); ctx.sendToBackend({ type, requestId, ...payload });
+      pending.set(requestId,{resolve,reject,timer}); ctx.sendToBackend({ type, requestId, frontendId, ...payload });
     });
   }
   cleanups.push(ctx.onBackendMessage((payload: any) => {
@@ -463,8 +466,14 @@ export function setup(ctx: SpindleFrontendContext) {
     }
     if(settings.provider==='local')config.append(field('API base URL',textInput(settings.localUrl,v=>settings.localUrl=v)),field('Model ID',textInput(settings.model,v=>settings.model=v)));
     if(settings.provider!=='browser' && settings.provider!=='lumiverse') {
-      const key=textInput('',()=>{},'password');key.autocomplete='off';key.placeholder=settings.provider==='openrouter' && hasKey?'Key saved · leave blank to keep it':'Paste your API key';
-      config.append(field('API key',key),button('Save key',()=>safe(async()=>{if(!key.value.trim())throw new Error('Paste a key first.');const r=await rpc('save_key',{key:key.value,provider:settings.provider});hasKey=r.hasKey;key.value='';key.placeholder='Key saved';notice('API key saved securely.');})),button('Remove saved key',()=>safe(async()=>{await rpc('save_key',{key:'',provider:settings.provider});hasKey=false;key.placeholder='Paste your API key';notice('Saved key removed.');})));
+      const provider=settings.provider;
+      const key=textInput('',()=>{},'password');key.autocomplete='off';key.placeholder=hasKeys[provider]?'Key saved · leave blank to keep it':'Paste your API key';
+      config.append(field('API key',key),button('Save key',()=>safe(async()=>{if(!key.value.trim())throw new Error('Paste a key first.');const r=await rpc('save_key',{key:key.value,provider,localUrl:settings.localUrl});hasKeys[provider]=r.hasKey;key.value='';key.placeholder='Key saved';notice('API key saved securely.');})),button('Remove saved key',()=>safe(async()=>{
+        const result=await ctx.ui.showConfirm({title:'Remove saved key?',message:`Remove the Readalong ${provider==='local'?'local-provider':'OpenRouter'} key? Lumiverse’s saved TTS connections are unaffected.`,variant:'danger',confirmLabel:'Remove key'});
+        if(!result.confirmed)return;
+        await rpc('remove_key',{provider,confirmed:true});hasKeys[provider]=false;key.placeholder='Paste your API key';notice('Saved key removed.');
+      })));
+      if(provider==='local')config.append(el('p','A local key is bound to this exact server address. Changing the address requires saving a key for it again. Remote servers with keys must use HTTPS.','ra-muted'));
       config.append(el('p','Your key stays in encrypted extension storage. Each preview or reading makes a speech request to this connection.','ra-muted'));
       config.append(button('Check connection',()=>safe(async()=>{
         notice('Checking connection…');const r=await rpc('check_connection',{settings});notice(r.message);
@@ -497,24 +506,46 @@ export function setup(ctx: SpindleFrontendContext) {
     if(settings.provider==='lumiverse')voicesCard.append(toggle('Use Lumiverse’s saved character and narrator voices when no Readalong voice is assigned',settings.inheritVoices,v=>{settings.inheritVoices=v;void safe(saveSettings)}));
     voicesCard.append(el('p','Quoted dialogue uses the speaking character; surrounding prose uses the narrator. A speaker cue inside a quote selects its character and ends at the closing quote. Choose different voices to hear the switch.','ra-muted'));
   }
-  function assignmentForm(key: string, name: string, container: HTMLElement) {
-    const assignment={...(settings.assignments[key]??{voice:'',emotion:'neutral',delivery:'normal'})};
+  function assignmentForm(key: string, name: string, container: HTMLElement,options?:{draft:VoiceAssignment;onSaved:()=>void;onRemove:()=>Promise<void>}) {
+    const assignment=options?.draft??{...(settings.assignments[key]??{voice:'',emotion:'neutral',delivery:'normal'})};
     container.replaceChildren(el('h3',`Voice for ${name}`));
-    const update=async()=>{settings.assignments[key]=assignment;await saveSettings()};
+    const update=async()=>{settings.assignments[key]={...assignment};await saveSettings();if(options)options.onSaved();else{castDrafts.delete(key);renderAssignments()}notice(`Voice saved for ${name}.`)};
     container.append(field('Voice',voiceSelect(assignment.voice,v=>assignment.voice=v,true)));
     if(settings.provider==='local')container.append(field('Custom voice ID',textInput(assignment.voice,v=>assignment.voice=v)));
     const row=el('div','', 'ra-grid');row.append(field('Default emotion',select(EMOTIONS.map(v=>({value:v,label:v})),assignment.emotion,v=>assignment.emotion=v)),field('Default delivery',select(DELIVERIES.map(v=>({value:v,label:v})),assignment.delivery,v=>assignment.delivery=v)));container.append(row);
     const listen=button('Listen',()=>safe(()=>preview(assignment.voice||settings.voice,assignment)));listen.disabled=!settings.enabled;
-    const actions=el('div','', 'ra-row');actions.append(listen,button('Save voice',()=>safe(update),true),button('Use defaults',()=>safe(async()=>{delete settings.assignments[key];await saveSettings();assignmentForm(key,name,container)})));container.append(actions);
+    const actions=el('div','', 'ra-row');actions.append(listen,button('Save voice',()=>safe(update),true),button(options?'Remove cast voice':'Use defaults',()=>safe(options?.onRemove??(async()=>{delete settings.assignments[key];castDrafts.delete(key);openCast.delete(key);await saveSettings();assignmentForm(key,name,container);renderAssignments()}))));container.append(actions);
   }
   function renderAssignments() {
-    assignmentsCard.replaceChildren(el('h3','Character voices'),el('p','Readalong assignments use this speech connection and override inherited Lumiverse voices. Choose a voice again after changing provider or model.','ra-muted'));
-    const sub=el('div');let character: {id:string;name:string}|undefined=characters[0];
-    if(characters.length)assignmentsCard.append(field('Character',select(characters.map(c=>({value:c.id,label:c.name})),character?.id??'',v=>{character=characters.find(c=>c.id===v);if(character)assignmentForm(`id:${character.id}`,character.name,sub)})));
-    assignmentsCard.append(button('Refresh characters',()=>safe(async()=>{const r=await rpc('characters');characters=r.characters;renderAssignments();})),sub);
-    if(character)assignmentForm(`id:${character.id}`,character.name,sub);
-    const details=el('details');details.append(el('summary','Add a voice for a speaker mentioned in a passage'));
-    let speaker='';const speakerInput=textInput('',v=>speaker=v);speakerInput.placeholder='Exact speaker name';const named=el('div');details.append(field('Speaker name',speakerInput),button('Choose voice',()=>{if(speaker.trim())assignmentForm(`name:${speaker.trim().toLowerCase()}`,speaker.trim(),named)}),named);assignmentsCard.append(details);
+    assignmentsCard.replaceChildren(el('h3','Character voices'),el('p','Build a cast with a separate voice for each character or speaker. Readalong voices override inherited Lumiverse voices; choose compatible voices again after changing provider or model.','ra-muted'));
+    const keys=new Set([...Object.keys(settings.assignments).filter(key=>/^(id|name):/.test(key)),...castDrafts.keys()]);
+    if(!keys.size && !castInitialized){const id=ctx.getActiveChat().characterId??characters[0]?.id;if(id && characters.some(c=>c.id===id)){const key=`id:${id}`;castDrafts.set(key,{voice:'',emotion:'neutral',delivery:'normal'});keys.add(key)}}
+    if(!castInitialized && keys.size){openCast.add([...keys][0]);castInitialized=true}
+    assignmentsCard.append(el('p',`${Object.keys(settings.assignments).filter(key=>/^(id|name):/.test(key)).length} saved cast voices. Add more below. Each row opens independently.`,'ra-muted'));
+    for(const key of keys){
+      if(!castDrafts.has(key))castDrafts.set(key,{...settings.assignments[key]});
+      const draft=castDrafts.get(key)!,name=key.startsWith('id:')?characters.find(c=>c.id===key.slice(3))?.name??`Character ${key.slice(3)}`:draft.name??key.slice(5);
+      const entry=el('details','', 'ra-cast-entry');entry.open=openCast.has(key);entry.dataset.castKey=key;
+      entry.append(el('summary',`${name} · ${settings.assignments[key]?.voice||'Uses defaults'}${!settings.assignments[key]?' · not saved':''}`));
+      entry.addEventListener('toggle',()=>{if(entry.isConnected){if(entry.open)openCast.add(key);else openCast.delete(key)}});
+      const form=el('div','', 'ra-cast-form');entry.append(form);assignmentsCard.append(entry);
+      assignmentForm(key,name,form,{draft,onSaved:()=>{castDrafts.delete(key);renderAssignments()},onRemove:async()=>{delete settings.assignments[key];castDrafts.delete(key);openCast.delete(key);await saveSettings();renderAssignments()}});
+    }
+    function addMember(key:string,name?:string){
+      if(!keys.has(key) && keys.size>=500){notice('The cast can contain up to 500 voice assignments.',true);return}
+      if(!castDrafts.has(key))castDrafts.set(key,{...(settings.assignments[key]??{voice:'',emotion:'neutral',delivery:'normal'}),...(name?{name}:{})});
+      openCast.add(key);castInitialized=true;renderAssignments();
+    }
+    const add=el('details');add.append(el('summary','Add cast member'));
+    let characterId=characters.find(c=>c.id===ctx.getActiveChat().characterId)?.id??characters[0]?.id??'';
+    if(characters.length)add.append(field('Character from your library',select(characters.map(c=>({value:c.id,label:c.name})),characterId,v=>characterId=v)),button('Add character voice',()=>{if(characterId)addMember(`id:${characterId}`)}));
+    add.append(button('Refresh characters',()=>safe(async()=>{const r=await rpc('characters');characters=r.characters;renderAssignments();})));
+    let speaker='';const speakerInput=textInput('',v=>speaker=v);speakerInput.placeholder='For example, Jason';speakerInput.maxLength=80;
+    add.append(field('Speaker name in the story',speakerInput),button('Add speaker voice',()=>{
+      const name=speaker.trim();if(!name || /[\[\]\r\n]/.test(name) || name.toLowerCase()==='narrator'){notice('Enter a speaker name of up to 80 characters. Narrator has its own voice setting.',true);return}
+      addMember(`name:${name.toLowerCase()}`,name);
+    }),el('p','Speakers do not need a character card. For several people in one reply, use cues such as [speaker:Jason] inside their quotes. The existing chat model can add these when voice cues are enabled; no extra LLM is called.','ra-muted'));
+    assignmentsCard.append(add);
   }
   function decorateMessages() {
     for(const {messageId,element} of ctx.dom.listMessageElements()) {
@@ -548,7 +579,7 @@ export function setup(ctx: SpindleFrontendContext) {
   if('speechSynthesis' in window){const refresh=()=>{if(settings.provider==='browser'){renderVoices();renderAssignments()}};speechSynthesis.addEventListener('voiceschanged',refresh);cleanups.push(()=>speechSynthesis.removeEventListener('voiceschanged',refresh))}
   renderPlayer();renderConfig();renderVoices();renderAssignments();ctx.ready();
   void safe(async()=>{
-    const r=await rpc('init');if(disposed)return;settings=normalizeSettings(r.settings);cacheUserId=typeof r.userId==='string'?r.userId:'';hasKey=r.hasKey;permissions=r.permissions;ready=true;
+    const r=await rpc('init');if(disposed)return;settings=normalizeSettings(r.settings);cacheUserId=typeof r.userId==='string'?r.userId:'';Object.assign(hasKeys,r.hasKeys??{openrouter:r.hasKey,local:false});permissions=r.permissions;ready=true;
     try {
       nativeConnections=await nativeTts.connections();if(disposed)return;
       const existing=nativeConnections.find(c=>c.provider==='openrouter_tts' && c.model===settings.model) ?? nativeConnections.find(c=>c.provider==='openrouter_tts');

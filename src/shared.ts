@@ -5,7 +5,7 @@ export const DELIVERIES = ['normal', 'whispers', 'shouts', 'softly', 'slowly', '
 export const GEMINI_VOICES = ['Zephyr','Puck','Charon','Kore','Fenrir','Leda','Orus','Aoede','Callirrhoe','Autonoe','Enceladus','Iapetus','Umbriel','Algieba','Despina','Erinome','Algenib','Rasalgethi','Laomedeia','Achernar','Alnilam','Schedar','Gacrux','Pulcherrima','Achird','Zubenelgenubi','Vindemiatrix','Sadachbia','Sadaltager','Sulafat'];
 export const CUE_PATTERN = String.raw`\[(?:emotion|delivery|speaker):[^\]\r\n]{1,80}\]`;
 export const HIDE_RULE_NAME = 'Readalong • Hide voice cues';
-export interface VoiceAssignment { voice: string; emotion: string; delivery: string }
+export interface VoiceAssignment { voice: string; emotion: string; delivery: string; name?:string }
 export interface Settings {
   provider: 'lumiverse' | 'openrouter' | 'browser' | 'local';
   connectionId: string;
@@ -17,7 +17,7 @@ export interface Settings {
 }
 export const DEFAULTS: Settings = {
   provider: 'openrouter', connectionId:'', model: 'google/gemini-3.8-flash-tts', voice: 'Kore', narratorVoice: '',
-  localUrl: 'http://localhost:8880/v1', enabled: true, follow: false,
+  localUrl: 'http://localhost:8880/v1', enabled: false, follow: false,
   promptEmotions: true, useEmotions: true, inheritVoices:true, widgetMinimized:false, widgetPosition:null, speed: 1, volume: 0.85, assignments: {},
 };
 export interface SpeechSegment { text: string; speaker: string; emotion: string; delivery: string }
@@ -47,14 +47,14 @@ export function normalizeSettings(raw: unknown): Settings {
   const assignments: Settings['assignments'] = {};
   if (r.assignments && typeof r.assignments === 'object') for (const [key, v] of Object.entries(r.assignments).slice(0, 500)) {
     if (!v || typeof v !== 'object' || ['__proto__','constructor','prototype'].includes(key)) continue;
-    assignments[key.slice(0, 200)] = { voice: str(v.voice, '', 160), emotion: enumValue(v.emotion, EMOTIONS, 'neutral'), delivery: enumValue(v.delivery, DELIVERIES, 'normal') };
+    assignments[key.slice(0, 200)] = { voice: str(v.voice, '', 160), emotion: enumValue(v.emotion, EMOTIONS, 'neutral'), delivery: enumValue(v.delivery, DELIVERIES, 'normal'), ...(typeof v.name==='string'?{name:str(v.name,'',80)}:{}) };
   }
   return {
     connectionId: str(r.connectionId,'',160),
     provider: ['lumiverse','openrouter','browser','local'].includes(r.provider ?? '') ? r.provider! : DEFAULTS.provider,
     model: str(r.model, DEFAULTS.model), voice: str(r.voice, DEFAULTS.voice), narratorVoice: str(r.narratorVoice, ''),
     localUrl: str(r.localUrl, DEFAULTS.localUrl, 500),
-    enabled: r.enabled !== false, follow: r.follow === true,
+    enabled: typeof r.enabled==='boolean'?r.enabled:DEFAULTS.enabled, follow: r.follow === true,
     promptEmotions: r.promptEmotions !== false, useEmotions: r.useEmotions !== false, inheritVoices:r.inheritVoices!==false, widgetMinimized:r.widgetMinimized===true, widgetPosition,
     speed: clamp(r.speed, 0.5, 2, 1), volume: clamp(r.volume, 0, 1, .85), assignments,
   };
