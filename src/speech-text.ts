@@ -7,13 +7,24 @@ const ENTITIES:Record<string,string> = {nbsp:' ',amp:'&',lt:'<',gt:'>',quot:'"',
 // https://ai.google.dev/gemini-api/docs/speech-generation#vocal-bursts-and-non-speech-sounds
 export const VOCAL_TAGS = ['laugh','laughter','chuckle','chuckles','giggle','snicker','cackle','cheer','gasp','sigh','sighs','groan','grunt','grr','growl','hiss','moan','pant','pff','phew','tsk','whispers','whispering','shout','argh','whimper','cry','sob','scream','shriek','snort','breath','heavy breath','exhales','cough','throat-clearing','sneeze','yawn','short pause','long pause'] as const;
 const vocalTags=new Set<string>(VOCAL_TAGS);
-function vocalTag(tag:string):string|undefined {
+function legacyVocalTag(tag:string):string|undefined {
   const match=/^<([a-z][a-z\s-]*?)\s*\/?>$/i.exec(tag);
   const name=match?.[1].toLowerCase().trim().replace(/\s+/g,' ');
   return name && vocalTags.has(name)?`<${name}>`:undefined;
 }
 export function stripVocalTags(text:string,preserveOffsets=false):string {
   return text.replace(/<[^<>]*>/g,tag=>vocalTag(tag)?' '.repeat(preserveOffsets?tag.length:1):tag);
+}
+const NON_PROSE_TAGS=new Set('html head body title script style noscript template slot canvas svg math details summary dialog form button select option optgroup textarea datalist output progress meter audio video picture map object iframe frameset frame noframes applet basefont center'.split(' '));
+// These are metadata even when the model forgets the closing marker. Paired
+// custom tags are always metadata; only standalone, attribute-free cues pass.
+const METADATA_TAG=/^(?:think|thinking|reasoning|analysis|redacted_thinking|tracker|stats|status|state|scenecard|tts_tags|(?:sc|flair|lumi|lumidraw|lumistudio|lumi-studio|dt-image|image-prompt|loom|tool|function)(?:[_-][\w-]+)?)$/i;
+function vocalTag(marker:string):string|undefined {
+  const match=/^<([a-z][\w-]*(?:\s+[^<>=\/"*]+)?)\s*\/?>$/i.exec(marker);
+  if(!match)return;
+  const cue=match[1].trim().toLowerCase().replace(/\s+/g,' '),name=cue.split(' ')[0];
+  if(PROSE_TAGS.has(name) || VOID_TAGS.has(name) || NON_PROSE_TAGS.has(name) || METADATA_TAG.test(name))return;
+  return `<${cue}>`;
 }
 
 function decodeEntities(text:string):string {
@@ -24,7 +35,8 @@ function decodeEntities(text:string):string {
   });
 }
 
-export function sanitizeSpeechText(raw:string,keepVocalTags=false):string {
+/** Reconstruct pre-0.2.11 recording plans and their original cache identity. */
+export function sanitizeLegacySpeechText(raw:string,keepVocalTags=false):string {
   const text=decodeEntities(raw)
     .replace(/<!--\s*([a-z0-9_]+)_START\s*-->[\s\S]*?(?:<!--\s*\1_END\s*-->|$)/gi,' ')
     .replace(/<!--[\s\S]*?(?:-->|$)/g,' ')
@@ -38,7 +50,7 @@ export function sanitizeSpeechText(raw:string,keepVocalTags=false):string {
   for(const match of text.matchAll(tags)) {
     if(!blocked.length)parts.push(text.slice(cursor,match.index),' ');
     const tag=match[2].toLowerCase();
-    const vocal=vocalTag(match[0]);
+    const vocal=legacyVocalTag(match[0]);
     if(vocal) {
       if(!blocked.length && keepVocalTags)parts.push(vocal,' ');
     } else if(match[1]) {
@@ -49,5 +61,35 @@ export function sanitizeSpeechText(raw:string,keepVocalTags=false):string {
   }
   if(!blocked.length)parts.push(text.slice(cursor));
   // A partial custom tag at the end of a streamed/edited message is metadata.
+  return parts.join('').replace(/<\/?([a-z][a-z0-9:_-]*)(?:\s[^<>]*)?$/gi,' ');
+}
+
+export function sanitizeSpeechText(raw:string,keepVocalTags=false):string {
+  const text=decodeEntities(raw)
+    .replace(/<!--\s*([a-z0-9_]+)_START\s*-->[\s\S]*?(?:<!--\s*\1_END\s*-->|$)/gi,' ')
+    .replace(/<!--[\s\S]*?(?:-->|$)/g,' ')
+    .replace(/```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)/g,' ')
+    .replace(/(`+)[\s\S]*?\1/g,' ')
+    .replace(/<!doctype\b[^>]*>/gi,' ');
+  const tags=Array.from(text.matchAll(/<(\/?)([a-z][a-z0-9:_-]*)(?=[\s/>])(?:[^<>"']|"[^"]*"|'[^']*')*>/gi));
+  const paired=new Set<number>(),openings=new Map<string,number[]>();
+  for(let i=0;i<tags.length;i++){
+    const match=tags[i],name=match[2].toLowerCase();
+    if(match[1]){const opening=openings.get(name)?.pop();if(opening!==undefined)paired.add(opening)}
+    else if(!VOID_TAGS.has(name) && !/\/\s*>$/.test(match[0])){const stack=openings.get(name)??[];stack.push(i);openings.set(name,stack)}
+  }
+  const blocked:string[]=[],parts:string[]=[];let cursor=0;
+  for(let i=0;i<tags.length;i++){
+    const match=tags[i],name=match[2].toLowerCase();
+    if(!blocked.length)parts.push(text.slice(cursor,match.index),' ');
+    if(match[1]){const at=blocked.lastIndexOf(name);if(at!==-1)blocked.splice(at)}
+    else if(!PROSE_TAGS.has(name) && !VOID_TAGS.has(name)){
+      const vocal=!paired.has(i)?vocalTag(match[0]):undefined;
+      if(vocal){if(!blocked.length && keepVocalTags)parts.push(vocal,' ')}
+      else if(!/\/\s*>$/.test(match[0]))blocked.push(name);
+    }
+    cursor=match.index!+match[0].length;
+  }
+  if(!blocked.length)parts.push(text.slice(cursor));
   return parts.join('').replace(/<\/?([a-z][a-z0-9:_-]*)(?:\s[^<>]*)?$/gi,' ');
 }

@@ -74,11 +74,11 @@ describe('voice selection and settings',()=>{
   test('turning off emotions removes every provider cue',()=>{
     const s={...DEFAULTS,useEmotions:false};const segment={text:'Hi.',speaker:'Mara',emotion:'angry',delivery:'shouts'};
     expect(speechInput(segment,selectVoice(s,segment),true)).toBe('Hi.');
-    expect(speechRequest(s,segment)).not.toHaveProperty('provider');
+    expect(speechRequest(s,segment)).not.toHaveProperty('instructions');
   });
-  test('Gemini 3.8 uses speech metadata while 3.1 uses audio tags',()=>{
+  test('Gemini 3.8 uses separate instructions while 3.1 uses audio tags',()=>{
     const segment={text:'Hi.',speaker:'Mara',emotion:'worried',delivery:'whispers'};
-    const current=speechRequest(DEFAULTS,segment);expect(current.input).toBe('Hi.');expect(current).toHaveProperty('provider');
+    const current=speechRequest(DEFAULTS,segment);expect(current.input).toBe('Hi.');expect(current.instructions).toBe('worried, whispering');expect(current).not.toHaveProperty('provider');
     const legacy=speechRequest({...DEFAULTS,model:'google/gemini-3.1-flash-tts-preview'},segment);expect(legacy.input).toBe('[worried] [whispers] Hi.');expect(legacy).not.toHaveProperty('provider');
     expect(current.response_format).toBe('pcm');expect(legacy.response_format).toBe('pcm');
     expect(speechRequest({...DEFAULTS,model:'openai/gpt-4o-mini-tts'},segment).response_format).toBe('mp3');

@@ -1,12 +1,13 @@
 import { selectVoice, speakerCharacterId, splitSentences, readVoiceRef, parseSegments, DEFAULT_SPEECH_RULES, type CharacterInfo, type NativeVoiceRef, type Settings, type SpeechSegment, type MessageInfo, type SpeechRules } from './shared';
 import type { NativeConnection } from './native-tts';
-import { stripVocalTags } from './speech-text';
+import { stripVocalTags,sanitizeLegacySpeechText } from './speech-text';
 import {applyPronunciations,type Pronunciations} from './pronunciation';
+import {isGeminiSpeechStyleModel} from './speech-style';
 
 export const MAX_PASSAGE_CHARS=3000;
 export const MAX_NATIVE_PASSAGE_CHARS=12000;
 export interface SpeechPassage { segment:SpeechSegment;segments:SpeechSegment[];settings:Settings;voice:string }
-export interface VoiceContext { characters:CharacterInfo[];characterId?:string;connections?:NativeConnection[];mainSpeaker?:string;narrationVoice?:NativeVoiceRef;pronunciations?:Pronunciations;overrides?:{narrator?:unknown;characters?:Record<string,unknown>} }
+export interface VoiceContext { characters:CharacterInfo[];characterId?:string;connections?:NativeConnection[];mainSpeaker?:string;narrationVoice?:NativeVoiceRef;pronunciations?:Pronunciations;legacyAudio?:boolean;overrides?:{narrator?:unknown;characters?:Record<string,unknown>} }
 
 const firstName=(name:string)=>name.split('||')[0].trim().toLowerCase();
 /** True for a speaker who is neither the reply's own character, a library character, nor someone with a saved voice. */
@@ -23,7 +24,7 @@ export function planMessageSpeech(message:MessageInfo,settings:Settings,context:
   // Plain user input is their own speech. Keep explicit skips, narrated actions,
   // and speaker cues; assistant narration still follows the host's rules.
   const effectiveRules=message.isUser && rules.undecorated!=='skip'?{...rules,undecorated:'speech' as const}:rules;
-  const segments=parseSegments(message.content,speaker,effectiveRules);
+  const segments=parseSegments(context.legacyAudio?sanitizeLegacySpeechText(message.content,true):message.content,speaker,effectiveRules);
   if(message.isUser && settings.personaName){
     for(const segment of segments){
       if(segment.speaker.trim().toLowerCase()===message.name.trim().toLowerCase() && !settings.assignments[`name:${segment.speaker.toLowerCase()}`])segment.speaker=speaker;
@@ -56,9 +57,8 @@ export function planSpeech(segments:SpeechSegment[], settings:Settings, context:
       segment={...source,text:stripVocalTags(source.text).replace(/\s+/g,' ').trim()};
       if(!segment.text || /^["“”«»\s]+$/.test(segment.text))continue;
     }
-    // Gemini 3.8's native adapter ignores style cues, so don't fragment its
-    // prose on directions it cannot use. Keep directions for supported TTS.
-    const styleSupported=/gemini-3\.1.*tts|gpt-4o-mini-tts/i.test(snapshot.model) && snapshot.provider!=='browser';
+    const geminiStyle=!context.legacyAudio && isGeminiSpeechStyleModel(snapshot.model) && (snapshot.provider==='openrouter' || snapshot.provider==='lumiverse' && !!context.connections?.find(c=>c.id===snapshot.connectionId)?.supportsSpeechStyle);
+    const styleSupported=(geminiStyle || /gemini-3\.1.*tts|gpt-4o-mini-tts/i.test(snapshot.model)) && snapshot.provider!=='browser';
     const emotion=styleSupported?assignment.emotion:'neutral', delivery=styleSupported?assignment.delivery:'normal';
     const key=JSON.stringify([snapshot.provider,snapshot.connectionId,snapshot.model,snapshot.voice,emotion,delivery]);
     const limit=snapshot.provider==='lumiverse' && /gemini-.*tts/i.test(snapshot.model)?MAX_NATIVE_PASSAGE_CHARS:MAX_PASSAGE_CHARS;

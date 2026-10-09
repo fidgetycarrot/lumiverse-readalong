@@ -1,5 +1,6 @@
 import { sanitizeSpeechText,stripVocalTags } from './speech-text';
 import {PRONUNCIATION_CUE_PATTERN,stripPronunciationCues} from './pronunciation';
+import {deliveryStyle,isGeminiSpeechStyleModel} from './speech-style';
 
 export const EMOTIONS = ['neutral', 'happy', 'sad', 'angry', 'worried', 'curious', 'excited', 'sarcastic', 'tender', 'afraid'] as const;
 export const DELIVERIES = ['normal', 'whispers', 'shouts', 'softly', 'slowly', 'laughs', 'sighs'] as const;
@@ -166,14 +167,12 @@ export function speechRequest(settings: Settings, segment: SpeechSegment, charac
   const assignment = selectVoice(settings,segment,characterId);
   const openrouter = settings.provider === 'openrouter';
   // Gemini 3.8 accepts inline vocal events; sustained directions stay separate.
-  const gemini38 = openrouter && /^google\/gemini-3\.8.*tts/.test(settings.model);
+  const gemini38 = openrouter && isGeminiSpeechStyleModel(settings.model);
   const legacyTags = openrouter && /^google\/gemini-3\.1.*tts/.test(settings.model);
   const body: Record<string,unknown> = { model:settings.model, voice:assignment.voice, input:speechInput(segment,assignment,legacyTags,gemini38), response_format:needsPcm(settings) ? 'pcm' : 'mp3' };
   if (gemini38) {
-    const emotions: Record<string,string> = { happy:'happy and cheerful',sad:'sad',angry:'angry',worried:'worried',curious:'curious',excited:'excited',sarcastic:'sarcastic',tender:'warm and tender',afraid:'afraid' };
-    const deliveries: Record<string,string> = { whispers:'whispering',shouts:'shouting',softly:'soft-spoken',slowly:'slow and deliberate',laughs:'with a light laugh',sighs:'with a sigh' };
-    const style = [emotions[assignment.emotion],deliveries[assignment.delivery]].filter(Boolean).join(', ');
-    if (style) body.provider = { options:{ 'google-ai-studio':{ speech_metadata:{ style } } } };
+    const style=deliveryStyle(assignment.emotion,assignment.delivery);
+    if(style)body.instructions=style;
   }
   return body;
 }

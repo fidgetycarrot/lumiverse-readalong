@@ -94,3 +94,20 @@ test('speaker cues cannot override skipped native spans',()=>{
   expect(parseSegments('*[speaker:Elys-04] Hidden action.* “[speaker:Elys-04] Hidden dialogue.” Visible prose.','Elys-04',rules).map(s=>s.text)).toEqual(['Visible prose.']);
   expect(parseSegments('*[speaker:Other][emotion:angry] Hidden action.* “Hello.”','Elys-04',{...DEFAULT_SPEECH_RULES,asterisked:'skip'})[0]).toMatchObject({speaker:'Elys-04',emotion:''});
 });
+test('new standalone vocal tags never swallow dialogue or following narration',()=>{
+  for(const cue of ['new-performance-cue-2042','an entirely new vocal cue','gasps','soft laughter','sound']){
+    const raw=`“Before. <${cue}> After.” Then he waited.`;
+    const segments=parseSegments(raw,'Elys-04');
+    expect(segments.map(s=>s.text).join(' ')).toContain(`<${cue}> After.`);
+    expect(segments.at(-1)?.text).toBe('Then he waited.');
+    expect(plainText(raw)).toBe('“Before. After.” Then he waited.');
+  }
+});
+test('paired custom blocks remain silent even if their names could also be vocal cues',()=>{
+  expect(plainText('Before. <gasp>Private directions.</gasp> After. <unknown>Other private text.</unknown> End.')).toBe('Before. After. End.');
+  expect(plainText('Before. <gasp>Private.</gasp> “Wait. <gasp> Listen.”')).toBe('Before. “Wait. Listen.”');
+});
+test('unclosed known metadata and non-prose HTML are never treated as new audio cues',()=>{
+  for(const tag of ['scenecard','sc-stella','dt-image','lumi-studio-prompt','flair-choice','tts_tags','think','analysis','script','textarea'])expect(plainText(`Before. <${tag}>Private after this.`)).toBe('Before.');
+  expect(plainText('Before. <!doctype html><img title="a > b"> After.')).toBe('Before. After.');
+});

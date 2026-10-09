@@ -1,7 +1,8 @@
 import { pcmBlobToWav } from './prepared-audio';
 import { selectVoice, speechInput, readVoiceRef, DEFAULT_SPEECH_RULES, type SpeechRules, type Settings, type SpeechSegment } from './shared';
 import { nativeProviderError } from './provider-errors';
-export interface NativeConnection { id:string;name:string;provider:string;model:string;voice:string;outputFormat?:string }
+import {deliveryStyle,combineSpeechStyle,isGeminiSpeechStyleModel} from './speech-style';
+export interface NativeConnection { id:string;name:string;provider:string;model:string;voice:string;outputFormat?:string;supportsSpeechStyle?:boolean;speechStyle?:string }
 const API = '/api/v1';
 async function boundedBytes(response:Response, limit:number):Promise<Uint8Array> {
   if (Number(response.headers.get('content-length'))>limit) throw new Error('Lumiverse returned an oversized speech response.');
@@ -11,20 +12,17 @@ async function boundedBytes(response:Response, limit:number):Promise<Uint8Array>
   finally {await reader.cancel().catch(()=>{})}
   const bytes=new Uint8Array(size);let offset=0;for(const chunk of chunks){bytes.set(chunk,offset);offset+=chunk.length}return bytes;
 }
-function style(emotion:string, delivery:string) {
-  const values:Record<string,string>={happy:'happy and cheerful',sad:'sad',angry:'angry',worried:'worried',curious:'curious',excited:'excited',sarcastic:'sarcastic',tender:'warm and tender',afraid:'afraid',whispers:'whispering',shouts:'shouting',softly:'soft-spoken',slowly:'slow and deliberate',laughs:'with a light laugh',sighs:'with a sigh'};
-  return [values[emotion],values[delivery]].filter(Boolean).join(', ');
-}
 export function nativeSpeechRequest(connection:NativeConnection, settings:Settings, segment:SpeechSegment, characterId?:string) {
   const assignment=selectVoice(settings,segment,characterId), model=settings.model || connection.model;
   const openrouter=connection.provider==='openrouter_tts';
   const gemini=/gemini-.*tts/i.test(model);
   const legacyTags=gemini && /gemini-3\.1/i.test(model);
-  const direction=style(assignment.emotion,assignment.delivery);
-  // Sustained Gemini directions aren't exposed by this host adapter. Inline
-  // vocal events are part of the transcript and pass through without metadata.
+  const direction=deliveryStyle(assignment.emotion,assignment.delivery);
   const parameters:Record<string,unknown>={};
   if (openrouter && gemini) parameters.speed=1;
+  // Explicitly freeze the effective connection style, including a cleared
+  // style. Saved partial audio can then finish with the original delivery.
+  if(connection.supportsSpeechStyle && isGeminiSpeechStyleModel(model))parameters.speech_style=combineSpeechStyle(connection.speechStyle??'',direction);
   if (/gpt-4o-mini-tts/i.test(model) && ['openrouter_tts','openai_tts'].includes(connection.provider) && direction) parameters.instructions=`Speak ${direction}.`;
   return {connectionId:connection.id,text:speechInput(segment,assignment,legacyTags,gemini && /gemini-3\.8/i.test(model)),voice:assignment.voice || connection.voice,model,parameters,
     outputFormat:openrouter && gemini ? 'pcm' : connection.outputFormat};
@@ -52,10 +50,24 @@ export function createNativeTtsClient(transport:typeof fetch = fetch) {
     },
     async connections():Promise<NativeConnection[]> {
       const all:NativeConnection[]=[];
+      // This is local capability discovery, not a provider request. Old hosts
+      // retain the previous batching behavior if they don't expose this field.
+      const styles=new Map<string,string>();
+      try {
+        const result=await readJson(await request('/tts-connections/providers'));
+        for(const p of Array.isArray(result.providers)?result.providers:[]){
+          const parameter=p.capabilities?.parameters?.speech_style;
+          if(typeof p.id==='string' && parameter?.type==='string')styles.set(p.id,typeof parameter.default==='string'?parameter.default:'');
+        }
+      }catch{/* No capability means no per-passage style instructions. */}
       for(let offset=0;offset<2000;offset+=200) {
         const result=await readJson(await request(`/tts-connections?limit=200&offset=${offset}`));
         if (!Array.isArray(result.data))throw new Error('This Lumiverse build did not return its TTS connections.');
-        for(const p of result.data)if(typeof p.id==='string' && typeof p.provider==='string')all.push({id:p.id,name:p.name || p.id,provider:p.provider,model:p.model || '',voice:p.voice || '',outputFormat:p.default_parameters?.output_format});
+        for(const p of result.data)if(typeof p.id==='string' && typeof p.provider==='string'){
+          const configured=p.default_parameters?.speech_style??p.default_parameters?.instructions;
+          all.push({id:p.id,name:p.name || p.id,provider:p.provider,model:p.model || '',voice:p.voice || '',outputFormat:p.default_parameters?.output_format,
+            ...(styles.has(p.provider)?{supportsSpeechStyle:true,speechStyle:typeof configured==='string'?configured.trim():styles.get(p.provider)!}:{}),});
+        }
         if(result.data.length<200 || typeof result.total==='number' && offset+result.data.length>=result.total)break;
       }
       return all;

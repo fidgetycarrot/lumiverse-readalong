@@ -4,13 +4,24 @@ var VOID_TAGS = new Set("area base br col embed hr img input link meta param sou
 var ENTITIES = { nbsp: " ", amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", ldquo: "“", rdquo: "”", lsquo: "‘", rsquo: "’" };
 var VOCAL_TAGS = ["laugh", "laughter", "chuckle", "chuckles", "giggle", "snicker", "cackle", "cheer", "gasp", "sigh", "sighs", "groan", "grunt", "grr", "growl", "hiss", "moan", "pant", "pff", "phew", "tsk", "whispers", "whispering", "shout", "argh", "whimper", "cry", "sob", "scream", "shriek", "snort", "breath", "heavy breath", "exhales", "cough", "throat-clearing", "sneeze", "yawn", "short pause", "long pause"];
 var vocalTags = new Set(VOCAL_TAGS);
-function vocalTag(tag) {
+function legacyVocalTag(tag) {
   const match = /^<([a-z][a-z\s-]*?)\s*\/?>$/i.exec(tag);
   const name = match?.[1].toLowerCase().trim().replace(/\s+/g, " ");
   return name && vocalTags.has(name) ? `<${name}>` : undefined;
 }
 function stripVocalTags(text, preserveOffsets = false) {
   return text.replace(/<[^<>]*>/g, (tag) => vocalTag(tag) ? " ".repeat(preserveOffsets ? tag.length : 1) : tag);
+}
+var NON_PROSE_TAGS = new Set("html head body title script style noscript template slot canvas svg math details summary dialog form button select option optgroup textarea datalist output progress meter audio video picture map object iframe frameset frame noframes applet basefont center".split(" "));
+var METADATA_TAG = /^(?:think|thinking|reasoning|analysis|redacted_thinking|tracker|stats|status|state|scenecard|tts_tags|(?:sc|flair|lumi|lumidraw|lumistudio|lumi-studio|dt-image|image-prompt|loom|tool|function)(?:[_-][\w-]+)?)$/i;
+function vocalTag(marker) {
+  const match = /^<([a-z][\w-]*(?:\s+[^<>=\/"*]+)?)\s*\/?>$/i.exec(marker);
+  if (!match)
+    return;
+  const cue = match[1].trim().toLowerCase().replace(/\s+/g, " "), name = cue.split(" ")[0];
+  if (PROSE_TAGS.has(name) || VOID_TAGS.has(name) || NON_PROSE_TAGS.has(name) || METADATA_TAG.test(name))
+    return;
+  return `<${cue}>`;
 }
 function decodeEntities(text) {
   return text.replace(/&(#x[\da-f]+|#\d+|[a-z]+);/gi, (entity, name) => {
@@ -20,7 +31,7 @@ function decodeEntities(text) {
     return code > 0 && code <= 1114111 && !(code >= 55296 && code <= 57343) ? String.fromCodePoint(code) : entity;
   });
 }
-function sanitizeSpeechText(raw, keepVocalTags = false) {
+function sanitizeLegacySpeechText(raw, keepVocalTags = false) {
   const text = decodeEntities(raw).replace(/<!--\s*([a-z0-9_]+)_START\s*-->[\s\S]*?(?:<!--\s*\1_END\s*-->|$)/gi, " ").replace(/<!--[\s\S]*?(?:-->|$)/g, " ").replace(/```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)/g, " ").replace(/(`+)[\s\S]*?\1/g, " ");
   const tags = /<(\/?)([a-z][a-z0-9:_-]*)(?=[\s/>])(?:[^<>"']|"[^"]*"|'[^']*')*>/gi;
   const blocked = [], parts = [];
@@ -29,7 +40,7 @@ function sanitizeSpeechText(raw, keepVocalTags = false) {
     if (!blocked.length)
       parts.push(text.slice(cursor, match.index), " ");
     const tag = match[2].toLowerCase();
-    const vocal = vocalTag(match[0]);
+    const vocal = legacyVocalTag(match[0]);
     if (vocal) {
       if (!blocked.length && keepVocalTags)
         parts.push(vocal, " ");
@@ -39,6 +50,46 @@ function sanitizeSpeechText(raw, keepVocalTags = false) {
         blocked.splice(index);
     } else if (!PROSE_TAGS.has(tag) && !VOID_TAGS.has(tag) && !/\/\s*>$/.test(match[0]))
       blocked.push(tag);
+    cursor = match.index + match[0].length;
+  }
+  if (!blocked.length)
+    parts.push(text.slice(cursor));
+  return parts.join("").replace(/<\/?([a-z][a-z0-9:_-]*)(?:\s[^<>]*)?$/gi, " ");
+}
+function sanitizeSpeechText(raw, keepVocalTags = false) {
+  const text = decodeEntities(raw).replace(/<!--\s*([a-z0-9_]+)_START\s*-->[\s\S]*?(?:<!--\s*\1_END\s*-->|$)/gi, " ").replace(/<!--[\s\S]*?(?:-->|$)/g, " ").replace(/```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)/g, " ").replace(/(`+)[\s\S]*?\1/g, " ").replace(/<!doctype\b[^>]*>/gi, " ");
+  const tags = Array.from(text.matchAll(/<(\/?)([a-z][a-z0-9:_-]*)(?=[\s/>])(?:[^<>"']|"[^"]*"|'[^']*')*>/gi));
+  const paired = new Set, openings = new Map;
+  for (let i = 0;i < tags.length; i++) {
+    const match = tags[i], name = match[2].toLowerCase();
+    if (match[1]) {
+      const opening = openings.get(name)?.pop();
+      if (opening !== undefined)
+        paired.add(opening);
+    } else if (!VOID_TAGS.has(name) && !/\/\s*>$/.test(match[0])) {
+      const stack = openings.get(name) ?? [];
+      stack.push(i);
+      openings.set(name, stack);
+    }
+  }
+  const blocked = [], parts = [];
+  let cursor = 0;
+  for (let i = 0;i < tags.length; i++) {
+    const match = tags[i], name = match[2].toLowerCase();
+    if (!blocked.length)
+      parts.push(text.slice(cursor, match.index), " ");
+    if (match[1]) {
+      const at = blocked.lastIndexOf(name);
+      if (at !== -1)
+        blocked.splice(at);
+    } else if (!PROSE_TAGS.has(name) && !VOID_TAGS.has(name)) {
+      const vocal = !paired.has(i) ? vocalTag(match[0]) : undefined;
+      if (vocal) {
+        if (!blocked.length && keepVocalTags)
+          parts.push(vocal, " ");
+      } else if (!/\/\s*>$/.test(match[0]))
+        blocked.push(name);
+    }
     cursor = match.index + match[0].length;
   }
   if (!blocked.length)
@@ -103,6 +154,18 @@ function pronunciationSample(entry, spelling) {
   if (!chosen.length)
     throw new Error("Choose a name or alternative from this pronunciation.");
   return chosen.length === 1 ? `${chosen[0]} arrived. I looked at ${chosen[0]}. ${chosen[0]}'s voice was calm.` : chosen.map((name) => `${name} arrived.`).join(" ");
+}
+
+// src/speech-style.ts
+var isGeminiSpeechStyleModel = (model) => /(?:^|\/)gemini-3\.8-flash(?:-lite)?-tts(?:$|[-:])/i.test(model);
+function deliveryStyle(emotion, delivery) {
+  const emotions = { happy: "happy and cheerful", sad: "sad", angry: "angry", worried: "worried", curious: "curious", excited: "excited", sarcastic: "sarcastic", tender: "warm and tender", afraid: "afraid" };
+  const deliveries = { whispers: "whispering", shouts: "shouting", softly: "soft-spoken", slowly: "slow and deliberate", laughs: "with a light laugh", sighs: "with a sigh" };
+  return [emotions[emotion], deliveries[delivery]].filter(Boolean).join(", ");
+}
+function combineSpeechStyle(base, direction) {
+  return [base.trim(), direction ? `For this passage, speak ${direction}.` : ""].filter(Boolean).join(`
+`);
 }
 
 // src/shared.ts
@@ -311,15 +374,13 @@ function needsPcm(settings) {
 function speechRequest(settings, segment, characterId) {
   const assignment = selectVoice(settings, segment, characterId);
   const openrouter = settings.provider === "openrouter";
-  const gemini38 = openrouter && /^google\/gemini-3\.8.*tts/.test(settings.model);
+  const gemini38 = openrouter && isGeminiSpeechStyleModel(settings.model);
   const legacyTags = openrouter && /^google\/gemini-3\.1.*tts/.test(settings.model);
   const body = { model: settings.model, voice: assignment.voice, input: speechInput(segment, assignment, legacyTags, gemini38), response_format: needsPcm(settings) ? "pcm" : "mp3" };
   if (gemini38) {
-    const emotions = { happy: "happy and cheerful", sad: "sad", angry: "angry", worried: "worried", curious: "curious", excited: "excited", sarcastic: "sarcastic", tender: "warm and tender", afraid: "afraid" };
-    const deliveries = { whispers: "whispering", shouts: "shouting", softly: "soft-spoken", slowly: "slow and deliberate", laughs: "with a light laugh", sighs: "with a sigh" };
-    const style = [emotions[assignment.emotion], deliveries[assignment.delivery]].filter(Boolean).join(", ");
+    const style = deliveryStyle(assignment.emotion, assignment.delivery);
     if (style)
-      body.provider = { options: { "google-ai-studio": { speech_metadata: { style } } } };
+      body.instructions = style;
   }
   return body;
 }
@@ -1037,19 +1098,17 @@ async function boundedBytes(response, limit) {
   }
   return bytes;
 }
-function style(emotion, delivery) {
-  const values = { happy: "happy and cheerful", sad: "sad", angry: "angry", worried: "worried", curious: "curious", excited: "excited", sarcastic: "sarcastic", tender: "warm and tender", afraid: "afraid", whispers: "whispering", shouts: "shouting", softly: "soft-spoken", slowly: "slow and deliberate", laughs: "with a light laugh", sighs: "with a sigh" };
-  return [values[emotion], values[delivery]].filter(Boolean).join(", ");
-}
 function nativeSpeechRequest(connection, settings, segment, characterId) {
   const assignment = selectVoice(settings, segment, characterId), model = settings.model || connection.model;
   const openrouter = connection.provider === "openrouter_tts";
   const gemini = /gemini-.*tts/i.test(model);
   const legacyTags = gemini && /gemini-3\.1/i.test(model);
-  const direction = style(assignment.emotion, assignment.delivery);
+  const direction = deliveryStyle(assignment.emotion, assignment.delivery);
   const parameters = {};
   if (openrouter && gemini)
     parameters.speed = 1;
+  if (connection.supportsSpeechStyle && isGeminiSpeechStyleModel(model))
+    parameters.speech_style = combineSpeechStyle(connection.speechStyle ?? "", direction);
   if (/gpt-4o-mini-tts/i.test(model) && ["openrouter_tts", "openai_tts"].includes(connection.provider) && direction)
     parameters.instructions = `Speak ${direction}.`;
   return {
@@ -1093,13 +1152,32 @@ function createNativeTtsClient(transport = fetch) {
     },
     async connections() {
       const all = [];
+      const styles = new Map;
+      try {
+        const result = await readJson(await request("/tts-connections/providers"));
+        for (const p of Array.isArray(result.providers) ? result.providers : []) {
+          const parameter = p.capabilities?.parameters?.speech_style;
+          if (typeof p.id === "string" && parameter?.type === "string")
+            styles.set(p.id, typeof parameter.default === "string" ? parameter.default : "");
+        }
+      } catch {}
       for (let offset = 0;offset < 2000; offset += 200) {
         const result = await readJson(await request(`/tts-connections?limit=200&offset=${offset}`));
         if (!Array.isArray(result.data))
           throw new Error("This Lumiverse build did not return its TTS connections.");
         for (const p of result.data)
-          if (typeof p.id === "string" && typeof p.provider === "string")
-            all.push({ id: p.id, name: p.name || p.id, provider: p.provider, model: p.model || "", voice: p.voice || "", outputFormat: p.default_parameters?.output_format });
+          if (typeof p.id === "string" && typeof p.provider === "string") {
+            const configured = p.default_parameters?.speech_style ?? p.default_parameters?.instructions;
+            all.push({
+              id: p.id,
+              name: p.name || p.id,
+              provider: p.provider,
+              model: p.model || "",
+              voice: p.voice || "",
+              outputFormat: p.default_parameters?.output_format,
+              ...styles.has(p.provider) ? { supportsSpeechStyle: true, speechStyle: typeof configured === "string" ? configured.trim() : styles.get(p.provider) } : {}
+            });
+          }
         if (result.data.length < 200 || typeof result.total === "number" && offset + result.data.length >= result.total)
           break;
       }
@@ -1157,7 +1235,7 @@ function isUnvoicedExtra(speaker, settings, context) {
 function planMessageSpeech(message, settings, context, rules = DEFAULT_SPEECH_RULES) {
   const speaker = message.isUser ? settings.personaName || message.name : message.name;
   const effectiveRules = message.isUser && rules.undecorated !== "skip" ? { ...rules, undecorated: "speech" } : rules;
-  const segments = parseSegments(message.content, speaker, effectiveRules);
+  const segments = parseSegments(context.legacyAudio ? sanitizeLegacySpeechText(message.content, true) : message.content, speaker, effectiveRules);
   if (message.isUser && settings.personaName) {
     for (const segment of segments) {
       if (segment.speaker.trim().toLowerCase() === message.name.trim().toLowerCase() && !settings.assignments[`name:${segment.speaker.toLowerCase()}`])
@@ -1191,7 +1269,8 @@ function planSpeech(segments, settings, context) {
       if (!segment.text || /^["“”«»\s]+$/.test(segment.text))
         continue;
     }
-    const styleSupported = /gemini-3\.1.*tts|gpt-4o-mini-tts/i.test(snapshot.model) && snapshot.provider !== "browser";
+    const geminiStyle = !context.legacyAudio && isGeminiSpeechStyleModel(snapshot.model) && (snapshot.provider === "openrouter" || snapshot.provider === "lumiverse" && !!context.connections?.find((c) => c.id === snapshot.connectionId)?.supportsSpeechStyle);
+    const styleSupported = (geminiStyle || /gemini-3\.1.*tts|gpt-4o-mini-tts/i.test(snapshot.model)) && snapshot.provider !== "browser";
     const emotion = styleSupported ? assignment.emotion : "neutral", delivery = styleSupported ? assignment.delivery : "normal";
     const key = JSON.stringify([snapshot.provider, snapshot.connectionId, snapshot.model, snapshot.voice, emotion, delivery]);
     const limit = snapshot.provider === "lumiverse" && /gemini-.*tts/i.test(snapshot.model) ? MAX_NATIVE_PASSAGE_CHARS : MAX_PASSAGE_CHARS;
@@ -1245,6 +1324,46 @@ function estimatedSentenceIndex(passage, fraction) {
       return i;
   }
   return weights.length - 1;
+}
+
+// src/saved-recording.ts
+var segment = (value) => value && ["text", "speaker", "emotion", "delivery"].every((k) => typeof value[k] === "string") ? { text: value.text, speaker: value.speaker, emotion: value.emotion, delivery: value.delivery } : undefined;
+function recordingPlan(passages, connections) {
+  const used = new Set(passages.filter((p) => p.settings.provider === "lumiverse").map((p) => p.settings.connectionId));
+  return {
+    passages: passages.map((p) => ({ segment: segment(p.segment), segments: p.segments.map((s) => segment(s)), voice: p.voice, settings: normalizeSettings(p.settings) })),
+    connections: connections.filter((c) => used.has(c.id)).map((c) => ({ id: c.id, name: c.name, provider: c.provider, model: c.model, voice: c.voice, outputFormat: c.outputFormat, supportsSpeechStyle: c.supportsSpeechStyle, speechStyle: c.speechStyle }))
+  };
+}
+function readRecordingPlan(raw, count) {
+  if (!raw || !Array.isArray(raw.passages) || raw.passages.length !== count || !Array.isArray(raw.connections))
+    return;
+  const passages = [];
+  for (const p of raw.passages) {
+    const main = segment(p?.segment);
+    if (!main || !Array.isArray(p.segments) || !p.segments.length || !p.settings || typeof p.voice !== "string")
+      return;
+    const segments = p.segments.map(segment);
+    if (segments.some((s) => !s))
+      return;
+    passages.push({ segment: main, segments, voice: p.voice, settings: normalizeSettings(p.settings) });
+  }
+  const connections = [];
+  for (const c of raw.connections) {
+    if (!c || !["id", "name", "provider", "model", "voice"].every((k) => typeof c[k] === "string"))
+      return;
+    connections.push({
+      id: c.id,
+      name: c.name,
+      provider: c.provider,
+      model: c.model,
+      voice: c.voice,
+      ...typeof c.outputFormat === "string" ? { outputFormat: c.outputFormat } : {},
+      ...typeof c.speechStyle === "string" ? { speechStyle: c.speechStyle } : {},
+      ...c.supportsSpeechStyle === true ? { supportsSpeechStyle: true } : {}
+    });
+  }
+  return recordingPlan(passages, connections);
 }
 
 // src/audio-cache.ts
@@ -1316,6 +1435,31 @@ class AudioCache {
     const clips = await this.read(userId, key);
     return validPartial(clips) && clips.length === count ? clips : undefined;
   }
+  async getRecording(userId, messageKey) {
+    if (!userId)
+      return;
+    const db = await this.open();
+    try {
+      return await new Promise((resolve, reject) => {
+        const request = db.transaction("audio", "readonly").objectStore("audio").index("user").getAll(userId);
+        request.onsuccess = () => {
+          const rows = request.result.filter((r) => r.userId === userId && r.recording?.messageKey === messageKey && validPartial(r.clips));
+          rows.sort((a, b) => Number(validClips(b.clips)) - Number(validClips(a.clips)) || b.at - a.at);
+          for (const row of rows) {
+            const plan = readRecordingPlan(row.recording?.plan, row.clips.length);
+            if (plan) {
+              resolve({ key: row.id.slice(userId.length + 1), clips: row.clips, plan });
+              return;
+            }
+          }
+          resolve(undefined);
+        };
+        request.onerror = () => reject(request.error ?? new Error("Could not read saved audio."));
+      });
+    } finally {
+      db.close();
+    }
+  }
   async read(userId, key) {
     if (!userId)
       return;
@@ -1338,10 +1482,12 @@ class AudioCache {
       return false;
     return this.putPartial(userId, key, clips);
   }
-  async putPartial(userId, key, clips) {
+  async putPartial(userId, key, clips, recording) {
     if (!userId || !validPartial(clips) || clips.reduce((n, c) => n + (c?.blob.size ?? 0), 0) > this.maxBytes)
       return false;
     const snapshot = Array.from(clips);
+    if (recording && (!/^[a-f0-9]{64}$/.test(recording.messageKey) || !readRecordingPlan(recording.plan, snapshot.length)))
+      return false;
     const db = await this.open();
     try {
       return await new Promise((resolve, reject) => {
@@ -1357,8 +1503,12 @@ class AudioCache {
           const bytes = merged.reduce((n, c) => n + (c?.blob.size ?? 0), 0);
           if (bytes > this.maxBytes)
             return;
-          const record = { id, userId, clips: merged, bytes, at: Math.max(Date.now(), ...rows.map((r) => r.at + 1)) };
-          const older = rows.filter((r) => r.id !== record.id).sort((a, b) => b.at - a.at);
+          const metadata = recording ? { messageKey: recording.messageKey, plan: recordingPlan(recording.plan.passages, recording.plan.connections) } : prior?.recording;
+          const record = { id, userId, clips: merged, bytes, at: Math.max(Date.now(), ...rows.map((r) => r.at + 1)), ...metadata ? { recording: metadata } : {} };
+          const protectedTake = !validClips(merged) && metadata ? rows.filter((r) => r.id !== id && r.recording?.messageKey === metadata.messageKey && validClips(r.clips)).sort((a, b) => b.at - a.at)[0] : undefined;
+          if (protectedTake && (bytes + protectedTake.bytes > this.maxBytes || this.maxEntries < 2))
+            return;
+          const older = rows.filter((r) => r.id !== record.id).sort((a, b) => Number(b.id === protectedTake?.id) - Number(a.id === protectedTake?.id) || b.at - a.at);
           let total = bytes, count = 1;
           store.put(record);
           written = true;
@@ -1750,6 +1900,7 @@ function setup(ctx) {
   let preparingAudio = false, waitingForAudio = false;
   let incompleteAudio = false, retryPreparation = null;
   let retainedParts = null;
+  let previousRecording = false;
   let playAttempt = null, messageLoad = null;
   const automaticPlayback = new AutomaticPlayback;
   let automaticPlaybackError = "";
@@ -2427,14 +2578,14 @@ function setup(ctx) {
         completionRecovery = null;
     }
   }
-  async function prepareSpeech(segment, snapshot, kind, signal) {
+  async function prepareSpeech(segment, snapshot, kind, signal, recordedConnection) {
     signal?.throwIfAborted();
     if (snapshot.provider !== "lumiverse") {
       speechActivity[kind]++;
       updateSpeechActivity();
       return rpc("speech", { segment, previewSettings: snapshot });
     }
-    const connection = activeNative(snapshot.connectionId);
+    const connection = recordedConnection ?? activeNative(snapshot.connectionId);
     if (!connection)
       throw new Error("Choose a connection first. If the list is empty, add one in Lumiverse’s voice settings.");
     const controller = new AbortController;
@@ -2510,6 +2661,7 @@ function setup(ctx) {
         automaticPreparations.delete(automaticPreparations.values().next().value);
     }
     stop(false);
+    previousRecording = false;
     automaticPlayback.arm(!!options.autoStart && settings.automaticPlayback && !options.restoreOnly);
     const token = playbackId;
     readingAbort = new AbortController;
@@ -2534,7 +2686,7 @@ function setup(ctx) {
       };
       let rules, hostAutomaticTts = false;
       if (snapshot.provider === "lumiverse") {
-        const results = await Promise.allSettled([nativeTts.preferences(), ctx.chats.getActive?.() ?? Promise.resolve(null)]);
+        const results = await Promise.allSettled([nativeTts.preferences(), ctx.chats.getActive?.() ?? Promise.resolve(null), nativeTts.connections()]);
         if (results[0].status === "fulfilled") {
           rules = results[0].value.rules;
           context.narrationVoice = results[0].value.narrationVoice;
@@ -2542,6 +2694,11 @@ function setup(ctx) {
         }
         if (results[1].status === "fulfilled")
           context.overrides = results[1].value?.metadata?.voiceOverrides;
+        if (results[2].status === "fulfilled" && token === playbackId) {
+          nativeConnections = results[2].value;
+          context.connections = nativeConnections;
+          renderConfig();
+        }
       }
       if (token !== playbackId)
         return;
@@ -2555,28 +2712,68 @@ function setup(ctx) {
       let restored = false, saved = true, openingCount = 0;
       if (snapshot.provider !== "browser") {
         const messageKey = await preparationHash([ctx.getActiveChat().chatId, message.id, message.content]);
-        const requests = currentPassages.map((p) => {
+        const requests = (passages, legacy = false) => passages.map((p) => {
           const connection = activeNative(p.settings.connectionId);
-          return p.settings.provider === "lumiverse" && connection ? nativeSpeechRequest(connection, p.settings, p.segment) : [p.settings.provider, p.settings.localUrl, speechRequest(p.settings, p.segment)];
+          if (p.settings.provider === "lumiverse" && connection) {
+            const request = nativeSpeechRequest(connection, p.settings, p.segment);
+            if (legacy)
+              delete request.parameters.speech_style;
+            return request;
+          }
+          return [p.settings.provider, p.settings.localUrl, speechRequest(p.settings, p.segment)];
         });
-        const audioKey = await preparationHash([messageKey, requests]);
+        const desiredKey = await preparationHash([messageKey, requests(currentPassages)]);
+        let audioKey = desiredKey, plan = recordingPlan(currentPassages, nativeConnections);
         let partial;
-        if (retainedParts?.userId === cacheUserId && retainedParts.key === audioKey) {
+        if (retainedParts?.userId === cacheUserId && retainedParts.recording.messageKey === messageKey && (!options.updateAudio || retainedParts.key === desiredKey)) {
+          audioKey = retainedParts.key;
+          plan = retainedParts.recording.plan;
           partial = Array.from(retainedParts.clips);
           saved = retainedParts.saved;
-        } else
+        } else if (!options.updateAudio)
           try {
-            partial = await audioCache.getPartial(cacheUserId, audioKey, currentPassages.length);
+            const existing = await audioCache.getRecording(cacheUserId, messageKey);
+            if (existing) {
+              audioKey = existing.key;
+              plan = existing.plan;
+              partial = existing.clips;
+            }
           } catch {}
+        if (!partial)
+          try {
+            partial = await audioCache.getPartial(cacheUserId, audioKey, plan.passages.length);
+          } catch {}
+        if (!partial && !options.updateAudio) {
+          const legacy = planMessageSpeech(message, snapshot, { ...context, legacyAudio: true }, rules);
+          if (legacy.length) {
+            const legacyKey = await preparationHash([messageKey, requests(legacy, true)]);
+            try {
+              const clips = await audioCache.getPartial(cacheUserId, legacyKey, legacy.length);
+              if (clips) {
+                audioKey = legacyKey;
+                partial = clips;
+                plan = recordingPlan(legacy, nativeConnections.map((c) => ({ ...c, speechStyle: "" })));
+                try {
+                  saved = await audioCache.putPartial(cacheUserId, audioKey, clips, { messageKey, plan });
+                } catch {
+                  saved = false;
+                }
+              }
+            } catch {}
+          }
+        }
         if (token !== playbackId)
           return;
+        previousRecording = !!partial && audioKey !== desiredKey;
+        currentPassages = plan.passages;
+        currentSegments = currentPassages.flatMap((p) => p.segments);
         if (partial?.length !== currentPassages.length)
           partial = undefined;
         partial ??= Array.from({ length: currentPassages.length }, () => {
           return;
         });
         const parts = partial, texts = currentPassages.map((p) => plainText(p.segment.text));
-        const retained = { userId: cacheUserId, key: audioKey, clips: parts, saved };
+        const recording = { messageKey, plan }, retained = { userId: cacheUserId, key: audioKey, clips: parts, saved, recording };
         retainedParts = retained;
         const prefixCount = () => {
           let n = 0;
@@ -2659,13 +2856,13 @@ function setup(ctx) {
             const clips = await prepareAll(currentPassages, async (p, index, requestSignal) => {
               if (parts[index])
                 return parts[index];
-              const data = await prepareSpeech(p.segment, p.settings, manual ? "manual" : "automatic", requestSignal);
+              const data = await prepareSpeech(p.segment, p.settings, manual ? "manual" : "automatic", requestSignal, plan.connections.find((c) => c.id === p.settings.connectionId));
               requestSignal.throwIfAborted();
               const clip = await prepareClip(data, requestSignal);
               requestSignal.throwIfAborted();
               parts[index] = clip;
               try {
-                saved = await audioCache.putPartial(cacheUserId, audioKey, parts);
+                saved = await audioCache.putPartial(cacheUserId, audioKey, parts, recording);
               } catch {
                 saved = false;
               }
@@ -2715,6 +2912,14 @@ function setup(ctx) {
           await prepareParts(true);
         };
         if (parts.filter(Boolean).length === parts.length) {
+          if (options.updateAudio) {
+            try {
+              saved = await audioCache.putPartial(cacheUserId, audioKey, parts, recording);
+            } catch {
+              saved = false;
+            }
+            retained.saved = saved;
+          }
           restored = true;
           preparedCount = parts.length;
           retryPreparation = null;
@@ -2742,7 +2947,7 @@ function setup(ctx) {
         phase = "ready";
       preparingAudio = false;
       checkingSavedAudio = false;
-      preparationNotice(restored ? saved ? "Saved audio is ready, at no new cost. Press Play." : "The prepared audio is ready, at no new cost. Keep this window open; it could not be saved." : !saved ? "This audio could not be saved. It will be gone after a reload." : phase === "playing" ? "Reading… The whole message is ready." : phase === "paused" ? "Paused. The whole message is ready." : phase === "finished" ? "Finished. Replay is free." : "The whole message is ready. Press Play.");
+      preparationNotice(restored ? previousRecording ? "Saved audio keeps its original voices and style. Play is free. Use Update saved audio to apply changes; that may cost money." : saved ? "Saved audio is ready, at no new cost. Press Play." : "The prepared audio is ready, at no new cost. Keep this window open; it could not be saved." : !saved ? "This audio could not be saved. It will be gone after a reload." : phase === "playing" ? "Reading… The whole message is ready." : phase === "paused" ? "Paused. The whole message is ready." : phase === "finished" ? "Finished. Replay is free." : "The whole message is ready. Press Play.");
       renderPlayer();
       tryAutomaticPlayback();
     } catch (e) {
@@ -2762,7 +2967,14 @@ function setup(ctx) {
       audioPlayer.unlock();
     const segment = { text: sample?.text ?? "The door was open. I took a breath, and stepped into the light.", speaker: "Preview", emotion: assignment?.emotion ?? "neutral", delivery: assignment?.delivery ?? "normal" };
     const snapshot = normalizeSettings({ ...settings, voice, narratorVoice: "", npcVoice: "", assignments: {}, inheritVoices: false });
-    currentPassages = planSpeech([segment], snapshot, { characters: [], pronunciations: sample?.entries });
+    if (snapshot.provider === "lumiverse") {
+      try {
+        nativeConnections = await nativeTts.connections();
+      } catch {}
+      if (token !== playbackId)
+        return;
+    }
+    currentPassages = planSpeech([segment], snapshot, { characters: [], connections: nativeConnections, pronunciations: sample?.entries });
     currentSegments = [segment];
     position = 0;
     phase = "preparing";
@@ -2949,6 +3161,18 @@ function setup(ctx) {
         retry.disabled = preparingAudio;
         row.append(retry);
       }
+      if (currentMessage && !preparingAudio && currentPassages[0]?.settings.provider !== "browser" && preparedCount > 0) {
+        const update = button("Update saved audio (may cost)", () => safe(async () => {
+          if (!currentMessage || preparingAudio)
+            return;
+          lastPlaybackAction = "Update saved audio";
+          updateSpeechActivity();
+          await startMessage({ ...currentMessage }, { updateAudio: true });
+        }));
+        update.disabled = !settings.enabled || !!playAttempt || !!messageLoad;
+        update.title = "Use your current voices, emotions and speech style. This may request new paid audio. Play keeps the existing recording.";
+        row.append(update);
+      }
     } else {
       const read = button("Prepare message", () => safe(async () => {
         if (selectedId)
@@ -3091,7 +3315,7 @@ function setup(ctx) {
       }), true), withIcon(button("Reload list", () => safe(refreshNativeConnections)), "refresh"));
       config.append(actions, el("p", "Uses a voice connection you already saved in Lumiverse’s voice settings. Add or change connections there.", "ra-muted"));
       if (/gemini-3\.8.*tts/i.test(settings.model))
-        config.append(el("p", "Gemini 3.8 reads sounds like sighs and pauses from your preset. It can’t yet take Readalong’s feeling marks through this connection.", "ra-muted"));
+        config.append(el("p", activeNative()?.supportsSpeechStyle ? "Gemini uses the speech style saved on this connection, plus your character’s mood and delivery when feelings are on. Vocal sounds stay in the dialogue. Changes apply to new audio; saved recordings stay as they are." : "Gemini reads vocal sounds from your preset. Update Lumiverse to a build with Speech style to use Readalong’s character moods and delivery. Saved audio is kept.", "ra-muted"));
     }
     if (settings.provider === "openrouter")
       config.append(modelField());

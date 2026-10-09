@@ -5,13 +5,19 @@ var VOID_TAGS = new Set("area base br col embed hr img input link meta param sou
 var ENTITIES = { nbsp: " ", amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", ldquo: "\u201C", rdquo: "\u201D", lsquo: "\u2018", rsquo: "\u2019" };
 var VOCAL_TAGS = ["laugh", "laughter", "chuckle", "chuckles", "giggle", "snicker", "cackle", "cheer", "gasp", "sigh", "sighs", "groan", "grunt", "grr", "growl", "hiss", "moan", "pant", "pff", "phew", "tsk", "whispers", "whispering", "shout", "argh", "whimper", "cry", "sob", "scream", "shriek", "snort", "breath", "heavy breath", "exhales", "cough", "throat-clearing", "sneeze", "yawn", "short pause", "long pause"];
 var vocalTags = new Set(VOCAL_TAGS);
-function vocalTag(tag) {
-  const match = /^<([a-z][a-z\s-]*?)\s*\/?>$/i.exec(tag);
-  const name = match?.[1].toLowerCase().trim().replace(/\s+/g, " ");
-  return name && vocalTags.has(name) ? `<${name}>` : undefined;
-}
 function stripVocalTags(text, preserveOffsets = false) {
   return text.replace(/<[^<>]*>/g, (tag) => vocalTag(tag) ? " ".repeat(preserveOffsets ? tag.length : 1) : tag);
+}
+var NON_PROSE_TAGS = new Set("html head body title script style noscript template slot canvas svg math details summary dialog form button select option optgroup textarea datalist output progress meter audio video picture map object iframe frameset frame noframes applet basefont center".split(" "));
+var METADATA_TAG = /^(?:think|thinking|reasoning|analysis|redacted_thinking|tracker|stats|status|state|scenecard|tts_tags|(?:sc|flair|lumi|lumidraw|lumistudio|lumi-studio|dt-image|image-prompt|loom|tool|function)(?:[_-][\w-]+)?)$/i;
+function vocalTag(marker) {
+  const match = /^<([a-z][\w-]*(?:\s+[^<>=\/"*]+)?)\s*\/?>$/i.exec(marker);
+  if (!match)
+    return;
+  const cue = match[1].trim().toLowerCase().replace(/\s+/g, " "), name = cue.split(" ")[0];
+  if (PROSE_TAGS.has(name) || VOID_TAGS.has(name) || NON_PROSE_TAGS.has(name) || METADATA_TAG.test(name))
+    return;
+  return `<${cue}>`;
 }
 function decodeEntities(text) {
   return text.replace(/&(#x[\da-f]+|#\d+|[a-z]+);/gi, (entity, name) => {
@@ -22,24 +28,39 @@ function decodeEntities(text) {
   });
 }
 function sanitizeSpeechText(raw, keepVocalTags = false) {
-  const text = decodeEntities(raw).replace(/<!--\s*([a-z0-9_]+)_START\s*-->[\s\S]*?(?:<!--\s*\1_END\s*-->|$)/gi, " ").replace(/<!--[\s\S]*?(?:-->|$)/g, " ").replace(/```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)/g, " ").replace(/(`+)[\s\S]*?\1/g, " ");
-  const tags = /<(\/?)([a-z][a-z0-9:_-]*)(?=[\s/>])(?:[^<>"']|"[^"]*"|'[^']*')*>/gi;
+  const text = decodeEntities(raw).replace(/<!--\s*([a-z0-9_]+)_START\s*-->[\s\S]*?(?:<!--\s*\1_END\s*-->|$)/gi, " ").replace(/<!--[\s\S]*?(?:-->|$)/g, " ").replace(/```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)/g, " ").replace(/(`+)[\s\S]*?\1/g, " ").replace(/<!doctype\b[^>]*>/gi, " ");
+  const tags = Array.from(text.matchAll(/<(\/?)([a-z][a-z0-9:_-]*)(?=[\s/>])(?:[^<>"']|"[^"]*"|'[^']*')*>/gi));
+  const paired = new Set, openings = new Map;
+  for (let i = 0;i < tags.length; i++) {
+    const match = tags[i], name = match[2].toLowerCase();
+    if (match[1]) {
+      const opening = openings.get(name)?.pop();
+      if (opening !== undefined)
+        paired.add(opening);
+    } else if (!VOID_TAGS.has(name) && !/\/\s*>$/.test(match[0])) {
+      const stack = openings.get(name) ?? [];
+      stack.push(i);
+      openings.set(name, stack);
+    }
+  }
   const blocked = [], parts = [];
   let cursor = 0;
-  for (const match of text.matchAll(tags)) {
+  for (let i = 0;i < tags.length; i++) {
+    const match = tags[i], name = match[2].toLowerCase();
     if (!blocked.length)
       parts.push(text.slice(cursor, match.index), " ");
-    const tag = match[2].toLowerCase();
-    const vocal = vocalTag(match[0]);
-    if (vocal) {
-      if (!blocked.length && keepVocalTags)
-        parts.push(vocal, " ");
-    } else if (match[1]) {
-      const index = blocked.lastIndexOf(tag);
-      if (index !== -1)
-        blocked.splice(index);
-    } else if (!PROSE_TAGS.has(tag) && !VOID_TAGS.has(tag) && !/\/\s*>$/.test(match[0]))
-      blocked.push(tag);
+    if (match[1]) {
+      const at = blocked.lastIndexOf(name);
+      if (at !== -1)
+        blocked.splice(at);
+    } else if (!PROSE_TAGS.has(name) && !VOID_TAGS.has(name)) {
+      const vocal = !paired.has(i) ? vocalTag(match[0]) : undefined;
+      if (vocal) {
+        if (!blocked.length && keepVocalTags)
+          parts.push(vocal, " ");
+      } else if (!/\/\s*>$/.test(match[0]))
+        blocked.push(name);
+    }
     cursor = match.index + match[0].length;
   }
   if (!blocked.length)
@@ -191,6 +212,14 @@ class PronunciationStore {
   }
 }
 
+// src/speech-style.ts
+var isGeminiSpeechStyleModel = (model) => /(?:^|\/)gemini-3\.8-flash(?:-lite)?-tts(?:$|[-:])/i.test(model);
+function deliveryStyle(emotion, delivery) {
+  const emotions = { happy: "happy and cheerful", sad: "sad", angry: "angry", worried: "worried", curious: "curious", excited: "excited", sarcastic: "sarcastic", tender: "warm and tender", afraid: "afraid" };
+  const deliveries = { whispers: "whispering", shouts: "shouting", softly: "soft-spoken", slowly: "slow and deliberate", laughs: "with a light laugh", sighs: "with a sigh" };
+  return [emotions[emotion], deliveries[delivery]].filter(Boolean).join(", ");
+}
+
 // src/shared.ts
 var EMOTIONS = ["neutral", "happy", "sad", "angry", "worried", "curious", "excited", "sarcastic", "tender", "afraid"];
 var DELIVERIES = ["normal", "whispers", "shouts", "softly", "slowly", "laughs", "sighs"];
@@ -298,15 +327,13 @@ function needsPcm(settings) {
 function speechRequest(settings, segment, characterId) {
   const assignment = selectVoice(settings, segment, characterId);
   const openrouter = settings.provider === "openrouter";
-  const gemini38 = openrouter && /^google\/gemini-3\.8.*tts/.test(settings.model);
+  const gemini38 = openrouter && isGeminiSpeechStyleModel(settings.model);
   const legacyTags = openrouter && /^google\/gemini-3\.1.*tts/.test(settings.model);
   const body = { model: settings.model, voice: assignment.voice, input: speechInput(segment, assignment, legacyTags, gemini38), response_format: needsPcm(settings) ? "pcm" : "mp3" };
   if (gemini38) {
-    const emotions = { happy: "happy and cheerful", sad: "sad", angry: "angry", worried: "worried", curious: "curious", excited: "excited", sarcastic: "sarcastic", tender: "warm and tender", afraid: "afraid" };
-    const deliveries = { whispers: "whispering", shouts: "shouting", softly: "soft-spoken", slowly: "slow and deliberate", laughs: "with a light laugh", sighs: "with a sigh" };
-    const style = [emotions[assignment.emotion], deliveries[assignment.delivery]].filter(Boolean).join(", ");
+    const style = deliveryStyle(assignment.emotion, assignment.delivery);
     if (style)
-      body.provider = { options: { "google-ai-studio": { speech_metadata: { style } } } };
+      body.instructions = style;
   }
   return body;
 }

@@ -77,7 +77,7 @@ describe('native Lumiverse TTS',()=>{
   test('listing connections never extracts keys or unnecessary provider metadata',async()=>{
     const calls:any[]=[];const client=createNativeTtsClient((async(url:any,init:any)=>{calls.push({url,init});return Response.json({data:[{...connection,api_key:'do-not-extract',metadata:{secret:'do-not-extract'},default_parameters:{output_format:'pcm'}}],total:1})}) as unknown as typeof fetch);
     const result=await client.connections();expect(result).toEqual([{...connection,outputFormat:'pcm'}]);expect(JSON.stringify(result)).not.toContain('do-not-extract');
-    expect(calls[0].url).toBe('/api/v1/tts-connections?limit=200&offset=0');expect(calls[0].init.credentials).toBe('include');expect(calls[0].init.headers).toBeUndefined();
+    expect(calls.map(c=>c.url)).toEqual(['/api/v1/tts-connections/providers','/api/v1/tts-connections?limit=200&offset=0']);expect(calls.every(c=>c.init.credentials==='include' && c.init.headers===undefined)).toBe(true);
   });
   test('voice and model lists use the selected connection',async()=>{
     const calls:string[]=[];const client=createNativeTtsClient((async(url:any)=>{calls.push(url);return Response.json(url.endsWith('/voices')?{voices:[{id:'voice-a',name:'Voice A'},{id:'voice-b',name:'Voice B'}]}:{models:[{id:'speech',label:'Speech model'}]})}) as unknown as typeof fetch);

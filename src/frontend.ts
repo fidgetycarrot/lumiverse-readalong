@@ -5,6 +5,7 @@ import { createNativeTtsClient, nativeSpeechRequest, type NativeConnection } fro
 import { planSpeech, planMessageSpeech, prepareAll, estimatedSentenceIndex, type SpeechPassage, type VoiceContext } from './playback-plan';
 import { PreparedPlayer, prepareClip, type PreparedClip } from './prepared-audio';
 import { AudioCache, preparationHash } from './audio-cache';
+import {recordingPlan,type RecordingMetadata} from './saved-recording';
 import {widgetDimensions as resolveWidgetDimensions,widgetPosition} from './widget-layout';
 import {patchPlaybackChildren} from './playback-ui';
 import {readingChanged} from './message-update';
@@ -157,7 +158,8 @@ export function setup(ctx: SpindleFrontendContext) {
   let checkingSavedAudio=false;
   let preparingAudio=false,waitingForAudio=false;
   let incompleteAudio=false,retryPreparation:(()=>Promise<void>)|null=null;
-  let retainedParts:{userId:string;key:string;clips:(PreparedClip|undefined)[];saved:boolean}|null=null;
+  let retainedParts:{userId:string;key:string;clips:(PreparedClip|undefined)[];saved:boolean;recording:RecordingMetadata}|null=null;
+  let previousRecording=false;
   let playAttempt:object|null=null,messageLoad:object|null=null;
   const automaticPlayback=new AutomaticPlayback();let automaticPlaybackError='';
   let utterance: SpeechSynthesisUtterance | null = null;
@@ -500,10 +502,10 @@ export function setup(ctx: SpindleFrontendContext) {
       await receiveCompletion({...ticket,message:{...loaded.message,name:ticket.name||loaded.message.name,characterId:ticket.characterId??loaded.message.characterId}});
     }finally{if(completionRecovery===operation)completionRecovery=null}
   }
-  async function prepareSpeech(segment:SpeechSegment, snapshot:Settings, kind:keyof typeof speechActivity, signal?:AbortSignal) {
+  async function prepareSpeech(segment:SpeechSegment, snapshot:Settings, kind:keyof typeof speechActivity, signal?:AbortSignal,recordedConnection?:NativeConnection) {
     signal?.throwIfAborted();
     if(snapshot.provider!=='lumiverse'){speechActivity[kind]++;updateSpeechActivity();return rpc('speech',{segment,previewSettings:snapshot})}
-    const connection=activeNative(snapshot.connectionId);
+    const connection=recordedConnection??activeNative(snapshot.connectionId);
     if(!connection)throw new Error('Choose a connection first. If the list is empty, add one in Lumiverse’s voice settings.');
     const controller=new AbortController();nativeRequests.add(controller);
     speechActivity[kind]++;updateSpeechActivity();
@@ -542,13 +544,14 @@ export function setup(ctx: SpindleFrontendContext) {
     renderOptions();renderPlayer();
     await saveSettings();
   }
-  async function startMessage(message: MessageInfo,options:{automatic?:boolean;restoreOnly?:boolean;autoStart?:boolean}={}) {
+  async function startMessage(message: MessageInfo,options:{automatic?:boolean;restoreOnly?:boolean;autoStart?:boolean;updateAudio?:boolean}={}) {
     if(!settings.enabled)throw new Error('Readalong is off. Turn it on to prepare audio.');
     if(!options.restoreOnly){
       automaticPreparations.add(JSON.stringify([ctx.getActiveChat().chatId,message.id,message.content]));
       if(automaticPreparations.size>20)automaticPreparations.delete(automaticPreparations.values().next().value!);
     }
     stop(false);
+    previousRecording=false;
     automaticPlayback.arm(!!options.autoStart && settings.automaticPlayback && !options.restoreOnly);
     const token=playbackId;readingAbort=new AbortController();const signal=readingAbort.signal;
     currentMessage={...message,characterId:message.isUser?undefined:message.characterId ?? speakerCharacterId(message.name,characters,ctx.getActiveChat().characterId ?? undefined)};
@@ -560,9 +563,10 @@ export function setup(ctx: SpindleFrontendContext) {
         pronunciations:await refreshPronunciations(chatId,options.restoreOnly?undefined:message.id)};
       let rules,hostAutomaticTts=false;
       if(snapshot.provider==='lumiverse') {
-        const results=await Promise.allSettled([nativeTts.preferences(),ctx.chats.getActive?.() ?? Promise.resolve(null)]);
+        const results=await Promise.allSettled([nativeTts.preferences(),ctx.chats.getActive?.() ?? Promise.resolve(null),nativeTts.connections()]);
         if(results[0].status==='fulfilled'){rules=results[0].value.rules;context.narrationVoice=results[0].value.narrationVoice;hostAutomaticTts=results[0].value.automaticTts}
         if(results[1].status==='fulfilled')context.overrides=results[1].value?.metadata?.voiceOverrides as VoiceContext['overrides'];
+        if(results[2].status==='fulfilled' && token===playbackId){nativeConnections=results[2].value;context.connections=nativeConnections;renderConfig()}
       }
       if(token!==playbackId)return;
       currentPassages=planMessageSpeech(message,snapshot,context,rules);currentSegments=currentPassages.flatMap(p=>p.segments);
@@ -570,19 +574,46 @@ export function setup(ctx: SpindleFrontendContext) {
       let restored=false,saved=true,openingCount=0;
       if(snapshot.provider!=='browser') {
         const messageKey=await preparationHash([ctx.getActiveChat().chatId,message.id,message.content]);
-        const requests=currentPassages.map(p=>{
+        const requests=(passages:SpeechPassage[],legacy=false)=>passages.map(p=>{
           const connection=activeNative(p.settings.connectionId);
-          return p.settings.provider==='lumiverse' && connection?nativeSpeechRequest(connection,p.settings,p.segment):[p.settings.provider,p.settings.localUrl,speechRequest(p.settings,p.segment)];
+          if(p.settings.provider==='lumiverse' && connection){const request=nativeSpeechRequest(connection,p.settings,p.segment);if(legacy)delete request.parameters.speech_style;return request}
+          return [p.settings.provider,p.settings.localUrl,speechRequest(p.settings,p.segment)];
         });
-        const audioKey=await preparationHash([messageKey,requests]);
+        const desiredKey=await preparationHash([messageKey,requests(currentPassages)]);
+        let audioKey=desiredKey,plan=recordingPlan(currentPassages,nativeConnections);
         let partial:(PreparedClip|undefined)[]|undefined;
-        if(retainedParts?.userId===cacheUserId && retainedParts.key===audioKey){partial=Array.from(retainedParts.clips);saved=retainedParts.saved}
-        else try{partial=await audioCache.getPartial(cacheUserId,audioKey,currentPassages.length)}catch{ /* Storage never authorizes a retry. */ }
+        // A message's existing take owns playback until the user explicitly
+        // updates it. Style changes can alter both requests and part counts.
+        if(retainedParts?.userId===cacheUserId && retainedParts.recording.messageKey===messageKey && (!options.updateAudio || retainedParts.key===desiredKey)){
+          audioKey=retainedParts.key;plan=retainedParts.recording.plan;partial=Array.from(retainedParts.clips);saved=retainedParts.saved;
+        }else if(!options.updateAudio)try{
+          const existing=await audioCache.getRecording(cacheUserId,messageKey);
+          if(existing){audioKey=existing.key;plan=existing.plan;partial=existing.clips}
+        }catch{/* The server ledger still prevents automatic regeneration. */}
+        if(!partial)try{partial=await audioCache.getPartial(cacheUserId,audioKey,plan.passages.length)}catch{/* Storage never authorizes a retry. */}
+        if(!partial && !options.updateAudio){
+          // Migrate 0.2.10 audio by its original batching and request identity,
+          // without replacing a byte or making a speech request.
+          const legacy=planMessageSpeech(message,snapshot,{...context,legacyAudio:true},rules);
+          if(legacy.length){
+            const legacyKey=await preparationHash([messageKey,requests(legacy,true)]);
+            try{
+              const clips=await audioCache.getPartial(cacheUserId,legacyKey,legacy.length);
+              if(clips){
+                audioKey=legacyKey;partial=clips;
+                plan=recordingPlan(legacy,nativeConnections.map(c=>({...c,speechStyle:''})));
+                try{saved=await audioCache.putPartial(cacheUserId,audioKey,clips,{messageKey,plan})}catch{saved=false}
+              }
+            }catch{/* Losing cache access never authorizes an automatic retry. */}
+          }
+        }
         if(token!==playbackId)return;
+        previousRecording=!!partial && audioKey!==desiredKey;
+        currentPassages=plan.passages;currentSegments=currentPassages.flatMap(p=>p.segments);
         if(partial?.length!==currentPassages.length)partial=undefined;
         partial??=Array.from({length:currentPassages.length},()=>undefined);
         const parts=partial,texts=currentPassages.map(p=>plainText(p.segment.text));
-        const retained={userId:cacheUserId,key:audioKey,clips:parts,saved};retainedParts=retained;
+        const recording={messageKey,plan},retained={userId:cacheUserId,key:audioKey,clips:parts,saved,recording};retainedParts=retained;
         const prefixCount=()=>{let n=0;while(n<parts.length && parts[n])n++;return n};
         const retainPartial=()=>{
           automaticPlayback.cancel();incompleteAudio=true;preparingAudio=false;checkingSavedAudio=false;
@@ -625,9 +656,9 @@ export function setup(ctx: SpindleFrontendContext) {
             }
             const clips=await prepareAll(currentPassages,async(p,index,requestSignal)=>{
               if(parts[index])return parts[index]!;
-              const data=await prepareSpeech(p.segment,p.settings,manual?'manual':'automatic',requestSignal);requestSignal.throwIfAborted();
+              const data=await prepareSpeech(p.segment,p.settings,manual?'manual':'automatic',requestSignal,plan.connections.find(c=>c.id===p.settings.connectionId));requestSignal.throwIfAborted();
               const clip=await prepareClip(data,requestSignal);requestSignal.throwIfAborted();parts[index]=clip;
-              try{saved=await audioCache.putPartial(cacheUserId,audioKey,parts)}catch{saved=false}
+              try{saved=await audioCache.putPartial(cacheUserId,audioKey,parts,recording)}catch{saved=false}
               retained.saved=saved;
               requestSignal.throwIfAborted();return clip;
             },signal,progress,snapshot.provider==='lumiverse'?3:2);
@@ -649,6 +680,9 @@ export function setup(ctx: SpindleFrontendContext) {
         };
         retryPreparation=async()=>{if(preparingAudio || token!==playbackId || !settings.enabled)return;lastPlaybackAction='Retry missing audio';updateSpeechActivity();automaticPlayback.cancel();automaticPlaybackError='';await prepareParts(true)};
         if(parts.filter(Boolean).length===parts.length){
+          // Explicitly selecting an already saved take makes it the default
+          // again without paying for it, including after switching styles back.
+          if(options.updateAudio){try{saved=await audioCache.putPartial(cacheUserId,audioKey,parts,recording)}catch{saved=false}retained.saved=saved}
           restored=true;preparedCount=parts.length;retryPreparation=null;audioPlayer.load(parts as PreparedClip[]);audioPlayer.setSpeed(settings.speed);audioPlayer.setVolume(settings.volume);
         }else if(options.restoreOnly || options.automatic && parts.some(Boolean)){
           if(parts.some(Boolean)){retainPartial();notice(`Kept ${preparedCount} of ${parts.length} parts${saved?' on this device':' in this window'}. Play uses the prepared opening. Retry missing audio requests only missing parts and may cost money.`,true);renderPlayer()}
@@ -659,7 +693,7 @@ export function setup(ctx: SpindleFrontendContext) {
       }
       if(token!==playbackId)return;
       if(phase==='preparing')phase='ready';preparingAudio=false;checkingSavedAudio=false;
-      preparationNotice(restored?saved?'Saved audio is ready, at no new cost. Press Play.':'The prepared audio is ready, at no new cost. Keep this window open; it could not be saved.':!saved?'This audio could not be saved. It will be gone after a reload.':(phase as string)==='playing'?'Reading… The whole message is ready.':(phase as string)==='paused'?'Paused. The whole message is ready.':(phase as string)==='finished'?'Finished. Replay is free.':'The whole message is ready. Press Play.');renderPlayer();tryAutomaticPlayback();
+      preparationNotice(restored?previousRecording?'Saved audio keeps its original voices and style. Play is free. Use Update saved audio to apply changes; that may cost money.':saved?'Saved audio is ready, at no new cost. Press Play.':'The prepared audio is ready, at no new cost. Keep this window open; it could not be saved.':!saved?'This audio could not be saved. It will be gone after a reload.':(phase as string)==='playing'?'Reading… The whole message is ready.':(phase as string)==='paused'?'Paused. The whole message is ready.':(phase as string)==='finished'?'Finished. Replay is free.':'The whole message is ready. Press Play.');renderPlayer();tryAutomaticPlayback();
     } catch(e) {if(token===playbackId){stop(false);throw e}}
   }
   async function preview(voice: string, assignment?: Partial<VoiceAssignment>,sample?:{text:string;entries:Pronunciations}) {
@@ -668,7 +702,8 @@ export function setup(ctx: SpindleFrontendContext) {
     if(settings.provider!=='browser')audioPlayer.unlock();
     const segment={text:sample?.text??'The door was open. I took a breath, and stepped into the light.',speaker:'Preview',emotion:assignment?.emotion ?? 'neutral',delivery:assignment?.delivery ?? 'normal'};
     const snapshot=normalizeSettings({...settings,voice,narratorVoice:'',npcVoice:'',assignments:{},inheritVoices:false});
-    currentPassages=planSpeech([segment],snapshot,{characters:[],pronunciations:sample?.entries});currentSegments=[segment];position=0;phase='preparing';showWidget();renderPlayer();notice(`Preparing ${voice}…`);
+    if(snapshot.provider==='lumiverse'){try{nativeConnections=await nativeTts.connections()}catch{}if(token!==playbackId)return}
+    currentPassages=planSpeech([segment],snapshot,{characters:[],connections:nativeConnections,pronunciations:sample?.entries});currentSegments=[segment];position=0;phase='preparing';showWidget();renderPlayer();notice(`Preparing ${voice}…`);
     try {
       if(snapshot.provider!=='browser') {
         const data=await prepareSpeech(currentPassages[0].segment,currentPassages[0].settings,'preview',readingAbort.signal);
@@ -754,6 +789,13 @@ export function setup(ctx: SpindleFrontendContext) {
       row.append(play,iconButton('stop','Stop',()=>stop(),'ra-icon'));
       if (currentMessage) row.append(button('Show in chat',()=>marker.follow()),button('Fix a name',()=>fixAName()));
       if(retryPreparation && (incompleteAudio || preparingAudio && preparedCount>0)){const retry=button('Retry missing audio',()=>safe(async()=>{await retryPreparation?.()}),true);retry.disabled=preparingAudio;row.append(retry)}
+      if(currentMessage && !preparingAudio && currentPassages[0]?.settings.provider!=='browser' && preparedCount>0){
+        const update=button('Update saved audio (may cost)',()=>safe(async()=>{
+          if(!currentMessage || preparingAudio)return;
+          lastPlaybackAction='Update saved audio';updateSpeechActivity();
+          await startMessage({...currentMessage},{updateAudio:true});
+        }));update.disabled=!settings.enabled || !!playAttempt || !!messageLoad;update.title='Use your current voices, emotions and speech style. This may request new paid audio. Play keeps the existing recording.';row.append(update);
+      }
     } else {
       const read=button('Prepare message',()=>safe(async()=>{ if (selectedId) await readId(selectedId); else { await refreshMessages(); if (selectedId) await readId(selectedId); else throw new Error('No assistant message found.') } }),true);
       read.disabled=!ready || !settings.enabled || !!messageLoad;row.append(read,iconButton('refresh','Refresh messages',()=>safe(refreshMessages),'ra-icon'));
@@ -809,7 +851,7 @@ export function setup(ctx: SpindleFrontendContext) {
       if(models.length && activeNative())config.append(modelField());
       actions.append(button('Test connection',()=>safe(async()=>{if(!activeNative())throw new Error('Choose a connection first.');notice('Testing the connection…');notice(await nativeTts.check(settings.connectionId))}),true),withIcon(button('Reload list',()=>safe(refreshNativeConnections)),'refresh'));
       config.append(actions,el('p','Uses a voice connection you already saved in Lumiverse’s voice settings. Add or change connections there.','ra-muted'));
-      if(/gemini-3\.8.*tts/i.test(settings.model))config.append(el('p','Gemini 3.8 reads sounds like sighs and pauses from your preset. It can’t yet take Readalong’s feeling marks through this connection.','ra-muted'));
+      if(/gemini-3\.8.*tts/i.test(settings.model))config.append(el('p',activeNative()?.supportsSpeechStyle?'Gemini uses the speech style saved on this connection, plus your character’s mood and delivery when feelings are on. Vocal sounds stay in the dialogue. Changes apply to new audio; saved recordings stay as they are.':'Gemini reads vocal sounds from your preset. Update Lumiverse to a build with Speech style to use Readalong’s character moods and delivery. Saved audio is kept.','ra-muted'));
     }
     if(settings.provider==='openrouter')config.append(modelField());
     if(settings.provider==='local'){
