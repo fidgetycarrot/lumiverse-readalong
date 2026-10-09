@@ -223,6 +223,9 @@ function deliveryStyle(emotion, delivery) {
 // src/shared.ts
 var EMOTIONS = ["neutral", "happy", "sad", "angry", "worried", "curious", "excited", "sarcastic", "tender", "afraid"];
 var DELIVERIES = ["normal", "whispers", "shouts", "softly", "slowly", "laughs", "sighs"];
+var GEMINI_VOICES = ["Zephyr", "Puck", "Charon", "Kore", "Fenrir", "Leda", "Orus", "Aoede", "Callirrhoe", "Autonoe", "Enceladus", "Iapetus", "Umbriel", "Algieba", "Despina", "Erinome", "Algenib", "Rasalgethi", "Laomedeia", "Achernar", "Alnilam", "Schedar", "Gacrux", "Pulcherrima", "Achird", "Zubenelgenubi", "Vindemiatrix", "Sadachbia", "Sadaltager", "Sulafat"];
+var GEMINI_FEMALE = ["Achernar", "Aoede", "Autonoe", "Callirrhoe", "Despina", "Erinome", "Gacrux", "Kore", "Laomedeia", "Leda", "Pulcherrima", "Sulafat", "Vindemiatrix", "Zephyr"];
+var GEMINI_VOICE_GENDERS = Object.fromEntries(GEMINI_VOICES.map((name) => [name.toLowerCase(), GEMINI_FEMALE.includes(name) ? "f" : "m"]));
 var CUE_PATTERN = String.raw`\[(?:emotion|delivery|speaker):[^\]\r\n]{1,80}\]|${PRONUNCIATION_CUE_PATTERN}`;
 var HIDE_RULE_NAME = "Readalong \u2022 Hide voice cues";
 var DEFAULTS = {
@@ -241,6 +244,7 @@ var DEFAULTS = {
   promptPronunciations: true,
   personaName: "",
   npcVoice: "",
+  voiceGenders: {},
   inheritVoices: true,
   widgetMinimized: false,
   widgetPosition: null,
@@ -275,6 +279,7 @@ function normalizeSettings(raw) {
     voice: str(r.voice, DEFAULTS.voice),
     narratorVoice: str(r.narratorVoice, ""),
     npcVoice: str(r.npcVoice, ""),
+    voiceGenders: Object.fromEntries(Object.entries(r.voiceGenders && typeof r.voiceGenders === "object" && !Array.isArray(r.voiceGenders) ? r.voiceGenders : {}).filter(([k, v]) => k.length > 0 && k.length <= 100 && k === k.trim().toLowerCase() && (v === "f" || v === "m" || v === "n")).slice(0, 500)),
     localUrl: str(r.localUrl, DEFAULTS.localUrl, 500),
     enabled: typeof r.enabled === "boolean" ? r.enabled : DEFAULTS.enabled,
     follow: r.follow === true,

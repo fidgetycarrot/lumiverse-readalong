@@ -172,6 +172,25 @@ function combineSpeechStyle(base, direction) {
 var EMOTIONS = ["neutral", "happy", "sad", "angry", "worried", "curious", "excited", "sarcastic", "tender", "afraid"];
 var DELIVERIES = ["normal", "whispers", "shouts", "softly", "slowly", "laughs", "sighs"];
 var GEMINI_VOICES = ["Zephyr", "Puck", "Charon", "Kore", "Fenrir", "Leda", "Orus", "Aoede", "Callirrhoe", "Autonoe", "Enceladus", "Iapetus", "Umbriel", "Algieba", "Despina", "Erinome", "Algenib", "Rasalgethi", "Laomedeia", "Achernar", "Alnilam", "Schedar", "Gacrux", "Pulcherrima", "Achird", "Zubenelgenubi", "Vindemiatrix", "Sadachbia", "Sadaltager", "Sulafat"];
+var GEMINI_FEMALE = ["Achernar", "Aoede", "Autonoe", "Callirrhoe", "Despina", "Erinome", "Gacrux", "Kore", "Laomedeia", "Leda", "Pulcherrima", "Sulafat", "Vindemiatrix", "Zephyr"];
+var GEMINI_VOICE_GENDERS = Object.fromEntries(GEMINI_VOICES.map((name) => [name.toLowerCase(), GEMINI_FEMALE.includes(name) ? "f" : "m"]));
+function voiceGender(settings, voice) {
+  const key = voice.trim().toLowerCase(), own = settings.voiceGenders?.[key];
+  if (own)
+    return own === "n" ? undefined : own;
+  return GEMINI_VOICE_GENDERS[key];
+}
+function markVoiceGender(marks, voice, pressed) {
+  const key = voice.trim().toLowerCase(), next = { ...marks }, builtIn = GEMINI_VOICE_GENDERS[key];
+  if (!key)
+    return next;
+  const current = voiceGender({ voiceGenders: marks }, voice), wanted = current === pressed ? undefined : pressed;
+  if (wanted === builtIn)
+    delete next[key];
+  else
+    next[key] = wanted ?? "n";
+  return next;
+}
 var CUE_PATTERN = String.raw`\[(?:emotion|delivery|speaker):[^\]\r\n]{1,80}\]|${PRONUNCIATION_CUE_PATTERN}`;
 var DEFAULTS = {
   provider: "openrouter",
@@ -189,6 +208,7 @@ var DEFAULTS = {
   promptPronunciations: true,
   personaName: "",
   npcVoice: "",
+  voiceGenders: {},
   inheritVoices: true,
   widgetMinimized: false,
   widgetPosition: null,
@@ -231,6 +251,7 @@ function normalizeSettings(raw) {
     voice: str(r.voice, DEFAULTS.voice),
     narratorVoice: str(r.narratorVoice, ""),
     npcVoice: str(r.npcVoice, ""),
+    voiceGenders: Object.fromEntries(Object.entries(r.voiceGenders && typeof r.voiceGenders === "object" && !Array.isArray(r.voiceGenders) ? r.voiceGenders : {}).filter(([k, v]) => k.length > 0 && k.length <= 100 && k === k.trim().toLowerCase() && (v === "f" || v === "m" || v === "n")).slice(0, 500)),
     localUrl: str(r.localUrl, DEFAULTS.localUrl, 500),
     enabled: typeof r.enabled === "boolean" ? r.enabled : DEFAULTS.enabled,
     follow: r.follow === true,
@@ -1736,6 +1757,15 @@ var STYLE = `
 .ra .ra-tabs{display:grid;grid-auto-flow:column;grid-auto-columns:1fr;gap:2px;padding:3px;border-radius:10px;background:var(--ra-soft);border:1px solid var(--ra-line)}
 .ra .ra-tabs button{border:0;background:transparent;color:var(--ra-dim);padding:6px 4px;min-height:32px;border-radius:7px;min-width:0}
 .ra .ra-tabs button[aria-selected=true]{background:var(--ra-fill);color:var(--ra-text);font-weight:600;box-shadow:0 0 0 1px var(--ra-line)}
+.ra .ra-tabs.ra-filter button[aria-pressed=true]{background:var(--ra-fill);color:var(--ra-text);font-weight:600;box-shadow:0 0 0 1px var(--ra-line)}
+.ra .ra-tabs.ra-filter button{font-size:12.5px;white-space:nowrap}
+.ra .ra-voice-rows{display:flex;flex-direction:column;max-height:420px;overflow:auto;border:1px solid var(--ra-line);border-radius:10px}
+.ra .ra-voice-row{display:flex;align-items:center;gap:6px;padding:5px 8px 5px 12px;border-bottom:1px solid var(--ra-line)}.ra .ra-voice-row:last-child{border-bottom:0}
+.ra .ra-voice-name{flex:1;min-width:0;display:flex;align-items:center;gap:8px;overflow-wrap:anywhere}
+.ra button.ra-mark{min-height:30px;padding:4px 10px;font-size:12.5px;border-radius:15px;color:var(--ra-dim);background:transparent}
+.ra button.ra-mark[aria-pressed=true]{color:var(--ra-text);border-color:var(--ra-mark);background:rgba(231,178,76,.14);font-weight:600}
+.ra .ra-voice-rows>p{padding:12px}
+.ra .ra-row.ra-extra{margin-top:-4px}
 .ra .ra-panel{display:flex;flex-direction:column;gap:14px}
 .ra .ra-panel>h3{margin-top:4px}.ra .ra-rule{border:0;border-top:1px solid var(--ra-line);margin:2px 0;width:100%}
 .ra .ra-voice-list{display:flex;gap:6px;flex-wrap:wrap;max-height:220px;overflow:auto;padding:2px}
@@ -1883,7 +1913,7 @@ function setup(ctx) {
   let settings = normalizeSettings(DEFAULTS), ready = false, initialized = false, disposed = false;
   const hasKeys = { openrouter: false, local: false }, frontendId = crypto.randomUUID();
   const castDrafts = new Map, openCast = new Set;
-  let castInitialized = false, addOpen = false, voiceQuery = "", fixName = "", fixSay = "", viewChosen = false;
+  let castInitialized = false, addOpen = false, voiceQuery = "", voiceFilter = "all", fixName = "", fixSay = "", viewChosen = false;
   const addedCast = new Set, addedNames = new Map, sayDrafts = new Map, moreOpen = new Set, testPick = new Map;
   const validSpeaker = (name) => !!name && name.length <= 80 && !/[\[\]\r\n]/.test(name) && name.toLowerCase() !== "narrator";
   let canDiagnoseSpeech = false, diagnosing = false, diagnoseButton = null;
@@ -2061,7 +2091,35 @@ function setup(ctx) {
     const names = [...voiceNames()];
     if (value && !names.includes(value))
       names.unshift(value);
-    return select([...inherited ? [{ value: "", label: "Main voice" }] : [], ...names.map((name) => ({ value: name, label: name }))], value, change);
+    return groupedVoiceSelect(names, value, change, inherited ? "Main voice" : undefined);
+  }
+  function groupedVoiceSelect(names, value, change, emptyLabel) {
+    const s = el("select"), option = (v, label) => {
+      const o = el("option", label);
+      o.value = v;
+      return o;
+    };
+    if (emptyLabel !== undefined)
+      s.append(option("", emptyLabel));
+    const groups = { f: [], m: [], none: [] };
+    for (const name of names)
+      groups[voiceGender(settings, name) ?? "none"].push(name);
+    if (!groups.f.length && !groups.m.length)
+      for (const name of names)
+        s.append(option(name, name));
+    else
+      for (const [id, label] of [["f", "Female"], ["m", "Male"], ["none", "Not marked"]]) {
+        if (!groups[id].length)
+          continue;
+        const group = el("optgroup");
+        group.label = label;
+        for (const name of groups[id])
+          group.append(option(name, name));
+        s.append(group);
+      }
+    s.value = value;
+    s.onchange = (e) => change(e.currentTarget.value);
+    return s;
   }
   function contentRoot(messageId) {
     const bubble = ctx.dom.findMessageElement(messageId);
@@ -3124,7 +3182,7 @@ function setup(ctx) {
     }
     powerInput.checked = settings.enabled;
     powerLabel.textContent = settings.enabled ? "On" : "Off";
-    intro.textContent = settings.enabled ? settings.automaticPlayback ? "New replies get audio on their own and play when enough is ready. Your voice service may charge for each one." : "New replies get audio on their own and wait for Play. Your voice service may charge for each one." : "Turn on to hear replies read aloud.";
+    intro.textContent = settings.enabled ? settings.automaticPlayback ? "New replies get audio and play on their own. Your voice service may charge for each one." : "New replies get audio on their own, then wait for Play. Your voice service may charge for each one." : "Turn on to hear replies read aloud.";
     root.dataset.raPhase = settings.enabled ? phase : "off";
     const content = el("section"), canFloat = typeof ctx.ui.createFloatWidget === "function";
     const float = () => iconButton("float", "Floating player", () => safe(openWidget), "ra-icon ra-quiet ra-push");
@@ -3147,7 +3205,7 @@ function setup(ctx) {
       })));
     } else
       content.append(el("p", ready ? "No replies in this chat yet. Readalong picks up the next one." : "Loading…", "ra-muted"));
-    const row = el("div", "", "ra-row");
+    const row = el("div", "", "ra-row"), extra = el("div", "", "ra-row ra-extra");
     if (phase !== "idle") {
       const play = playButton(() => safe(playOrPause));
       play.disabled = phase === "preparing" || !!playAttempt || incompleteAudio && !audioPlayer.duration;
@@ -3159,7 +3217,7 @@ function setup(ctx) {
           await retryPreparation?.();
         }), true);
         retry.disabled = preparingAudio;
-        row.append(retry);
+        extra.append(retry);
       }
       if (currentMessage && !preparingAudio && currentPassages[0]?.settings.provider !== "browser" && preparedCount > 0) {
         const update = button("Update saved audio (may cost)", () => safe(async () => {
@@ -3171,7 +3229,8 @@ function setup(ctx) {
         }));
         update.disabled = !settings.enabled || !!playAttempt || !!messageLoad;
         update.title = "Use your current voices, emotions and speech style. This may request new paid audio. Play keeps the existing recording.";
-        row.append(update);
+        update.classList.add("ra-quiet");
+        extra.append(update);
       }
     } else {
       const read = button("Prepare message", () => safe(async () => {
@@ -3191,6 +3250,8 @@ function setup(ctx) {
     if (canFloat)
       row.append(float());
     content.append(row);
+    if (extra.childElementCount)
+      content.append(extra);
     if (phase === "idle" && settings.enabled)
       content.append(el("p", "Uses saved audio if there is any. If not, it makes new audio, which may cost money.", "ra-muted"));
     if (ready && canFloat && (widgetError || !permissions.includes("ui_panels")))
@@ -3239,13 +3300,13 @@ function setup(ctx) {
     about.body.append(el("p", "While Readalong is on, each new reply gets audio as soon as it is written. Automatic playback can start it for you; otherwise press Play.", "ra-muted"), el("p", "Each successful audio part is saved on this device. Reloading or switching chats reuses what is still saved. Play never requests speech.", "ra-muted"), el("p", "If preparation fails, Retry missing audio keeps the successful parts and requests only what is missing. That retry can cost money. Storage limits or clearing app data can remove saved audio.", "ra-muted"), speechActivityNote, el("p", "Changing a voice, or how a name is said, only changes new audio.", "ra-muted"), el("p", "The highlighted sentence is a close guess of where the voice is.", "ra-muted"));
     options.replaceChildren(sliders, toggle("Play replies automatically", settings.automaticPlayback, (v) => {
       safe(() => setAutomaticPlayback(v));
-    }, "Start with the next new reply when enough audio is ready. Current and manually prepared messages wait for Play. Pause waits for Resume."), toggle("Scroll the chat to follow the voice", settings.follow, (v) => {
+    }, "Starts with your next new reply. Older messages still wait for Play."), toggle("Scroll the chat to follow the voice", settings.follow, (v) => {
       settings.follow = v;
       safe(saveSettings);
-    }), toggle("Allow playback before the whole message is ready", settings.earlyPlayback, (v) => {
+    }), toggle("Start before the whole message is ready", settings.earlyPlayback, (v) => {
       settings.earlyPlayback = v;
       safe(saveSettings);
-    }, "Manual and automatic playback can start with about three quarters of the text and at least 30 seconds of opening audio. Turn off to wait for the whole message."), about.details);
+    }, "Play can start once about three quarters of the audio is ready."), about.details);
   }
   function nextStep(label, to) {
     const b = button(label, () => showView(to, true));
@@ -3396,7 +3457,14 @@ function setup(ctx) {
       safe(saveSettings);
     }, "Only for voices that can do it."), nextStep("Next: try some voices", "voices"));
   }
+  function setVoiceGender(name, pressed) {
+    settings.voiceGenders = markVoiceGender(settings.voiceGenders, name, pressed);
+    renderVoices();
+    renderAssignments();
+    safe(saveSettings);
+  }
   function renderVoices() {
+    const scroll = voicesCard.querySelector(".ra-voice-rows")?.scrollTop ?? 0;
     voicesCard.replaceChildren();
     const names = voiceNames(), pick = (name) => {
       settings.voice = name;
@@ -3407,29 +3475,63 @@ function setup(ctx) {
     const listen = withIcon(button("Listen", () => safe(() => preview(settings.voice)), true), "speaker");
     listen.disabled = !settings.enabled;
     row.append(field("Main voice", voiceSelect(settings.voice, pick)), listen);
-    voicesCard.append(row, el("p", settings.enabled ? "Used for anyone who has no voice of their own. Listen plays a short sample, which may cost a little." : "Turn Readalong on to listen to samples.", "ra-muted"));
+    voicesCard.append(row, el("p", "Used for anyone who has no voice of their own.", "ra-muted"));
     if (settings.provider === "local" || !names.length)
       voicesCard.append(field("Voice name", textInput(settings.voice, (v) => settings.voice = v)), el("p", names.length ? "The list shows common Kokoro voices. Type a voice name if your server uses others." : "This model has no voice list yet. Reload it under Connection, or type a voice name.", "ra-muted"));
     if (names.length) {
       let drawList = function() {
         list.replaceChildren();
-        for (const name of names.filter((n) => n.toLowerCase().includes(voiceQuery.toLowerCase()))) {
-          const b = button(name, () => pick(name));
-          b.setAttribute("aria-pressed", String(name === settings.voice));
-          list.append(b);
+        for (const name of names) {
+          const gender = voiceGender(settings, name);
+          if (!name.toLowerCase().includes(voiceQuery.toLowerCase()) || voiceFilter !== "all" && (gender ?? "none") !== voiceFilter)
+            continue;
+          const item = el("div", "", "ra-voice-row"), label = el("span", "", "ra-voice-name");
+          label.append(el("strong", name));
+          if (name === settings.voice)
+            label.append(el("span", "Main", "ra-badge"));
+          const play = iconButton("speaker", `Listen to ${name}`, () => safe(() => preview(name)), "ra-icon");
+          play.disabled = !settings.enabled;
+          const mark = (g, text) => {
+            const b = button(text, () => setVoiceGender(name, g));
+            b.dataset.raControl = `${name}-${g}`;
+            b.className = "ra-mark";
+            b.setAttribute("aria-pressed", String(gender === g));
+            b.setAttribute("aria-label", `Mark ${name} as ${text.toLowerCase()}`);
+            return b;
+          };
+          item.append(label, play, mark("f", "Female"), mark("m", "Male"));
+          list.append(item);
         }
         if (!list.childElementCount)
-          list.append(el("p", "No voice matches that search.", "ra-muted"));
+          list.append(el("p", voiceFilter === "none" && !voiceQuery ? "Every voice is marked." : "No voice matches.", "ra-muted"));
       };
+      const counts = { all: names.length, f: 0, m: 0, none: 0 };
+      for (const name of names) {
+        const g = voiceGender(settings, name);
+        counts[g ?? "none"]++;
+      }
+      const filters = el("div", "", "ra-tabs ra-filter");
+      filters.setAttribute("role", "group");
+      filters.setAttribute("aria-label", "Show voices");
+      for (const [id, label] of [["all", "All"], ["f", "Female"], ["m", "Male"], ["none", "Not marked"]]) {
+        const b = button(`${label} ${counts[id]}`, () => {
+          voiceFilter = id;
+          renderVoices();
+        });
+        b.dataset.raControl = `filter-${id}`;
+        b.setAttribute("aria-pressed", String(voiceFilter === id));
+        filters.append(b);
+      }
       const search = textInput(voiceQuery, (v) => {
         voiceQuery = v;
         drawList();
       });
-      search.placeholder = `Search ${names.length} voices`;
+      search.placeholder = "Search voices";
       search.setAttribute("aria-label", "Search voices");
-      const list = el("div", "", "ra-voice-list");
+      const list = el("div", "", "ra-voice-rows");
       drawList();
-      voicesCard.append(search, list);
+      voicesCard.append(el("hr", "", "ra-rule"), el("h3", "All voices"), el("p", `${settings.enabled ? "Listen plays a short sample, which may cost a little." : "Turn Readalong on to listen to samples."} Mark each voice Female or Male to sort the voice lists. Gemini voices start out marked the way Google lists them.`, "ra-muted"), filters, search, list);
+      list.scrollTop = scroll;
     }
     if (settings.provider === "lumiverse")
       voicesCard.append(toggle("Use voices already set in Lumiverse", settings.inheritVoices, (v) => {
@@ -3791,14 +3893,14 @@ function setup(ctx) {
     if (settings.npcVoice && !othersNames.includes(settings.npcVoice))
       othersNames.unshift(settings.npcVoice);
     const othersRow = el("div", "", "ra-row ra-end");
-    othersRow.append(field("Voice", select([{ value: "", label: "Same as the main character" }, ...othersNames.map((name) => ({ value: name, label: name }))], settings.npcVoice, (v) => {
+    othersRow.append(field("Voice", groupedVoiceSelect(othersNames, settings.npcVoice, (v) => {
       settings.npcVoice = v;
       safe(async () => {
         await saveSettings();
         renderAssignments();
         notice(v ? "Voice saved for everyone else. Audio you already have keeps the old sound." : "Everyone else now sounds like the main character.");
       });
-    })), othersListen);
+    }, "Same as the main character")), othersListen);
     others.body.append(othersRow, el("p", "For side characters who speak but have no voice of their own yet. Give someone their own row above to make them sound different.", "ra-muted"));
     if (!settings.promptEmotions)
       others.body.append(el("p", "This only works when “Mark feelings and who is speaking” is on under Connection. That is how Readalong knows who is talking.", "ra-muted"));

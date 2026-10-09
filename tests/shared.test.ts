@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'bun:test';
-import { DEFAULTS, CUE_PATTERN, normalizeSettings, parseSegments, selectVoice, speakerCharacterId, speechInput, speechRequest, stripCues, plainText } from '../src/shared';
+import { DEFAULTS, CUE_PATTERN, GEMINI_VOICES, voiceGender, markVoiceGender, normalizeSettings, parseSegments, selectVoice, speakerCharacterId, speechInput, speechRequest, stripCues, plainText } from '../src/shared';
 import { locateText,normalizeText } from '../src/highlight';
 test('on/off settings persist and legacy autoplay does not restore automatic playback',()=>{
   expect(normalizeSettings({autoPlay:true}).enabled).toBe(false);
@@ -92,5 +92,25 @@ describe('voice selection and settings',()=>{
   test('bad numeric settings and object keys are rejected',()=>{
     const s=normalizeSettings(JSON.parse('{"speed":999,"volume":-1,"provider":"bad","assignments":{"__proto__":{"voice":"x"}}}'));
     expect(s.speed).toBe(2);expect(s.volume).toBe(0);expect(s.provider).toBe('openrouter');expect(Object.keys(s.assignments)).toHaveLength(0);
+  });
+});
+
+describe('voice genders',()=>{
+  test('Gemini voices come marked the way Google lists them, and unknown voices are unmarked',()=>{
+    expect(GEMINI_VOICES.filter(v=>voiceGender(DEFAULTS,v)==='f').length).toBe(14);
+    expect(GEMINI_VOICES.filter(v=>voiceGender(DEFAULTS,v)==='m').length).toBe(16);
+    expect(voiceGender(DEFAULTS,'Kore')).toBe('f');expect(voiceGender(DEFAULTS,' puck ')).toBe('m');
+    expect(voiceGender(DEFAULTS,'af_heart')).toBeUndefined();
+  });
+  test('a user mark wins, pressing the active mark clears it, and matching the built-in stores nothing',()=>{
+    let marks=markVoiceGender({},'af_heart','f');expect(marks).toEqual({af_heart:'f'});
+    marks=markVoiceGender(marks,'af_heart','f');expect(voiceGender({voiceGenders:marks},'af_heart')).toBeUndefined();
+    marks=markVoiceGender({},'Kore','m');expect(marks).toEqual({kore:'m'});expect(voiceGender({voiceGenders:marks},'Kore')).toBe('m');
+    marks=markVoiceGender(marks,'Kore','f');expect(marks).toEqual({});
+    marks=markVoiceGender({},'Kore','f');expect(marks).toEqual({kore:'n'});expect(voiceGender({voiceGenders:marks},'Kore')).toBeUndefined();
+  });
+  test('saved marks are validated',()=>{
+    expect(normalizeSettings({voiceGenders:{kore:'m',Bad:'f',x:'q',ok:'n'}}).voiceGenders).toEqual({kore:'m',ok:'n'});
+    expect(normalizeSettings({voiceGenders:['m']}).voiceGenders).toEqual({});
   });
 });

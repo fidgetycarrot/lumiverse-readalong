@@ -126,6 +126,8 @@ Play, Pause, Resume, Replay, minimizing and loading saved audio never authorize 
 
 ## Character voices
 
+The **Voices** tab lists every voice with a listen button and **Female** / **Male** marks. Gemini’s 30 prebuilt voices start out marked the way Google’s own voice table lists them; press a mark to change it, or press the active one to clear it. Marks sort every voice picker into Female, Male and Not marked, and the filter above the list shows one group at a time. Marks are saved with your settings and never change which voice anyone uses or any saved audio.
+
 **Everyone else** in the **Cast** tab sets one voice for side characters who speak with a `[speaker:Name]` cue but have no voice of their own, are not the reply’s own character, and are not in your character library. Left on **Same as the main character**, they keep borrowing that character’s voice as before. Give a side character their own cast row to make them sound different.
 
 Each cast member has a separate expandable row. Under **Cast → Add someone**, select **One of your characters** and click **Add**, or enter **Or anyone else, by name** and click its **Add** button. Open the row, choose its voice, preview it while Readalong is on, and click **Save**. Repeat for the rest of your cast. Adding or saving cast voices does not synthesize speech; **Listen** does. Remove one assignment with **Remove** without changing the others.

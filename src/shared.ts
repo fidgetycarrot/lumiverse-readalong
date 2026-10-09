@@ -5,6 +5,24 @@ import {deliveryStyle,isGeminiSpeechStyleModel} from './speech-style';
 export const EMOTIONS = ['neutral', 'happy', 'sad', 'angry', 'worried', 'curious', 'excited', 'sarcastic', 'tender', 'afraid'] as const;
 export const DELIVERIES = ['normal', 'whispers', 'shouts', 'softly', 'slowly', 'laughs', 'sighs'] as const;
 export const GEMINI_VOICES = ['Zephyr','Puck','Charon','Kore','Fenrir','Leda','Orus','Aoede','Callirrhoe','Autonoe','Enceladus','Iapetus','Umbriel','Algieba','Despina','Erinome','Algenib','Rasalgethi','Laomedeia','Achernar','Alnilam','Schedar','Gacrux','Pulcherrima','Achird','Zubenelgenubi','Vindemiatrix','Sadachbia','Sadaltager','Sulafat'];
+export type VoiceGender = 'f' | 'm';
+/** How Google lists its prebuilt voices. A user's own marks in settings.voiceGenders win. */
+const GEMINI_FEMALE = ['Achernar','Aoede','Autonoe','Callirrhoe','Despina','Erinome','Gacrux','Kore','Laomedeia','Leda','Pulcherrima','Sulafat','Vindemiatrix','Zephyr'];
+export const GEMINI_VOICE_GENDERS: Readonly<Record<string,VoiceGender>> = Object.fromEntries(GEMINI_VOICES.map(name => [name.toLowerCase(), GEMINI_FEMALE.includes(name) ? 'f' : 'm'] as [string,VoiceGender]));
+/** 'f' or 'm' for a voice, or undefined when nobody has marked it. A saved 'n' clears a built-in mark. */
+export function voiceGender(settings: Pick<Settings,'voiceGenders'>, voice: string): VoiceGender | undefined {
+  const key = voice.trim().toLowerCase(), own = settings.voiceGenders?.[key];
+  if (own) return own === 'n' ? undefined : own;
+  return GEMINI_VOICE_GENDERS[key];
+}
+/** The next saved marks after the user presses Female or Male for a voice. Pressing the active one clears it. */
+export function markVoiceGender(marks: Record<string,VoiceGender|'n'>, voice: string, pressed: VoiceGender): Record<string,VoiceGender|'n'> {
+  const key = voice.trim().toLowerCase(), next = { ...marks }, builtIn = GEMINI_VOICE_GENDERS[key];
+  if (!key) return next;
+  const current = voiceGender({ voiceGenders: marks }, voice), wanted = current === pressed ? undefined : pressed;
+  if (wanted === builtIn) delete next[key]; else next[key] = wanted ?? 'n';
+  return next;
+}
 export const CUE_PATTERN = String.raw`\[(?:emotion|delivery|speaker):[^\]\r\n]{1,80}\]|${PRONUNCIATION_CUE_PATTERN}`;
 export const HIDE_RULE_NAME = 'Readalong • Hide voice cues';
 export interface VoiceAssignment { voice: string; emotion: string; delivery: string; name?:string }
@@ -12,7 +30,7 @@ export interface Settings {
   provider: 'lumiverse' | 'openrouter' | 'browser' | 'local';
   connectionId: string;
   model: string; voice: string; narratorVoice: string; localUrl: string;
-  enabled: boolean; follow: boolean; earlyPlayback:boolean; automaticPlayback:boolean; promptEmotions: boolean; useEmotions: boolean;promptPronunciations:boolean; personaName:string; npcVoice:string;
+  enabled: boolean; follow: boolean; earlyPlayback:boolean; automaticPlayback:boolean; promptEmotions: boolean; useEmotions: boolean;promptPronunciations:boolean; personaName:string; npcVoice:string; voiceGenders:Record<string,VoiceGender|'n'>;
   inheritVoices: boolean; widgetMinimized: boolean; widgetPosition: {x:number;y:number}|null;
   speed: number; volume: number;
   assignments: Record<string, VoiceAssignment>;
@@ -20,7 +38,7 @@ export interface Settings {
 export const DEFAULTS: Settings = {
   provider: 'openrouter', connectionId:'', model: 'google/gemini-3.8-flash-tts', voice: 'Kore', narratorVoice: '',
   localUrl: 'http://localhost:8880/v1', enabled: false, follow: false, earlyPlayback:true, automaticPlayback:false,
-  promptEmotions: true, useEmotions: true, promptPronunciations:true, personaName:'', npcVoice:'', inheritVoices:true, widgetMinimized:false, widgetPosition:null, speed: 1, volume: 0.85, assignments: {},
+  promptEmotions: true, useEmotions: true, promptPronunciations:true, personaName:'', npcVoice:'', voiceGenders:{}, inheritVoices:true, widgetMinimized:false, widgetPosition:null, speed: 1, volume: 0.85, assignments: {},
 };
 export interface SpeechSegment { text: string; speaker: string; emotion: string; delivery: string }
 export interface SpeechModel { id: string; name: string; voices: string[] }
@@ -54,7 +72,7 @@ export function normalizeSettings(raw: unknown): Settings {
   return {
     connectionId: str(r.connectionId,'',160),
     provider: ['lumiverse','openrouter','browser','local'].includes(r.provider ?? '') ? r.provider! : DEFAULTS.provider,
-    model: str(r.model, DEFAULTS.model), voice: str(r.voice, DEFAULTS.voice), narratorVoice: str(r.narratorVoice, ''), npcVoice: str(r.npcVoice, ''),
+    model: str(r.model, DEFAULTS.model), voice: str(r.voice, DEFAULTS.voice), narratorVoice: str(r.narratorVoice, ''), npcVoice: str(r.npcVoice, ''), voiceGenders: Object.fromEntries(Object.entries(r.voiceGenders && typeof r.voiceGenders==='object' && !Array.isArray(r.voiceGenders) ? r.voiceGenders as Record<string,unknown> : {}).filter(([k,v]) => k.length>0 && k.length<=100 && k===k.trim().toLowerCase() && (v==='f' || v==='m' || v==='n')).slice(0,500)) as Record<string,VoiceGender|'n'>,
     localUrl: str(r.localUrl, DEFAULTS.localUrl, 500),
     enabled: typeof r.enabled==='boolean'?r.enabled:DEFAULTS.enabled, follow: r.follow === true, earlyPlayback:r.earlyPlayback!==false, automaticPlayback:r.automaticPlayback===true,
     promptEmotions: r.promptEmotions !== false, useEmotions: r.useEmotions !== false,promptPronunciations:r.promptPronunciations!==false, personaName:typeof r.personaName==='string' && r.personaName.trim().length<=80 && !/[\[\]\r\n]/.test(r.personaName)?r.personaName.trim():'', inheritVoices:r.inheritVoices!==false, widgetMinimized:r.widgetMinimized===true, widgetPosition,
