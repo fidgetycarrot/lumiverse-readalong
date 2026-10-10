@@ -132,6 +132,23 @@ test('pausing while waiting prevents remaining audio from starting until Resume'
   player.append([await clip(10)]);expect(audios[1]?.playCalls??0).toBe(0);
   await player.play();expect(player.elapsed).toBe(30);expect(audios[0].playCalls).toBe(2);
 });
+test('a final preparation failure after the buffer ends pauses and preserves the missing-part handoff',async()=>{
+  const {player,audios,created}=fixture();let ended=0;const waiting:boolean[]=[];
+  player.onEnded=()=>ended++;player.onWaiting=value=>waiting.push(value);
+  player.begin([await clip(30)]);await player.play();audios[0].currentTime=30;audios[0].onended();
+  expect(waiting).toEqual([true]);expect(audios[0].paused).toBe(false);
+  player.markIncomplete();expect(audios[0].paused).toBe(true);expect(waiting).toEqual([true,true]);expect(ended).toBe(0);
+  player.append([await clip(10)]);expect(audios[0].playCalls).toBe(1);
+  await player.play();expect(player.elapsed).toBe(30);expect(audios[0].playCalls).toBe(2);
+  audios[0].currentTime=10;audios[0].onended();expect(ended).toBe(1);expect(player.elapsed).toBe(40);expect(created).toHaveLength(2);
+});
+test('a missing suffix discovered while buffered speech is still playing pauses only at the gap',async()=>{
+  const {player,audios}=fixture();let ended=0;const waiting:boolean[]=[];
+  player.onEnded=()=>ended++;player.onWaiting=value=>waiting.push(value);
+  player.begin([await clip(30)]);await player.play();audios[0].currentTime=10;player.markIncomplete();
+  expect(audios[0].paused).toBe(false);expect(player.elapsed).toBe(10);expect(waiting).toEqual([]);
+  audios[0].currentTime=30;audios[0].onended();expect(waiting).toEqual([true]);expect(ended).toBe(0);
+});
 test('Stop during early playback discards the buffer and never advances a stale end event',async()=>{
   const {player,audios,revoked}=fixture();player.begin([await clip(30)]);await player.play();const stale=audios[0].onended;
   player.clear();stale();expect(player.duration).toBe(0);expect(revoked).toHaveLength(1);expect(audios).toHaveLength(1);

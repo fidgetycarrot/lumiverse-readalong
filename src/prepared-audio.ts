@@ -137,6 +137,11 @@ export class PreparedPlayer {
     }else if(this.waiting && complete){this.waiting=false;this.running=false;this.finished=true;this.onWaiting(false);this.onEnded()}
     else this.preloadNext();
   }
+  /** A failed suffix must also pause a buffer that was already waiting. */
+  markIncomplete(){
+    this.complete=false;
+    if(this.waiting){this.pause();this.onWaiting(true)}
+  }
   get hasStarted(){return this.started}
   private configure(audio:HTMLAudioElement){audio.preload='auto';audio.volume=this.volume;audio.playbackRate=this.speed}
   private activate(index:number) {

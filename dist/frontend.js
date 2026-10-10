@@ -779,6 +779,13 @@ class PreparedPlayer {
     } else
       this.preloadNext();
   }
+  markIncomplete() {
+    this.complete = false;
+    if (this.waiting) {
+      this.pause();
+      this.onWaiting(true);
+    }
+  }
   get hasStarted() {
     return this.started;
   }
@@ -1793,6 +1800,7 @@ var STYLE = `
 .ra-mini .ra-who span{color:var(--ra-dim);font-size:12px;white-space:nowrap}
 .ra-mini .ra-caption{margin:0;color:var(--ra-dim);font-size:12.5px;line-height:1.35;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden}
 .ra-mini .ra-caption.ra-reading{color:var(--ra-text);font-size:14px}
+.ra-mini.ra-audio-incomplete .ra-caption,.ra-mini.ra-audio-incomplete .ra-compact-status{color:#e99087}
 .ra-mini .ra-widget-tools{gap:2px;margin:-4px -6px 0 0}.ra-mini button.ra-icon{width:28px;height:28px}
 .ra-mini .ra-widget-foot{margin-top:auto}.ra-mini .ra-widget-foot button{min-height:28px;padding:4px 9px;font-size:12px}
 .ra-mini button[aria-pressed=true] .ra-ico{color:var(--ra-mark)}
@@ -2275,6 +2283,9 @@ function setup(ctx) {
     play.append(busy ? el("span", "", "ra-spin") : icon(glyph));
     return play;
   }
+  function audioClock() {
+    return `${timeLabel(audioPlayer.elapsed)} / ${preparingAudio || incompleteAudio ? "…" : timeLabel(audioPlayer.duration)}`;
+  }
   function renderWidget() {
     if (!widget || disposed)
       return;
@@ -2296,16 +2307,19 @@ function setup(ctx) {
     const power = iconButton("power", settings.enabled ? "Turn Readalong off" : "Turn Readalong on", () => safe(() => setEnabled(!settings.enabled)));
     power.dataset.raControl = "power";
     power.setAttribute("aria-pressed", String(settings.enabled));
+    const preparation = preparingAudio || incompleteAudio;
     const progress = el("progress");
     progress.max = 1;
-    progress.value = preparingAudio ? preparedCount / Math.max(1, currentPassages.length) : phase === "finished" ? 1 : phase === "ready" ? 0 : hasTime ? audioPlayer.elapsed / audioPlayer.duration : position / Math.max(1, currentSegments.length);
-    progress.setAttribute("aria-label", preparingAudio ? "Speech preparation" : "Playback progress");
-    const clock = `${timeLabel(audioPlayer.elapsed)} / ${timeLabel(audioPlayer.duration)}`;
+    progress.value = preparation ? preparedCount / Math.max(1, currentPassages.length) : phase === "finished" ? 1 : phase === "ready" ? 0 : hasTime ? audioPlayer.elapsed / audioPlayer.duration : position / Math.max(1, currentSegments.length);
+    progress.setAttribute("aria-label", preparation ? "Speech preparation" : "Playback progress");
+    const clock = audioClock(), partsLabel = `${preparedCount} of ${currentPassages.length} parts ready`;
+    const warning = incompleteAudio ? `Audio incomplete: ${partsLabel}. Retry missing audio may cost.` : waitingForAudio ? `Waiting for the rest of the audio… ${partsLabel}.` : status.classList.contains("ra-error") ? status.textContent ?? "Playback stopped." : "";
+    widget.root.classList.toggle("ra-audio-incomplete", incompleteAudio);
     if (settings.widgetMinimized) {
       const info = el("div", "", "ra-compact-info");
       info.append(el("strong", speaking ? speakerLabel(currentSegments[position]?.speaker, "Readalong") : "Readalong"));
       const timed = hasTime && settings.enabled && ["playing", "paused", "ready", "finished"].includes(phase);
-      const detail = el("span", !settings.enabled ? "Off" : timed ? clock : playLabel, timed ? "ra-compact-status ra-time" : "ra-compact-status");
+      const detail = el("span", !settings.enabled ? "Off" : incompleteAudio ? `Missing audio · ${preparedCount}/${currentPassages.length}` : waitingForAudio ? "Waiting for audio…" : warning ? "Playback error" : timed ? clock : playLabel, timed && !warning ? "ra-compact-status ra-time" : "ra-compact-status");
       detail.title = status.textContent ?? "";
       info.append(detail);
       patchPlaybackChildren(widget.root, play, info, power, resize, close, progress);
@@ -2314,8 +2328,8 @@ function setup(ctx) {
       who.append(el("strong", speaking ? speakerLabel(currentSegments[position]?.speaker, "Voice") : "Readalong"));
       if (speaking && currentPassages[currentPassage]?.voice)
         who.append(el("span", voiceLabel(currentPassages[currentPassage].voice)));
-      const caption = el("p", speaking ? plainText(currentSegments[position]?.text ?? "") : status.textContent || "Choose a message.", speaking ? "ra-caption ra-reading" : "ra-caption");
-      caption.title = caption.textContent ?? "";
+      const caption = el("p", warning || (speaking ? plainText(currentSegments[position]?.text ?? "") : status.textContent || "Choose a message."), speaking && !warning ? "ra-caption ra-reading" : "ra-caption");
+      caption.title = warning ? status.textContent ?? warning : caption.textContent ?? "";
       text.append(who, caption);
       const tools = el("div", "", "ra-row ra-widget-tools");
       tools.append(resize, close);
@@ -2358,11 +2372,11 @@ function setup(ctx) {
     if (passage)
       markSentence(at.index, estimatedSentenceIndex(passage, at.fraction));
     const progress = widget?.root.querySelector("progress");
-    if (progress && !preparingAudio)
+    if (progress && !preparingAudio && !incompleteAudio)
       progress.value = at.duration ? at.elapsed / at.duration : 0;
     for (const time of [widget?.root.querySelector(".ra-time"), player.querySelector(".ra-time")])
       if (time)
-        time.textContent = `${timeLabel(at.elapsed)} / ${timeLabel(at.duration)}`;
+        time.textContent = audioClock();
   }
   function finished() {
     playing = false;
@@ -2859,6 +2873,7 @@ function setup(ctx) {
             audioPlayer.setSpeed(settings.speed);
             audioPlayer.setVolume(settings.volume);
           }
+          audioPlayer.markIncomplete();
           if (phase === "preparing")
             phase = "ready";
           renderPlayer();
@@ -3196,12 +3211,13 @@ function setup(ctx) {
       if (voice)
         meta.append(el("span", voiceLabel(voice)));
       meta.append(el("span", preparingAudio || incompleteAudio ? `${preparedCount} of ${currentPassages.length} parts ready` : `Sentence ${position + 1} of ${currentSegments.length}`, "ra-push"));
+      const preparation = preparingAudio || incompleteAudio;
       const progress = el("progress");
-      progress.max = preparingAudio ? currentPassages.length : currentSegments.length;
-      progress.value = preparingAudio ? preparedCount : phase === "ready" ? 0 : position + 1;
-      progress.setAttribute("aria-label", preparingAudio ? "Speech preparation" : "Playback progress");
+      progress.max = preparation ? currentPassages.length : currentSegments.length;
+      progress.value = preparation ? preparedCount : phase === "ready" ? 0 : position + 1;
+      progress.setAttribute("aria-label", preparation ? "Speech preparation" : "Playback progress");
       const seek = el("div", "", "ra-seek");
-      seek.append(progress, el("span", audioPlayer.duration ? `${timeLabel(audioPlayer.elapsed)} / ${timeLabel(audioPlayer.duration)}` : "", "ra-time"));
+      seek.append(progress, el("span", audioPlayer.duration ? audioClock() : "", "ra-time"));
       content.append(meta, el("p", plainText(segment?.text ?? ""), "ra-passage"), seek);
     } else if (messages.length) {
       content.append(field("Message", select([...messages].reverse().map((m) => ({ value: m.id, label: `${m.name || "Assistant"}: ${plainText(stripCues(m.content)).slice(0, 70)}` })), selectedId, (v) => {
