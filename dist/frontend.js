@@ -2091,7 +2091,11 @@ function setup(ctx) {
     const names = [...voiceNames()];
     if (value && !names.includes(value))
       names.unshift(value);
-    return groupedVoiceSelect(names, value, change, inherited ? "Main voice" : undefined);
+    return groupedVoiceSelect(names, value, change, inherited ? `Main voice: ${voiceLabel(settings.voice)}` : undefined);
+  }
+  function voiceLabel(name) {
+    const gender = name ? voiceGender(settings, name) : undefined;
+    return gender ? `${name} (${gender === "f" ? "female" : "male"})` : name;
   }
   function groupedVoiceSelect(names, value, change, emptyLabel) {
     const s = el("select"), option = (v, label) => {
@@ -2106,7 +2110,7 @@ function setup(ctx) {
       groups[voiceGender(settings, name) ?? "none"].push(name);
     if (!groups.f.length && !groups.m.length)
       for (const name of names)
-        s.append(option(name, name));
+        s.append(option(name, voiceLabel(name)));
     else
       for (const [id, label] of [["f", "Female"], ["m", "Male"], ["none", "Not marked"]]) {
         if (!groups[id].length)
@@ -2114,7 +2118,7 @@ function setup(ctx) {
         const group = el("optgroup");
         group.label = label;
         for (const name of groups[id])
-          group.append(option(name, name));
+          group.append(option(name, voiceLabel(name)));
         s.append(group);
       }
     s.value = value;
@@ -2309,7 +2313,7 @@ function setup(ctx) {
       const top = el("div", "", "ra-row ra-widget-top"), text = el("div", "", "ra-widget-text"), who = el("div", "", "ra-who");
       who.append(el("strong", speaking ? speakerLabel(currentSegments[position]?.speaker, "Voice") : "Readalong"));
       if (speaking && currentPassages[currentPassage]?.voice)
-        who.append(el("span", currentPassages[currentPassage].voice));
+        who.append(el("span", voiceLabel(currentPassages[currentPassage].voice)));
       const caption = el("p", speaking ? plainText(currentSegments[position]?.text ?? "") : status.textContent || "Choose a message.", speaking ? "ra-caption ra-reading" : "ra-caption");
       caption.title = caption.textContent ?? "";
       text.append(who, caption);
@@ -3190,7 +3194,7 @@ function setup(ctx) {
       const segment = currentSegments[position], meta = el("div", "", "ra-meta"), voice = currentPassages[currentPassage]?.voice;
       meta.append(el("strong", speakerLabel(segment?.speaker, "Voice")));
       if (voice)
-        meta.append(el("span", voice));
+        meta.append(el("span", voiceLabel(voice)));
       meta.append(el("span", preparingAudio || incompleteAudio ? `${preparedCount} of ${currentPassages.length} parts ready` : `Sentence ${position + 1} of ${currentSegments.length}`, "ra-push"));
       const progress = el("progress");
       progress.max = preparingAudio ? currentPassages.length : currentSegments.length;
@@ -3806,7 +3810,7 @@ function setup(ctx) {
       assignmentsCard.append(fix);
     }
     assignmentsCard.append(el("h3", "Cast"), el("p", "Everyone in your stories who has a voice, plus the names this story has picked up.", "ra-muted"));
-    const narrator = disclosure([el("strong", "Narrator"), el("span", settings.narratorVoice || "Main voice")], openCast.has("narrator"));
+    const narrator = disclosure([el("strong", "Narrator"), el("span", settings.narratorVoice ? voiceLabel(settings.narratorVoice) : `Main voice: ${voiceLabel(settings.voice)}`)], openCast.has("narrator"));
     narrator.details.addEventListener("toggle", () => {
       if (narrator.details.isConnected) {
         if (narrator.details.open)
@@ -3858,7 +3862,7 @@ function setup(ctx) {
     }
     for (const row of rows) {
       const saved = settings.assignments[row.key], known = sayingFor(baseName(row.name));
-      const summary = [el("strong", row.you ? `You (${row.name})` : baseName(row.name)), el("span", saved?.voice || "No voice yet")];
+      const summary = [el("strong", row.you ? `You (${row.name})` : baseName(row.name)), el("span", saved?.voice ? voiceLabel(saved.voice) : "No voice yet")];
       if (known)
         summary.push(el("span", `said “${known.spokenAs}”`));
       if (!saved && !known && !row.you)
@@ -3878,7 +3882,7 @@ function setup(ctx) {
       assignmentsCard.append(entry.details);
       castForm(entry.body, row.key, row.name);
     }
-    const others = disclosure([el("strong", "Everyone else"), el("span", settings.npcVoice || "Same as the main character")], openCast.has("others"));
+    const others = disclosure([el("strong", "Everyone else"), el("span", settings.npcVoice ? voiceLabel(settings.npcVoice) : "Same as the main character")], openCast.has("others"));
     others.details.addEventListener("toggle", () => {
       if (others.details.isConnected) {
         if (others.details.open)

@@ -265,18 +265,20 @@ export function setup(ctx: SpindleFrontendContext) {
   }
   function voiceSelect(value: string, change: (value: string)=>void, inherited = false) {
     const names = [...voiceNames()]; if (value && !names.includes(value)) names.unshift(value);
-    return groupedVoiceSelect(names,value,change,inherited ? 'Main voice' : undefined);
+    return groupedVoiceSelect(names,value,change,inherited ? `Main voice: ${voiceLabel(settings.voice)}` : undefined);
   }
-  /** A voice picker sorted into Female, Male and Other once any voice is marked. */
+  /** A voice name as shown anywhere in the app: "Leda (female)" once the voice is marked. */
+  function voiceLabel(name: string) { const gender = name ? voiceGender(settings,name) : undefined; return gender ? `${name} (${gender==='f' ? 'female' : 'male'})` : name }
+  /** A voice picker sorted into Female, Male and Not marked once any voice is marked. */
   function groupedVoiceSelect(names: string[], value: string, change: (value: string)=>void, emptyLabel?: string) {
     const s = el('select'), option = (v: string, label: string) => { const o = el('option',label); o.value = v; return o };
     if (emptyLabel !== undefined) s.append(option('',emptyLabel));
     const groups = { f: [] as string[], m: [] as string[], none: [] as string[] };
     for (const name of names) groups[voiceGender(settings,name) ?? 'none'].push(name);
-    if (!groups.f.length && !groups.m.length) for (const name of names) s.append(option(name,name));
+    if (!groups.f.length && !groups.m.length) for (const name of names) s.append(option(name,voiceLabel(name)));
     else for (const [id,label] of [['f','Female'],['m','Male'],['none','Not marked']] as const) {
       if (!groups[id].length) continue;
-      const group = el('optgroup'); group.label = label; for (const name of groups[id]) group.append(option(name,name)); s.append(group);
+      const group = el('optgroup'); group.label = label; for (const name of groups[id]) group.append(option(name,voiceLabel(name))); s.append(group);
     }
     s.value = value; s.onchange = e => change((e.currentTarget as HTMLSelectElement).value); return s;
   }
@@ -375,7 +377,7 @@ export function setup(ctx: SpindleFrontendContext) {
     }else{
       const top=el('div','', 'ra-row ra-widget-top'),text=el('div','', 'ra-widget-text'),who=el('div','', 'ra-who');
       who.append(el('strong',speaking?speakerLabel(currentSegments[position]?.speaker,'Voice'):'Readalong'));
-      if(speaking && currentPassages[currentPassage]?.voice)who.append(el('span',currentPassages[currentPassage].voice));
+      if(speaking && currentPassages[currentPassage]?.voice)who.append(el('span',voiceLabel(currentPassages[currentPassage].voice)));
       // While reading, show the sentence itself. Otherwise the status says what to do next.
       const caption=el('p',speaking?plainText(currentSegments[position]?.text ?? ''):status.textContent || 'Choose a message.',speaking?'ra-caption ra-reading':'ra-caption');
       caption.title=caption.textContent ?? '';text.append(who,caption);
@@ -797,7 +799,7 @@ export function setup(ctx: SpindleFrontendContext) {
     const float=()=>iconButton('float','Floating player',()=>safe(openWidget),'ra-icon ra-quiet ra-push');
     if (currentSegments.length) {
       const segment=currentSegments[position],meta=el('div','', 'ra-meta'),voice=currentPassages[currentPassage]?.voice;
-      meta.append(el('strong',speakerLabel(segment?.speaker,'Voice')));if(voice)meta.append(el('span',voice));
+      meta.append(el('strong',speakerLabel(segment?.speaker,'Voice')));if(voice)meta.append(el('span',voiceLabel(voice)));
       meta.append(el('span',(preparingAudio || incompleteAudio)?`${preparedCount} of ${currentPassages.length} parts ready`:`Sentence ${position+1} of ${currentSegments.length}`,'ra-push'));
       const progress=el('progress');progress.max=preparingAudio?currentPassages.length:currentSegments.length;progress.value=preparingAudio?preparedCount:phase==='ready'?0:position+1;progress.setAttribute('aria-label',preparingAudio?'Speech preparation':'Playback progress');
       const seek=el('div','', 'ra-seek');seek.append(progress,el('span',audioPlayer.duration?`${timeLabel(audioPlayer.elapsed)} / ${timeLabel(audioPlayer.duration)}`:'','ra-time'));
@@ -1078,7 +1080,7 @@ export function setup(ctx: SpindleFrontendContext) {
       fix.append(el('h3','Fix how a name is said'),fields,actions,names);assignmentsCard.append(fix);
     }
     assignmentsCard.append(el('h3','Cast'),el('p','Everyone in your stories who has a voice, plus the names this story has picked up.','ra-muted'));
-    const narrator=disclosure([el('strong','Narrator'),el('span',settings.narratorVoice||'Main voice')],openCast.has('narrator'));
+    const narrator=disclosure([el('strong','Narrator'),el('span',settings.narratorVoice?voiceLabel(settings.narratorVoice):`Main voice: ${voiceLabel(settings.voice)}`)],openCast.has('narrator'));
     narrator.details.addEventListener('toggle',()=>{if(narrator.details.isConnected){if(narrator.details.open)openCast.add('narrator');else openCast.delete('narrator')}});
     const narratorListen=withIcon(button('Listen',()=>safe(()=>preview(settings.narratorVoice||settings.voice))),'speaker');narratorListen.disabled=!settings.enabled;
     const narratorRow=el('div','', 'ra-row ra-end');narratorRow.append(field('Voice',voiceSelect(settings.narratorVoice,v=>{settings.narratorVoice=v;void safe(async()=>{await saveSettings();renderAssignments();notice('Narrator voice saved.')})},true)),narratorListen);
@@ -1095,7 +1097,7 @@ export function setup(ctx: SpindleFrontendContext) {
     }
     for(const row of rows){
       const saved=settings.assignments[row.key],known=sayingFor(baseName(row.name));
-      const summary:(Node|string)[]=[el('strong',row.you?`You (${row.name})`:baseName(row.name)),el('span',saved?.voice||'No voice yet')];
+      const summary:(Node|string)[]=[el('strong',row.you?`You (${row.name})`:baseName(row.name)),el('span',saved?.voice?voiceLabel(saved.voice):'No voice yet')];
       if(known)summary.push(el('span',`said “${known.spokenAs}”`));
       if(!saved && !known && !row.you)summary.push(el('span','New','ra-badge'));
       const entry=disclosure(summary,openCast.has(row.key));
@@ -1103,7 +1105,7 @@ export function setup(ctx: SpindleFrontendContext) {
       entry.details.addEventListener('toggle',()=>{if(entry.details.isConnected){if(entry.details.open)openCast.add(row.key);else openCast.delete(row.key)}});
       assignmentsCard.append(entry.details);castForm(entry.body,row.key,row.name);
     }
-    const others=disclosure([el('strong','Everyone else'),el('span',settings.npcVoice||'Same as the main character')],openCast.has('others'));
+    const others=disclosure([el('strong','Everyone else'),el('span',settings.npcVoice?voiceLabel(settings.npcVoice):'Same as the main character')],openCast.has('others'));
     others.details.addEventListener('toggle',()=>{if(others.details.isConnected){if(others.details.open)openCast.add('others');else openCast.delete('others')}});
     const othersListen=withIcon(button('Listen',()=>safe(()=>preview(settings.npcVoice||settings.voice))),'speaker');othersListen.disabled=!settings.enabled;
     const othersNames=[...voiceNames()];if(settings.npcVoice && !othersNames.includes(settings.npcVoice))othersNames.unshift(settings.npcVoice);
