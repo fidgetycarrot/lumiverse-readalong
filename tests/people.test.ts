@@ -51,3 +51,11 @@ test('your name can differ per story and keeps your voice',()=>{
 test('an object pronoun about someone else does not hide a clear gender',()=>{
   expect(findPeople(['Zoe hopped the last three steps. She laughed and shook the water from her boots.','Zoe waved him off. She pointed toward the lighthouse.'])).toContainEqual({name:'Zoe',gender:'f'});
 });
+test('status blocks and ordinary capitalised words are not people',()=>{
+  const story=[
+    'Height: 5\'6". Eyes: green. Skin: pale. From: the coast.\nZoe stretched by the window. She glanced at Elliot. Early light scraped across her skin.',
+    'By noon the rain had stopped. Scraped knees and bruised pride, she thought. Eyes on the road, Zoe told herself.',
+    'Vane stepped out of the shadows. He tipped his hat at Zoe. From the doorway, he watched her go. "Evening," Vane said.'];
+  const names=findPeople(story,['Elliot']).map(p=>p.name).sort();
+  expect(names).toEqual(['Vane','Zoe']);
+});

@@ -39,3 +39,12 @@ test('a new story can copy a cast, with matching main characters offered first',
   expect(copyCast(s,'a','new')).toBe(1);expect(copyCast(s,'a','new')).toBe(0);
   expect(namesElsewhere(s,'new').map(n=>n.name)).toEqual(['guard']);
 });
+import {isStoryteller,setStoryteller,storytellerDecided,ignoreName} from '../src/story-cast';
+test('a guessed storyteller gives way to your choice, both ways',()=>{
+  const s=normalizeSettings({});
+  expect(isStoryteller(s,'card',true)).toBe(true);expect(isStoryteller(s,'card',false)).toBe(false);
+  setStoryteller(s,'card',false);expect(isStoryteller(s,'card',true)).toBe(false);expect(storytellerDecided(s,'card')).toBe(true);
+  setStoryteller(s,'card',true);expect(isStoryteller(s,'card',false)).toBe(true);
+  ignoreName(s,'chat','Height');expect(normalizeSettings(s).stories.chat.ignored).toEqual(['height']);
+  expect(normalizeSettings(s).personCards).toEqual([]);
+});

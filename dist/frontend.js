@@ -392,7 +392,8 @@ var DEFAULTS = {
   volume: 0.85,
   assignments: {},
   stories: {},
-  storytellers: []
+  storytellers: [],
+  personCards: []
 };
 var DEFAULT_SPEECH_RULES = { quoted: "speech", asterisked: "narration", undecorated: "narration" };
 function readVoiceRef(raw) {
@@ -436,6 +437,7 @@ function normalizeSettings(raw) {
         ...typeof v.characterId === "string" && v.characterId.length <= 160 ? { characterId: v.characterId } : {},
         ...speakerName(v.you) ? { you: speakerName(v.you) } : {},
         ...speakerName(v.lead) ? { lead: speakerName(v.lead) } : {},
+        ...Array.isArray(v.ignored) && v.ignored.length ? { ignored: [...new Set(v.ignored.filter((n) => typeof n === "string" && n.length > 0 && n.length <= 80).map((n) => n.toLowerCase()))].slice(0, 300) } : {},
         updatedAt: Number.isFinite(Number(v.updatedAt)) ? Number(v.updatedAt) : 0
       };
     }
@@ -476,6 +478,7 @@ function normalizeSettings(raw) {
     volume: clamp(r.volume, 0, 1, 0.85),
     assignments,
     stories,
+    personCards: Array.isArray(r.personCards) ? [...new Set(r.personCards.filter((id) => typeof id === "string" && id.length > 0 && id.length <= 160))].slice(0, 500) : [],
     storytellers: Array.isArray(r.storytellers) ? [...new Set(r.storytellers.filter((id) => typeof id === "string" && id.length > 0 && id.length <= 160))].slice(0, 500) : []
   };
 }
@@ -1780,16 +1783,32 @@ function setStoryYou(settings, chatId, name) {
   s.updatedAt = Date.now();
   return newKey;
 }
-function isStoryteller(settings, characterId) {
-  return !!characterId && settings.storytellers.includes(characterId);
+function isStoryteller(settings, characterId, guess = false) {
+  if (!characterId)
+    return false;
+  if (settings.storytellers.includes(characterId))
+    return true;
+  return guess && !settings.personCards.includes(characterId);
 }
 function setStoryteller(settings, characterId, storyteller) {
-  const all = new Set(settings.storytellers);
-  if (storyteller)
-    all.add(characterId);
-  else
-    all.delete(characterId);
-  settings.storytellers = [...all];
+  const tellers = new Set(settings.storytellers), people = new Set(settings.personCards);
+  if (storyteller) {
+    tellers.add(characterId);
+    people.delete(characterId);
+  } else {
+    tellers.delete(characterId);
+    people.add(characterId);
+  }
+  settings.storytellers = [...tellers];
+  settings.personCards = [...people];
+}
+function storytellerDecided(settings, characterId) {
+  return settings.storytellers.includes(characterId) || settings.personCards.includes(characterId);
+}
+function ignoreName(settings, chatId, name) {
+  const s = story(settings, chatId);
+  s.ignored = [...new Set([...s.ignored ?? [], name.toLowerCase()])].slice(-300);
+  s.updatedAt = Date.now();
 }
 var NOBODY = "Everyone else";
 function leadIn(settings, chatId) {
@@ -1923,7 +1942,7 @@ function namesElsewhere(settings, chatId) {
 }
 
 // src/people.ts
-var NOT_PEOPLE = new Set(["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december", "god", "gods", "lord", "lady", "sir", "madam", "ma", "mom", "mum", "dad", "mother", "father", "okay", "hey", "hi", "hello", "please", "thanks", "sorry", "no", "yes", "oh", "um", "uh", "hmm", "wait", "look", "listen", "come", "go", "stop", "let", "don", "didn", "won", "can", "isn", "wasn", "that", "this", "what", "where", "when", "why", "how", "who", "which", "whatever", "nothing", "everything", "anything", "somewhere", "maybe", "perhaps", "not", "never", "always", "all", "some", "any", "each", "every", "most", "many", "much", "more", "less", "first", "last", "next", "other", "another", "such", "very", "too", "also", "only", "just", "even", "still", "yet", "already", "almost", "enough", "quite", "rather", "really", "well", "here", "there", "now", "then", "today", "tonight", "tomorrow", "yesterday", "chapter", "part", "scene", "end", "ooc", "note", "system", "user", "assistant"]);
+var NOT_PEOPLE = new Set(["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december", "god", "gods", "lord", "lady", "sir", "madam", "ma", "mom", "mum", "dad", "mother", "father", "okay", "hey", "hi", "hello", "please", "thanks", "sorry", "no", "yes", "oh", "um", "uh", "hmm", "wait", "look", "listen", "come", "go", "stop", "let", "don", "didn", "won", "can", "isn", "wasn", "that", "this", "what", "where", "when", "why", "how", "who", "which", "whatever", "nothing", "everything", "anything", "somewhere", "maybe", "perhaps", "not", "never", "always", "all", "some", "any", "each", "every", "most", "many", "much", "more", "less", "first", "last", "next", "other", "another", "such", "very", "too", "also", "only", "just", "even", "still", "yet", "already", "almost", "enough", "quite", "rather", "really", "well", "here", "there", "now", "then", "today", "tonight", "tomorrow", "yesterday", "chapter", "part", "scene", "end", "ooc", "note", "system", "user", "assistant", "from", "by", "with", "without", "within", "into", "onto", "upon", "under", "over", "through", "across", "behind", "beside", "besides", "between", "beyond", "inside", "outside", "near", "toward", "towards", "during", "until", "till", "since", "because", "though", "although", "unless", "whether", "once", "twice", "against", "along", "around", "among", "above", "below", "beneath", "about", "off", "out", "up", "down", "for", "of", "in", "on", "at", "to", "or", "nor", "like", "despite", "except", "per", "via", "its", "our", "their", "whose", "something", "someone", "somebody", "nobody", "none", "everyone", "everybody", "anyone", "anybody"]);
 var FEMALE = /\b(she|her|hers|herself)\b/gi;
 var MALE = /\b(he|him|his|himself)\b/gi;
 var WORD = /\p{Lu}[\p{Ll}\p{M}'’-]+/gu;
@@ -1951,10 +1970,14 @@ function findPeople(texts, known = []) {
     return s;
   };
   const verbAfter = new RegExp(String.raw`^\s*(?:\p{L}+ly\s+)?${SPEECH_VERBS}\b`, "iu"), verbBefore = new RegExp(String.raw`${SPEECH_VERBS}\s*$`, "iu");
+  const ordinary = new Set;
+  for (const text of texts)
+    for (const m of text.matchAll(/(?<![\p{L}'’])\p{Ll}[\p{Ll}\p{M}'’-]*/gu))
+      ordinary.add(m[0].replace(/['’]s$/, ""));
   for (const text of texts) {
     const list = sentences2(narration(text));
     list.forEach((sentence, i) => {
-      const words = [...sentence.matchAll(WORD)].filter((m) => usable(m[0]));
+      const words = [...sentence.matchAll(WORD)].filter((m) => usable(m[0]) && !/^\s*:/.test(sentence.slice(m.index + m[0].length)));
       const names = new Set(words.map((m) => clean2(m[0]).toLowerCase()).filter((n) => !skip.has(n)));
       for (const m of words) {
         const name = clean2(m[0]);
@@ -1989,10 +2012,12 @@ function findPeople(texts, known = []) {
   const people = [];
   for (const s of [...stats.values()].sort((a, b) => b.seen - a.seen)) {
     const pronouns = s.f + s.m;
-    if (!(s.mid || s.seen > 1 || pronouns >= 2))
-      continue;
-    if (!s.speaks && pronouns < 2)
-      continue;
+    if (!s.speaks) {
+      if (pronouns < 2 || ordinary.has(s.name.toLowerCase()))
+        continue;
+      if (!s.mid && s.name.length > 4 && /(ed|ing|ly)$/i.test(s.name))
+        continue;
+    }
     const gender = pronouns >= 2 && s.f >= pronouns * 0.75 ? "f" : pronouns >= 2 && s.m >= pronouns * 0.75 ? "m" : undefined;
     people.push({ name: s.name, ...gender ? { gender } : {} });
   }
@@ -3635,7 +3660,7 @@ function setup(ctx) {
         connections: nativeConnections,
         mainSpeaker: message.name,
         pronunciations: await refreshPronunciations(chatId, options.restoreOnly ? undefined : message.id),
-        storyteller: !message.isUser && isStoryteller(settings, currentMessage.characterId),
+        storyteller: !message.isUser && tellerCard(currentMessage.characterId),
         lead: leadIn(settings, chatId),
         people: readPeople(message.content).map((p) => ({ name: p.name }))
       };
@@ -4074,13 +4099,28 @@ function setup(ctx) {
     decorateMessages();
     await ensureStory(chatId);
   }
+  function tellerGuess(characterId) {
+    const card = characters.find((c) => c.id === characterId);
+    if (!card)
+      return false;
+    const name = baseName(card.name), own = messages.filter((m) => !m.isUser && (m.characterId === characterId || m.name === card.name || m.name === name));
+    if (own.length < 2)
+      return false;
+    const words = name.split(/[^\p{L}\p{N}'’]+/u).filter((w) => w.length >= 3 && /^\p{Lu}/u.test(w) && !["The", "And", "For", "From", "With"].includes(w));
+    if (!words.length)
+      return false;
+    const said = words.map((w) => new RegExp(`(?<![\\p{L}\\p{N}])${w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\p{L}\\p{N}])`, "u"));
+    return !messages.some((m) => said.some((re) => re.test(m.content)));
+  }
+  const tellerCard = (characterId) => isStoryteller(settings, characterId, tellerGuess(characterId));
   function readPeople(extra) {
     const chatId = ctx.getActiveChat().chatId ?? "", key = `${chatId}:${messages.length}:${extra?.length ?? 0}`;
     if (peopleFor === key)
       return storyPeople;
     const card = characters.find((c) => c.id === ctx.getActiveChat().characterId)?.name.split("||")[0].trim();
-    const known = [youIn(settings, chatId), ...card && !isStoryteller(settings, ctx.getActiveChat().characterId) ? [card] : [], NOBODY].filter(Boolean);
-    storyPeople = findPeople([...messages.slice(-60).map((m) => m.content), ...extra ? [extra] : []], known);
+    const known = [youIn(settings, chatId), ...card && !tellerCard(ctx.getActiveChat().characterId) ? [card] : [], NOBODY].filter(Boolean);
+    const ignored = new Set(settings.stories[chatId]?.ignored ?? []);
+    storyPeople = findPeople([...messages.slice(-60).map((m) => m.content), ...extra ? [extra] : []], known).filter((p) => !ignored.has(p.name.toLowerCase()));
     peopleFor = key;
     return storyPeople;
   }
@@ -4720,14 +4760,14 @@ function setup(ctx) {
     return wrap;
   }
   function storytellerToggle(characterId, name) {
-    return toggle(`${name} is a storyteller, not a person`, isStoryteller(settings, characterId), (v) => {
+    return toggle(`${name} is a storyteller, not a person`, tellerCard(characterId), (v) => {
       safe(async () => {
         setStoryteller(settings, characterId, v);
         await saveSettings();
         renderAssignments();
         notice(v ? `${name} now tells the story. Its lines go to the people in it, and narration uses the Narrator voice.` : `${name} is a person in the story again.`);
       });
-    }, "For cards that run a world or a whole cast, like a game master. Turn on so lines go to the people in the story, not to the card.");
+    }, !storytellerDecided(settings, characterId) && tellerGuess(characterId) ? `Readalong guessed this because the story never says ${name} by name. Turn off if ${name} is a person.` : "For cards that run a world or a whole cast, like a game master. Turn on so lines go to the people in the story, not to the card.");
   }
   function leadRow(chatId, names) {
     const wrap = el("div", "", "ra-stack"), current = leadIn(settings, chatId);
@@ -4763,7 +4803,7 @@ function setup(ctx) {
       container.append(youNameRow(openChat));
     if (inList && activeCard && key === `id:${activeCard}`) {
       container.append(storytellerToggle(activeCard, spoken));
-      if (isStoryteller(settings, activeCard)) {
+      if (tellerCard(activeCard)) {
         if (openChat)
           container.append(leadRow(openChat, castRows().filter((r) => !r.you && r.key !== key).map((r) => baseName(r.name))));
         return;
@@ -4879,7 +4919,8 @@ function setup(ctx) {
       done();
       notice(entry || edited && known ? `Saved ${spoken}. Audio you already have keeps the old sound.` : `Saved ${spoken}.`);
     }), true);
-    const remove = button(inList ? "Remove" : "Clear", () => safe(async () => {
+    const foundOnly = inList && !saved && !known && storyPeople.some((p) => `name:${p.name.toLowerCase()}` === key);
+    const remove = button(foundOnly ? "Not a person" : inList ? "Remove" : "Clear", () => safe(async () => {
       if (saved || known) {
         const result = await ctx.ui.showConfirm({ title: `Remove ${spoken}?`, message: known ? "This forgets their voice and how their name is said in this story." : "This forgets their voice.", variant: "danger", confirmLabel: "Remove" });
         if (!result.confirmed)
@@ -4896,6 +4937,12 @@ function setup(ctx) {
       }
       if (known)
         await removeSaying(known.name);
+      if (inList && chatId && key.startsWith("name:") && !saved && storyPeople.some((p) => `name:${p.name.toLowerCase()}` === key)) {
+        ignoreName(settings, chatId, spoken);
+        peopleFor = "";
+        readPeople();
+        await saveSettings();
+      }
       addedCast.delete(key);
       addedNames.delete(key);
       openCast.delete(key);
@@ -5042,7 +5089,7 @@ function setup(ctx) {
         const card = characters.find((c) => c.id === ctx.getActiveChat().characterId);
         if (card)
           start.append(storytellerToggle(card.id, baseName(card.name)));
-        if (card && isStoryteller(settings, card.id))
+        if (card && tellerCard(card.id))
           start.append(leadRow(chatId, rows.filter((r) => !r.you && r.key !== `id:${card.id}`).map((r) => baseName(r.name))));
         const startActions = el("div", "", "ra-row");
         startActions.append(addButton);
@@ -5109,7 +5156,7 @@ function setup(ctx) {
     }
     for (const row of rows) {
       const saved = cast()[row.key], known = sayingFor(baseName(row.name));
-      const teller = row.key === `id:${ctx.getActiveChat().characterId}` && isStoryteller(settings, ctx.getActiveChat().characterId);
+      const teller = row.key === `id:${ctx.getActiveChat().characterId}` && tellerCard(ctx.getActiveChat().characterId);
       const summary = [el("strong", row.you ? `You (${row.name})` : baseName(row.name)), el("span", teller ? `Storyteller · unnamed lines: ${leadIn(settings, chatId)}` : saved?.voice ? `${voiceLabel(saved.voice)}${saved.auto ? ", picked for you" : ""}` : "No voice yet")];
       if (known)
         summary.push(el("span", `said “${known.spokenAs}”`));

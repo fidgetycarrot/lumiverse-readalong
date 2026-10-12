@@ -317,7 +317,8 @@ var DEFAULTS = {
   volume: 0.85,
   assignments: {},
   stories: {},
-  storytellers: []
+  storytellers: [],
+  personCards: []
 };
 function readVoiceRef(raw) {
   if (!raw || typeof raw !== "object")
@@ -353,6 +354,7 @@ function normalizeSettings(raw) {
         ...typeof v.characterId === "string" && v.characterId.length <= 160 ? { characterId: v.characterId } : {},
         ...speakerName(v.you) ? { you: speakerName(v.you) } : {},
         ...speakerName(v.lead) ? { lead: speakerName(v.lead) } : {},
+        ...Array.isArray(v.ignored) && v.ignored.length ? { ignored: [...new Set(v.ignored.filter((n) => typeof n === "string" && n.length > 0 && n.length <= 80).map((n) => n.toLowerCase()))].slice(0, 300) } : {},
         updatedAt: Number.isFinite(Number(v.updatedAt)) ? Number(v.updatedAt) : 0
       };
     }
@@ -393,6 +395,7 @@ function normalizeSettings(raw) {
     volume: clamp(r.volume, 0, 1, 0.85),
     assignments,
     stories,
+    personCards: Array.isArray(r.personCards) ? [...new Set(r.personCards.filter((id) => typeof id === "string" && id.length > 0 && id.length <= 160))].slice(0, 500) : [],
     storytellers: Array.isArray(r.storytellers) ? [...new Set(r.storytellers.filter((id) => typeof id === "string" && id.length > 0 && id.length <= 160))].slice(0, 500) : []
   };
 }

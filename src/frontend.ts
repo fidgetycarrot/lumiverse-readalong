@@ -6,7 +6,7 @@ import { planSpeech, planMessageSpeech, prepareAll, estimatedSentenceIndex, isUn
 import {buildRoster} from './speaker-detect';
 import {soundCues,type SoundCue} from './sound-effects';
 import {autoCast} from './auto-cast';
-import {castView,setCastEntry,setMember,claimEarlier,copyCast,otherStories,namesElsewhere,noteStory,youIn,setStoryYou,isStoryteller,setStoryteller,leadIn,setLead,NOBODY} from './story-cast';
+import {castView,setCastEntry,setMember,claimEarlier,copyCast,otherStories,namesElsewhere,noteStory,youIn,setStoryYou,isStoryteller,setStoryteller,storytellerDecided,ignoreName,leadIn,setLead,NOBODY} from './story-cast';
 import {findPeople,type Person} from './people';
 import { PreparedPlayer, prepareClip, waveHeader, joinPrepared, type PreparedClip } from './prepared-audio';
 import { AudioCache, preparationHash } from './audio-cache';
@@ -723,7 +723,7 @@ export function setup(ctx: SpindleFrontendContext) {
       let snapshot=castView(normalizeSettings(settings),chatId);
       const context:VoiceContext={characters,characterId:currentMessage.characterId,connections:nativeConnections,mainSpeaker:message.name,
         pronunciations:await refreshPronunciations(chatId,options.restoreOnly?undefined:message.id),
-        storyteller:!message.isUser && isStoryteller(settings,currentMessage.characterId),lead:leadIn(settings,chatId),people:readPeople(message.content).map(p=>({name:p.name}))};
+        storyteller:!message.isUser && tellerCard(currentMessage.characterId),lead:leadIn(settings,chatId),people:readPeople(message.content).map(p=>({name:p.name}))};
       let rules,hostAutomaticTts=false;
       if(snapshot.provider==='lumiverse') {
         const results=await Promise.allSettled([nativeTts.preferences(),ctx.chats.getActive?.() ?? Promise.resolve(null),nativeTts.connections()]);
@@ -932,13 +932,29 @@ export function setup(ctx: SpindleFrontendContext) {
     await ensureStory(chatId);
   }
   /** First visit to a story: bring in older voices it uses, and remember its title and main character. */
+  /**
+   * A card is probably a storyteller when it has written replies here but the
+   * story never names it: a person card gets named, a game-master card doesn't.
+   */
+  function tellerGuess(characterId?:string|null):boolean {
+    const card=characters.find(c=>c.id===characterId);if(!card)return false;
+    const name=baseName(card.name),own=messages.filter(m=>!m.isUser && (m.characterId===characterId || m.name===card.name || m.name===name));
+    if(own.length<2)return false;
+    // Any capitalised word of the card's name counts ("Zoe" for "Zoe - Companion v2").
+    const words=name.split(/[^\p{L}\p{N}'’]+/u).filter(w=>w.length>=3 && /^\p{Lu}/u.test(w) && !['The','And','For','From','With'].includes(w));
+    if(!words.length)return false;
+    const said=words.map(w=>new RegExp(`(?<![\\p{L}\\p{N}])${w.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}(?![\\p{L}\\p{N}])`,'u'));
+    return !messages.some(m=>said.some(re=>re.test(m.content)));
+  }
+  const tellerCard=(characterId?:string|null)=>isStoryteller(settings,characterId,tellerGuess(characterId));
   /** Read the open story for people and their likely gender. Cheap; cached per message count. */
   function readPeople(extra?:string):Person[] {
     const chatId=ctx.getActiveChat().chatId??'',key=`${chatId}:${messages.length}:${extra?.length??0}`;
     if(peopleFor===key)return storyPeople;
     const card=characters.find(c=>c.id===ctx.getActiveChat().characterId)?.name.split('||')[0].trim();
-    const known=[youIn(settings,chatId),...(card && !isStoryteller(settings,ctx.getActiveChat().characterId)?[card]:[]),NOBODY].filter(Boolean);
-    storyPeople=findPeople([...messages.slice(-60).map(m=>m.content),...(extra?[extra]:[])],known);peopleFor=key;
+    const known=[youIn(settings,chatId),...(card && !tellerCard(ctx.getActiveChat().characterId)?[card]:[]),NOBODY].filter(Boolean);
+    const ignored=new Set(settings.stories[chatId]?.ignored??[]);
+    storyPeople=findPeople([...messages.slice(-60).map(m=>m.content),...(extra?[extra]:[])],known).filter(p=>!ignored.has(p.name.toLowerCase()));peopleFor=key;
     return storyPeople;
   }
   async function ensureStory(chatId:string) {
@@ -1231,10 +1247,10 @@ export function setup(ctx: SpindleFrontendContext) {
     return wrap;
   }
   function storytellerToggle(characterId:string,name:string) {
-    return toggle(`${name} is a storyteller, not a person`,isStoryteller(settings,characterId),v=>{void safe(async()=>{
+    return toggle(`${name} is a storyteller, not a person`,tellerCard(characterId),v=>{void safe(async()=>{
       setStoryteller(settings,characterId,v);await saveSettings();renderAssignments();
       notice(v?`${name} now tells the story. Its lines go to the people in it, and narration uses the Narrator voice.`:`${name} is a person in the story again.`);
-    })},'For cards that run a world or a whole cast, like a game master. Turn on so lines go to the people in the story, not to the card.');
+    })},!storytellerDecided(settings,characterId) && tellerGuess(characterId)?`Readalong guessed this because the story never says ${name} by name. Turn off if ${name} is a person.`:'For cards that run a world or a whole cast, like a game master. Turn on so lines go to the people in the story, not to the card.');
   }
   /** On a storyteller card: who gets lines that name nobody. */
   function leadRow(chatId:string,names:string[]):HTMLElement {
@@ -1258,7 +1274,7 @@ export function setup(ctx: SpindleFrontendContext) {
     if(inList && openChat && key===youKey())container.append(youNameRow(openChat));
     if(inList && activeCard && key===`id:${activeCard}`){
       container.append(storytellerToggle(activeCard,spoken));
-      if(isStoryteller(settings,activeCard)){
+      if(tellerCard(activeCard)){
         if(openChat)container.append(leadRow(openChat,castRows().filter(r=>!r.you && r.key!==key).map(r=>baseName(r.name))));
         return;
       }
@@ -1305,7 +1321,8 @@ export function setup(ctx: SpindleFrontendContext) {
       if(entry)await saveSaying(entry);else if(hasStory && edited && known && !say.spokenAs.trim())await removeSaying(known.name);
       done();notice(entry || (edited && known)?`Saved ${spoken}. Audio you already have keeps the old sound.`:`Saved ${spoken}.`);
     }),true);
-    const remove=button(inList?'Remove':'Clear',()=>safe(async()=>{
+    const foundOnly=inList && !saved && !known && storyPeople.some(p=>`name:${p.name.toLowerCase()}`===key);
+    const remove=button(foundOnly?'Not a person':inList?'Remove':'Clear',()=>safe(async()=>{
       if(saved || known){
         const result=await ctx.ui.showConfirm({title:`Remove ${spoken}?`,message:known?'This forgets their voice and how their name is said in this story.':'This forgets their voice.',variant:'danger',confirmLabel:'Remove'});
         if(!result.confirmed)return;
@@ -1315,6 +1332,8 @@ export function setup(ctx: SpindleFrontendContext) {
       if(key.startsWith('id:') && chatId && inList){setMember(settings,chatId,key,false);if(saved)await saveSettings()}
       else if(saved){setCastEntry(settings,chatId,key,undefined);await saveSettings()}
       if(known)await removeSaying(known.name);
+      // A name Readalong found by reading the story stays away once you remove it.
+      if(inList && chatId && key.startsWith('name:') && !saved && storyPeople.some(p=>`name:${p.name.toLowerCase()}`===key)){ignoreName(settings,chatId,spoken);peopleFor='';readPeople();await saveSettings()}
       addedCast.delete(key);addedNames.delete(key);openCast.delete(key);
       if(inList && chatId && settings.stories[chatId]?.you && key===youKey()){setStoryYou(settings,chatId,'');await saveSettings()}
       else if(inList && settings.personaName && key===`name:${settings.personaName.toLowerCase()}`){settings.personaName='';await saveSettings()}
@@ -1393,7 +1412,7 @@ export function setup(ctx: SpindleFrontendContext) {
         start.append(youNameRow(chatId,true));
         const card=characters.find(c=>c.id===ctx.getActiveChat().characterId);
         if(card)start.append(storytellerToggle(card.id,baseName(card.name)));
-        if(card && isStoryteller(settings,card.id))start.append(leadRow(chatId,rows.filter(r=>!r.you && r.key!==`id:${card.id}`).map(r=>baseName(r.name))));
+        if(card && tellerCard(card.id))start.append(leadRow(chatId,rows.filter(r=>!r.you && r.key!==`id:${card.id}`).map(r=>baseName(r.name))));
         const startActions=el('div','', 'ra-row');startActions.append(addButton);start.append(startActions);
         const copy=storyPicker('Or start with a cast from another story');if(copy)start.append(copy);
         assignmentsCard.append(start);
@@ -1418,7 +1437,7 @@ export function setup(ctx: SpindleFrontendContext) {
     }
     for(const row of rows){
       const saved=cast()[row.key],known=sayingFor(baseName(row.name));
-      const teller=row.key===`id:${ctx.getActiveChat().characterId}` && isStoryteller(settings,ctx.getActiveChat().characterId);
+      const teller=row.key===`id:${ctx.getActiveChat().characterId}` && tellerCard(ctx.getActiveChat().characterId);
       const summary:(Node|string)[]=[el('strong',row.you?`You (${row.name})`:baseName(row.name)),el('span',teller?`Storyteller · unnamed lines: ${leadIn(settings,chatId)}`:saved?.voice?`${voiceLabel(saved.voice)}${saved.auto?', picked for you':''}`:'No voice yet')];
       if(known)summary.push(el('span',`said “${known.spokenAs}”`));
       if(row.found?.gender && !saved?.voice)summary.push(el('span',row.found.gender==='f'?'sounds female':'sounds male'));

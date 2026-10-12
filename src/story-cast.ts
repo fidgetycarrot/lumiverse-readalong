@@ -46,11 +46,22 @@ export function setStoryYou(settings:Settings,chatId:string,name:string) {
 }
 
 /** Whether a card tells the story rather than playing one person. */
-export function isStoryteller(settings:Settings,characterId?:string|null):boolean { return !!characterId && settings.storytellers.includes(characterId) }
+/** Your choice wins; without one, `guess` (the story never names the card) decides. */
+export function isStoryteller(settings:Settings,characterId?:string|null,guess=false):boolean {
+  if(!characterId)return false;
+  if(settings.storytellers.includes(characterId))return true;
+  return guess && !settings.personCards.includes(characterId);
+}
 export function setStoryteller(settings:Settings,characterId:string,storyteller:boolean) {
-  const all=new Set(settings.storytellers);
-  if(storyteller)all.add(characterId);else all.delete(characterId);
-  settings.storytellers=[...all];
+  const tellers=new Set(settings.storytellers),people=new Set(settings.personCards);
+  if(storyteller){tellers.add(characterId);people.delete(characterId)}else{tellers.delete(characterId);people.add(characterId)}
+  settings.storytellers=[...tellers];settings.personCards=[...people];
+}
+/** True once you've said whether this card is a storyteller. */
+export function storytellerDecided(settings:Settings,characterId:string):boolean { return settings.storytellers.includes(characterId) || settings.personCards.includes(characterId) }
+/** Stop offering a found name as a person in this story. */
+export function ignoreName(settings:Settings,chatId:string,name:string) {
+  const s=story(settings,chatId);s.ignored=[...new Set([...(s.ignored??[]),name.toLowerCase()])].slice(-300);s.updatedAt=Date.now();
 }
 /** Who speaks lines that name nobody, on a storyteller card. */
 export const NOBODY='Everyone else';
