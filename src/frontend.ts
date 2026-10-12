@@ -992,6 +992,7 @@ export function setup(ctx: SpindleFrontendContext) {
     about.body.append(
       el('p','While Readalong is on, each new reply gets audio as soon as it is written. Automatic playback can start it for you; otherwise press Play.','ra-muted'),
       el('p','Each successful audio part is saved on this device. Reloading or switching chats reuses what is still saved. Play never requests speech.','ra-muted'),
+      el('p','With Keep audio with the message on, finished audio is also saved in Lumiverse, so your phone or another computer can play it for free.','ra-muted'),
       el('p','If preparation fails, Retry missing audio keeps the successful parts and requests only what is missing. That retry can cost money. Storage limits or clearing app data can remove saved audio.','ra-muted'),
       speechActivityNote,
       el('p','Changing a voice, or how a name is said, only changes new audio.','ra-muted'),

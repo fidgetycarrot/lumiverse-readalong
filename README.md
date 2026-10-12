@@ -44,6 +44,17 @@ The **Character voices** section now has separate expandable rows and **Add some
 
 Readalong also supports Gemini 3.8 inline vocal events from presets such as Threadbare, preserving the entire dialogue after standalone `<gasp>`, `<sigh>`, `<heavy breath>` and pause tokens. Standalone attribute-free vocal cues, including unfamiliar names, are preserved for Gemini 3.8; they are hidden from the player/marker and omitted for unsupported models. It also excludes entire scene cards, flair choices, image prompts (`<dt-image>`), tool/control blocks and comment-delimited UI cards from speech. It keeps ordinary HTML prose. A speaker cue on quoted dialogue ends at the closing quote, so the following narration returns to its assigned voice without requiring a reset cue. It also saves prepared audio locally and restores it after an app refresh without generating speech again. Refresh and chat switching never start paid preparation when saved audio is missing. New completed replies prepare automatically while on; explicitly turning on prepares only the latest reply, once. **Playback waits for your Play click unless you enable automatic playback.** The drawer and floating widget have an immediate on/off control; off stops playback and preparation and blocks new speech requests. Native Gemini uses larger same-voice batches and joined prepared WAV files, avoiding full-message decoded buffers and the old 256 MiB rejection. The floating player works independently of the drawer and excludes its buttons from host drag handling.
 
+## New in this update
+
+Ideas borrowed from two other voice extensions, [Choir](https://github.com/patatasbravasch-arch/Choir) and [Chat Voice](https://github.com/WanderingMonk8/custom_voice). Thank you to both.
+
+- **Knows who is talking.** When the story model leaves out a `[speaker:Name]` cue, Readalong works out who said each quote from the text itself: `Maren:` labels, tags like *“…,” Maren said* or *said the sergeant*, a character acting right before or after the quote, the only character named in the paragraph, and two people trading lines. No extra model call. A cue from the model always wins.
+- **Nicknames share a voice.** Open a cast row and fill in **Also goes by** (for example *Mags, the captain*). A unique first name also reaches a full name, so *Rhea* finds *Captain Rhea Vance*.
+- **New characters get a voice on their own.** With **Cast → Give new characters a voice automatically** on, a new character the story marks as female or male gets an unused voice you marked the same way. The row says *picked for you*; change it any time. Each cast row also has a **Sounds** choice (Female / Male).
+- **Player upgrades.** Back and Forward buttons jump one part at a time. **Playback → Voices in this reply** has a volume slider and a **Skip** button for each voice, plus **Dialogue only** to skip the narrator. Phones and tablets that ignore page volume show only Skip.
+- **Sound effects (optional).** Turn on **Playback → Sound effects** and paste a free [Freesound](https://freesound.org/apiv2/apply) key. When the story describes a knock, footsteps, rain, a door slamming and so on, a quiet matching sound plays at that point. The key is stored encrypted, and each kind of sound is fetched once. The list of sounds is adapted from Choir (MIT licence, © 2026 Choir contributors).
+- **Keep audio with the message (optional).** Turn on **Playback → Keep audio with the message** and finished audio is saved onto the message in Lumiverse, the same way Lumiverse's own voice feature saves it. Your phone or another computer then plays it without paying again. **Recordings to keep** (default 30) removes the oldest saved recordings from their messages. Very long replies (around 3½ minutes or more) and audio that can't be joined into one file stay on the device that made them.
+
 ## Install
 
 Use a current Lumiverse 1.2.0 or newer build with Spindle. This package includes prebuilt frontend and backend bundles.
@@ -142,7 +153,7 @@ Library assignments are tied to character IDs and survive chat changes. Named as
 
 With **Lumiverse connection**, unassigned voices inherit Lumiverse’s per-chat overrides, character-card `ttsVoice`, and global narrator voice where the saved connections are available. Readalong assignments take precedence. Turn off **Use Lumiverse’s saved character and narrator voices** to use only Readalong settings. Inherited voices may use different saved TTS connections; Readalong does not modify them. Its speed control applies to the prepared playback; per-voice native speed overrides are not imported.
 
-Without speaker cues, straight, curly, and guillemet double quotes are treated as dialogue from the message’s character, and surrounding prose as narration. Native Lumiverse speech-detection rules are respected when available, including skipped asterisked actions. Otherwise asterisked prose uses the narrator. Multiple characters speaking in the same message need explicit `[speaker:Name]` cues inside the relevant quote; quotation marks alone do not identify which character spoke. A quoted speaker cue ends at the closing quote and resets its emotion/delivery, so surrounding narration cannot inherit the character voice. Repeat the cue for another quote from a different character. Intentional unquoted speech still keeps a speaker cue until the next speaker cue or quoted span ends; use `[speaker:narrator]` to resume narration explicitly in that case.
+Without speaker cues, straight, curly, and guillemet double quotes are treated as dialogue from the message’s character, and surrounding prose as narration. Native Lumiverse speech-detection rules are respected when available, including skipped asterisked actions. Otherwise asterisked prose uses the narrator. When several characters speak in one message, Readalong first uses `[speaker:Name]` cues, then guesses from the text around each quote (labels, *said Name* tags, nearby actions and back-and-forth turns). Guesses can be wrong; a cue is always more reliable. A quoted speaker cue ends at the closing quote and resets its emotion/delivery, so surrounding narration cannot inherit the character voice. Repeat the cue for another quote from a different character. Intentional unquoted speech still keeps a speaker cue until the next speaker cue or quoted span ends; use `[speaker:narrator]` to resume narration explicitly in that case.
 
 Speaker cues also pick up a saved character voice when the name matches one character in your library. For speakers without a character card, use **Add someone → Or anyone else, by name** and enter the exact name. A matching `[speaker:Name]` cue will select that assignment before falling back to the message’s main character. With voice prompting enabled, Readalong adds up to 100 assigned speaker names to the existing chat prompt so the model can use matching cues. There is no additional LLM call; these names add a small number of input tokens. A model can still miss or misattribute a cue. In the absence of a speaker assignment, the message's character voice or the default voice is used. If changing speech provider/model, choose compatible voice assignments again.
 
@@ -183,7 +194,7 @@ Vocal bursts are distinct from sustained style instructions. Gemini supports the
 - Leaves the host's message text nodes and stored message content intact. Uses browser CSS Highlights, with an overlay fallback.
 - Re-finds text after message DOM changes. Uses the currently verified Lumiverse message-content anchor; unusual display regex transformations, HTML islands, collapsed/virtualized messages, or complex formatting can prevent an inline match. The player always shows the current spoken sentence as a fallback. It does not automatically open a collapsed message or remount an offscreen virtualized message.
 - Skips code, images, entire custom XML/HTML metadata blocks and comment-delimited utility cards. Reads standard HTML prose and link labels and removes common Markdown decoration. Plain untagged metadata cannot be distinguished reliably from story prose; heavy custom rendering may still differ from the spoken source.
-- Uses ordinary speech synthesis only. No voice cloning, transcription, forced alignment, or additional analysis service is invoked.
+- Uses ordinary speech synthesis only. No voice cloning, transcription, forced alignment, or additional analysis service is invoked. The optional sound effects call Freesound's search with short fixed words like *door knock*; no story text is sent.
 
 ## Permissions
 
@@ -191,11 +202,11 @@ Vocal bursts are distinct from sustained style instructions. Gemini supports the
 |---|---|
 | `generation` | Detect completed replies for automatic preparation and identify the speaking character. |
 | `interceptor` | Add optional voice-cue instructions to the existing generation. |
-| `chat_mutation` | Read selected chat messages; no message writes are performed. |
+| `chat_mutation` | Read selected chat messages. The extension itself writes nothing to messages; with **Keep audio with the message** on, your browser uses Lumiverse's own save-audio route to attach the recording. |
 | `chats` | Verify that each requested chat belongs to the requesting user before reading it. |
 | `characters` | List characters and add the native character-editor Voice tab. |
 | `regex_scripts` | Install the extension-owned display-only cue filter. |
-| `cors_proxy` | Fetch voice/model lists and speech from OpenRouter or the selected local endpoint. |
+| `cors_proxy` | Fetch voice/model lists and speech from OpenRouter or the selected local endpoint, and, if sound effects are on, short sounds from Freesound. |
 | `ui_panels` | Create the movable floating playback widget; drawer playback remains usable without it. |
 
 Settings and keys are isolated per user even in operator installs. Responses to explicit frontend requests are routed back to the originating frontend session where the host supports session routing.
