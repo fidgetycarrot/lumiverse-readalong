@@ -103,3 +103,12 @@ test('long pronunciation expansions split safely without dropping audio or rewri
   expect(passages.map(p=>p.segment.text).join(' ')).toBe(applyPronunciations(text,rules));
   expect(passages.flatMap(p=>p.segments).every(s=>s.text===text)).toBe(true);
 });
+
+import {cueGender} from '../src/pronunciation';
+test('pronunciation cues can say whether a character sounds female or male',()=>{
+  const learned=learnPronunciations({},'[pronounce:Nyra|Nye-rah|female] Nyra entered. [pronounce:Odo|Oh-doh] Odo followed.');
+  expect(learned.nyra.gender).toBe('f');expect(learned.odo.gender).toBeUndefined();
+  const later=learnPronunciations(learned,'[pronounce:Odo|Something else|man] Odo laughed.');
+  expect(later.odo).toEqual({...learned.odo,gender:'m'});
+  expect(cueGender('Woman')).toBe('f');expect(cueGender('they')).toBeUndefined();
+});

@@ -45,7 +45,7 @@ describe('backend provider and session integration',()=>{
   test('pronunciation cues are injected by Readalong independently of emotion settings with no model request',async()=>{
     await call('save',{settings:{...DEFAULTS,promptEmotions:false}},'pronunciation-one');const before=requests.length;
     const input=[{role:'user',content:'Continue.'}],context={userId:'pronunciation-one',chatId:'pronunciation-one-chat'};
-    const result=await interceptor(input,context);expect(result[0].content).toContain('[pronounce:Name|Spoken spelling]');expect(result[0].content).not.toContain('[emotion:');
+    const result=await interceptor(input,context);expect(result[0].content).toContain('[pronounce:Name|Spoken spelling|female or male]');expect(result[0].content).not.toContain('[emotion:');
     expect(await interceptor(input,{...context,generationType:'quiet'})).toEqual(input);
     await call('save',{settings:{...DEFAULTS,promptEmotions:false,promptPronunciations:false}},'pronunciation-one');expect(await interceptor(input,context)).toEqual(input);expect(requests.length).toBe(before);
   });

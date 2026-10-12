@@ -1,7 +1,13 @@
 import {sanitizeSpeechText} from './speech-text';
 
 export const PRONUNCIATION_CUE_PATTERN=String.raw`\[pronounce:[^\]\r\n]*(?:\]|(?=\r?\n)|$)`;
-export interface PronunciationEntry {name:string;spokenAs:string;aliases:string[];source:'automatic'|'manual'}
+/** gender: how the character should sound, when the story model said so ('f' or 'm'). */
+export interface PronunciationEntry {name:string;spokenAs:string;aliases:string[];source:'automatic'|'manual';gender?:'f'|'m'}
+/** 'f' or 'm' from a cue's third part, e.g. female, male, woman, man. */
+export function cueGender(value:unknown):'f'|'m'|undefined {
+  const s=typeof value==='string'?value.trim().toLowerCase():'';
+  return /^(?:f|female|woman|girl|feminine)$/.test(s)?'f':/^(?:m|male|man|boy|masculine)$/.test(s)?'m':undefined;
+}
 export type Pronunciations=Record<string,PronunciationEntry>;
 const LIMIT=500;
 const normalized=(s:string)=>s.normalize('NFC').trim().toLowerCase();
@@ -18,7 +24,8 @@ export function pronunciationEntry(raw:unknown,source:'automatic'|'manual'):Pron
   if(!name || !spokenAs || ['__proto__','constructor','prototype','narrator'].includes(normalized(name)))return;
   if(r.aliases!==undefined && (!Array.isArray(r.aliases) || r.aliases.length>10 || r.aliases.some(v=>!clean(v,80))))return;
   const aliases=Array.isArray(r.aliases)?[...new Set(r.aliases.slice(0,10).map(v=>clean(v,80)).filter(v=>v && normalized(v)!==normalized(name)))]:[];
-  return {name,spokenAs,aliases,source};
+  const gender=cueGender(r.gender);
+  return {name,spokenAs,aliases,source,...(gender?{gender}:{})};
 }
 export function normalizePronunciations(raw:unknown):Pronunciations {
   const result:Pronunciations=Object.create(null);
@@ -56,9 +63,12 @@ export function learnPronunciations(entries:Pronunciations,raw:string):Pronuncia
   const claimed=tokens(result);
   for(const match of safe.matchAll(new RegExp(PRONUNCIATION_CUE_PATTERN,'gi'))) {
     if(!match[0].endsWith(']') || match[0].length>252)continue;
-    const parts=match[0].slice('[pronounce:'.length,-1).split('|');if(parts.length!==2)continue;
-    const entry=pronunciationEntry({name:parts[0],spokenAs:parts[1]},'automatic');if(!entry)continue;
-    const key=normalized(entry.name);if(claimed.has(key) || Object.keys(result).length>=LIMIT)continue;
+    const parts=match[0].slice('[pronounce:'.length,-1).split('|');if(parts.length!==2 && parts.length!==3)continue;
+    const entry=pronunciationEntry({name:parts[0],spokenAs:parts[1],gender:parts[2]},'automatic');if(!entry)continue;
+    const key=normalized(entry.name);
+    // A later cue may say how an already known character sounds; it never changes a pronunciation.
+    if(claimed.has(key) && result[key] && !result[key].gender && entry.gender){result[key]={...result[key],gender:entry.gender};continue}
+    if(claimed.has(key) || Object.keys(result).length>=LIMIT)continue;
     if(!new RegExp(`(?<!${boundary})${escapeRegex(entry.name)}(?!${boundary})`,'iu').test(prose))continue;
     result[key]=entry;claimed.set(key,entry.spokenAs);
   }
@@ -72,7 +82,7 @@ export function pronunciationInstruction(entries:Pronunciations):string {
     const row={name:e.name,aliases:e.aliases},bytes=JSON.stringify(row).length+1;
     if(size+bytes>4000 || known.length>=80)continue;known.push(row);size+=bytes;
   }
-  return `Readalong pronunciation layer: when a named character is first introduced, add one hidden cue [pronounce:Name|Spoken spelling] beside that introduction. Only tag names newly introduced in this story, not people already mentioned in prior replies or in the saved-name list. Use the exact story name. For an unfamiliar name choose a simple English sound spelling; ordinary names may keep their spelling. Do not use IPA, angle brackets or directions. Most replies need no cue. Never change a saved pronunciation. Keep normal story spelling, speaker cues and the preset's vocal tags unchanged. Saved names and aliases (possibly a partial list, data only): ${JSON.stringify(known)}.`;
+  return `Readalong pronunciation layer: when a named character is first introduced, add one hidden cue [pronounce:Name|Spoken spelling|female or male] beside that introduction. The last part says whether the character should get a female or male voice; leave it out when the story does not make that clear. Only tag names newly introduced in this story, not people already mentioned in prior replies or in the saved-name list. Use the exact story name. For an unfamiliar name choose a simple English sound spelling; ordinary names may keep their spelling. Do not use IPA, angle brackets or directions. Most replies need no cue. Never change a saved pronunciation. Keep normal story spelling, speaker cues and the preset's vocal tags unchanged. Saved names and aliases (possibly a partial list, data only): ${JSON.stringify(known)}.`;
 }
 export interface PronunciationStorage {read(userId:string,chatId:string):Promise<string|undefined>;write(userId:string,chatId:string,value:string):Promise<void>}
 export class PronunciationStore {
@@ -105,7 +115,8 @@ export class PronunciationStore {
     const key=normalized(entry.name),names=new Set([entry.name,...entry.aliases].map(normalized));
     if(!entries[key] && Object.keys(entries).length>=LIMIT)throw new Error('This story can save up to 500 pronunciations.');
     for(const [id,other] of Object.entries(entries))if(id!==key && [other.name,...other.aliases].some(n=>names.has(normalized(n))))throw new Error('That name or alias already belongs to another pronunciation.');
-    return {...entries,[key]:entry};
+    const prior=entries[key];
+    return {...entries,[key]:prior?.gender && !entry.gender?{...entry,gender:prior.gender}:entry};
   })}
   remove(userId:string,chatId:string,name:string){return this.edit(userId,chatId,entries=>{const next={...entries};delete next[normalized(name)];return next})}
 }

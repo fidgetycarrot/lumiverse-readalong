@@ -1,3 +1,4 @@
+import {attributeQuotes,canonicalSpeaker,type Roster} from './speaker-detect';
 import { sanitizeSpeechText,stripVocalTags } from './speech-text';
 import {PRONUNCIATION_CUE_PATTERN,stripPronunciationCues} from './pronunciation';
 import {deliveryStyle,isGeminiSpeechStyleModel} from './speech-style';
@@ -25,12 +26,13 @@ export function markVoiceGender(marks: Record<string,VoiceGender|'n'>, voice: st
 }
 export const CUE_PATTERN = String.raw`\[(?:emotion|delivery|speaker):[^\]\r\n]{1,80}\]|${PRONUNCIATION_CUE_PATTERN}`;
 export const HIDE_RULE_NAME = 'Readalong • Hide voice cues';
-export interface VoiceAssignment { voice: string; emotion: string; delivery: string; name?:string }
+/** gender: how the character should sound. auto: Readalong picked the voice. */
+export interface VoiceAssignment { voice: string; emotion: string; delivery: string; name?:string; aliases?:string[]; gender?:VoiceGender; auto?:boolean }
 export interface Settings {
   provider: 'lumiverse' | 'openrouter' | 'browser' | 'local';
   connectionId: string;
   model: string; voice: string; narratorVoice: string; localUrl: string;
-  enabled: boolean; follow: boolean; earlyPlayback:boolean; automaticPlayback:boolean; promptEmotions: boolean; useEmotions: boolean;promptPronunciations:boolean; personaName:string; npcVoice:string; voiceGenders:Record<string,VoiceGender|'n'>;
+  enabled: boolean; follow: boolean; earlyPlayback:boolean; automaticPlayback:boolean; promptEmotions: boolean; useEmotions: boolean;promptPronunciations:boolean; personaName:string; npcVoice:string; autoVoices:boolean; voiceGenders:Record<string,VoiceGender|'n'>;
   inheritVoices: boolean; widgetMinimized: boolean; widgetPosition: {x:number;y:number}|null;
   speed: number; volume: number;
   assignments: Record<string, VoiceAssignment>;
@@ -38,7 +40,7 @@ export interface Settings {
 export const DEFAULTS: Settings = {
   provider: 'openrouter', connectionId:'', model: 'google/gemini-3.8-flash-tts', voice: 'Kore', narratorVoice: '',
   localUrl: 'http://localhost:8880/v1', enabled: false, follow: false, earlyPlayback:true, automaticPlayback:false,
-  promptEmotions: true, useEmotions: true, promptPronunciations:true, personaName:'', npcVoice:'', voiceGenders:{}, inheritVoices:true, widgetMinimized:false, widgetPosition:null, speed: 1, volume: 0.85, assignments: {},
+  promptEmotions: true, useEmotions: true, promptPronunciations:true, personaName:'', npcVoice:'', autoVoices:true, voiceGenders:{}, inheritVoices:true, widgetMinimized:false, widgetPosition:null, speed: 1, volume: 0.85, assignments: {},
 };
 export interface SpeechSegment { text: string; speaker: string; emotion: string; delivery: string }
 export interface SpeechModel { id: string; name: string; voices: string[] }
@@ -67,7 +69,7 @@ export function normalizeSettings(raw: unknown): Settings {
   const assignments: Settings['assignments'] = {};
   if (r.assignments && typeof r.assignments === 'object') for (const [key, v] of Object.entries(r.assignments).slice(0, 500)) {
     if (!v || typeof v !== 'object' || ['__proto__','constructor','prototype'].includes(key)) continue;
-    assignments[key.slice(0, 200)] = { voice: str(v.voice, '', 160), emotion: enumValue(v.emotion, EMOTIONS, 'neutral'), delivery: enumValue(v.delivery, DELIVERIES, 'normal'), ...(typeof v.name==='string'?{name:str(v.name,'',80)}:{}) };
+    assignments[key.slice(0, 200)] = { voice: str(v.voice, '', 160), emotion: enumValue(v.emotion, EMOTIONS, 'neutral'), delivery: enumValue(v.delivery, DELIVERIES, 'normal'), ...(typeof v.name==='string'?{name:str(v.name,'',80)}:{}), ...(Array.isArray(v.aliases)?{aliases:[...new Set(v.aliases.filter((a:unknown):a is string=>typeof a==='string').map(a=>a.trim().slice(0,80)).filter(a=>a && !/[\[\]\r\n]/.test(a) && a.toLowerCase()!=='narrator'))].slice(0,10)}:{}), ...(v.gender==='f' || v.gender==='m'?{gender:v.gender}:{}), ...(v.auto===true?{auto:true}:{}) };
   }
   return {
     connectionId: str(r.connectionId,'',160),
@@ -75,7 +77,7 @@ export function normalizeSettings(raw: unknown): Settings {
     model: str(r.model, DEFAULTS.model), voice: str(r.voice, DEFAULTS.voice), narratorVoice: str(r.narratorVoice, ''), npcVoice: str(r.npcVoice, ''), voiceGenders: Object.fromEntries(Object.entries(r.voiceGenders && typeof r.voiceGenders==='object' && !Array.isArray(r.voiceGenders) ? r.voiceGenders as Record<string,unknown> : {}).filter(([k,v]) => k.length>0 && k.length<=100 && k===k.trim().toLowerCase() && (v==='f' || v==='m' || v==='n')).slice(0,500)) as Record<string,VoiceGender|'n'>,
     localUrl: str(r.localUrl, DEFAULTS.localUrl, 500),
     enabled: typeof r.enabled==='boolean'?r.enabled:DEFAULTS.enabled, follow: r.follow === true, earlyPlayback:r.earlyPlayback!==false, automaticPlayback:r.automaticPlayback===true,
-    promptEmotions: r.promptEmotions !== false, useEmotions: r.useEmotions !== false,promptPronunciations:r.promptPronunciations!==false, personaName:typeof r.personaName==='string' && r.personaName.trim().length<=80 && !/[\[\]\r\n]/.test(r.personaName)?r.personaName.trim():'', inheritVoices:r.inheritVoices!==false, widgetMinimized:r.widgetMinimized===true, widgetPosition,
+    promptEmotions: r.promptEmotions !== false, useEmotions: r.useEmotions !== false,promptPronunciations:r.promptPronunciations!==false, autoVoices:r.autoVoices!==false, personaName:typeof r.personaName==='string' && r.personaName.trim().length<=80 && !/[\[\]\r\n]/.test(r.personaName)?r.personaName.trim():'', inheritVoices:r.inheritVoices!==false, widgetMinimized:r.widgetMinimized===true, widgetPosition,
     speed: clamp(r.speed, 0.5, 2, 1), volume: clamp(r.volume, 0, 1, .85), assignments,
   };
 }
@@ -109,7 +111,7 @@ export function splitSentences(text: string): string[] {
       if(chunk)chunks.push(chunk);return chunks;
     });
 }
-export function parseSegments(raw: string, defaultSpeaker = '', rules:SpeechRules=DEFAULT_SPEECH_RULES): SpeechSegment[] {
+export function parseSegments(raw: string, defaultSpeaker = '', rules:SpeechRules=DEFAULT_SPEECH_RULES, roster?:Roster): SpeechSegment[] {
   raw = stripPronunciationCues(sanitizeSpeechText(raw,true)).replace(/!\[[^\]]*\]\([^)]*\)/g,' ')
     .replace(/\[([^\]]+)\]\([^)]*\)/g,'$1');
   const cue = new RegExp(`\\[(emotion|delivery|speaker):([^\\]\\r\\n]{1,80})\\]`, 'gi');
@@ -132,7 +134,7 @@ export function parseSegments(raw: string, defaultSpeaker = '', rules:SpeechRule
     };
     for(const match of text.matchAll(cue)) {
       append(text.slice(offset,match.index));const value=match[2].trim(),kind=match[1].toLowerCase();
-      if(kind==='speaker'){speaker=value;explicitSpeaker=true;emotion='';delivery=''}
+      if(kind==='speaker'){speaker=canonicalSpeaker(roster,value)??value;explicitSpeaker=true;emotion='';delivery=''}
       if(kind==='emotion')emotion=enumValue(value,EMOTIONS,'neutral');
       if(kind==='delivery')delivery=enumValue(value,DELIVERIES,'normal');
       offset=match.index!+match[0].length;
@@ -145,9 +147,14 @@ export function parseSegments(raw: string, defaultSpeaker = '', rules:SpeechRule
   const pattern=/"[^"\n]*(?:\n[^"\n]*)*"|“[^”]*”|«[^»]*»|(?<!\*)\*(?!\*)([^*]+)\*(?!\*)/g;
   const detection=raw.replace(new RegExp(CUE_PATTERN,'gi'),match=>' '.repeat(match.length));
   let cursor=0;
+  // Without a cue, work out who said each quote from the text around it.
+  const spans=[...detection.matchAll(pattern)].filter(m=>m[1]===undefined).map(m=>({start:m.index!,end:m.index!+m[0].length}));
+  const guesses=roster && rules.quoted==='speech'?attributeQuotes(detection,spans,roster):[];
+  let quoteIndex=0;
   for(const match of detection.matchAll(pattern)) {
     classify(raw.slice(cursor,match.index),rules.undecorated);
     const quoted=match[1]===undefined;
+    if(quoted){const guess=guesses[quoteIndex++];if(guess && !explicitSpeaker){speaker=guess;explicitSpeaker=true}}
     classify(raw.slice(match.index,match.index!+match[0].length),quoted?rules.quoted:rules.asterisked);
     // A character cue attached to dialogue must not make the following
     // narrative use that character's voice or performance directions.

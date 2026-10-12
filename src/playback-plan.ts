@@ -3,6 +3,7 @@ import type { NativeConnection } from './native-tts';
 import { stripVocalTags,sanitizeLegacySpeechText } from './speech-text';
 import {applyPronunciations,type Pronunciations} from './pronunciation';
 import {isGeminiSpeechStyleModel} from './speech-style';
+import {buildRoster,type RosterEntry} from './speaker-detect';
 
 export const MAX_PASSAGE_CHARS=3000;
 export const MAX_NATIVE_PASSAGE_CHARS=12000;
@@ -18,13 +19,28 @@ export function isUnvoicedExtra(speaker:string,settings:Settings,context:VoiceCo
   if(context.characters.some(c=>firstName(c.name)===name || c.name.trim().toLowerCase()===name))return false;
   return true;
 }
+/** Everyone a quote could be attributed to: the cast, the reply's character, you, and names the story has picked up. */
+export function storyRoster(settings:Settings,context:VoiceContext,mainSpeaker?:string):RosterEntry[] {
+  const entries:RosterEntry[]=[];
+  if(mainSpeaker)entries.push({name:mainSpeaker});
+  if(settings.personaName)entries.push({name:settings.personaName});
+  const active=context.characters.find(c=>c.id===context.characterId);if(active)entries.push({name:active.name});
+  for(const [key,assignment] of Object.entries(settings.assignments)){
+    const name=key.startsWith('id:')?context.characters.find(c=>c.id===key.slice(3))?.name:assignment.name??key.slice(5);
+    if(name)entries.push({name,aliases:assignment.aliases});
+  }
+  for(const entry of Object.values(context.pronunciations??{}))entries.push({name:entry.name,aliases:entry.aliases});
+  return entries;
+}
 /** A user's message belongs to their configured You row, even if the host uses their full persona name. */
 export function planMessageSpeech(message:MessageInfo,settings:Settings,context:VoiceContext,rules:SpeechRules=DEFAULT_SPEECH_RULES):SpeechPassage[] {
   const speaker=message.isUser?settings.personaName||message.name:message.name;
   // Plain user input is their own speech. Keep explicit skips, narrated actions,
   // and speaker cues; assistant narration still follows the host's rules.
   const effectiveRules=message.isUser && rules.undecorated!=='skip'?{...rules,undecorated:'speech' as const}:rules;
-  const segments=parseSegments(context.legacyAudio?sanitizeLegacySpeechText(message.content,true):message.content,speaker,effectiveRules);
+  // Old recordings were made before speaker detection; keep their exact requests.
+  const roster=context.legacyAudio?undefined:buildRoster(storyRoster(settings,context,speaker));
+  const segments=parseSegments(context.legacyAudio?sanitizeLegacySpeechText(message.content,true):message.content,speaker,effectiveRules,roster);
   if(message.isUser && settings.personaName){
     for(const segment of segments){
       if(segment.speaker.trim().toLowerCase()===message.name.trim().toLowerCase() && !settings.assignments[`name:${segment.speaker.toLowerCase()}`])segment.speaker=speaker;
