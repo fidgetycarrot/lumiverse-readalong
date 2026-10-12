@@ -8,7 +8,13 @@ import {buildRoster,type RosterEntry} from './speaker-detect';
 export const MAX_PASSAGE_CHARS=3000;
 export const MAX_NATIVE_PASSAGE_CHARS=12000;
 export interface SpeechPassage { segment:SpeechSegment;segments:SpeechSegment[];settings:Settings;voice:string }
-export interface VoiceContext { characters:CharacterInfo[];characterId?:string;connections?:NativeConnection[];mainSpeaker?:string;narrationVoice?:NativeVoiceRef;pronunciations?:Pronunciations;legacyAudio?:boolean;overrides?:{narrator?:unknown;characters?:Record<string,unknown>} }
+export interface VoiceContext { characters:CharacterInfo[];characterId?:string;connections?:NativeConnection[];mainSpeaker?:string;narrationVoice?:NativeVoiceRef;pronunciations?:Pronunciations;legacyAudio?:boolean;overrides?:{narrator?:unknown;characters?:Record<string,unknown>};
+  /** The reply's card tells the story rather than playing one person. */
+  storyteller?:boolean;
+  /** On a storyteller card, who speaks lines that name nobody. */
+  lead?:string;
+  /** People the story text shows, found by reading it (see people.ts). */
+  people?:RosterEntry[] }
 
 const firstName=(name:string)=>name.split('||')[0].trim().toLowerCase();
 /** True for a speaker who is neither the reply's own character, a library character, nor someone with a saved voice. */
@@ -24,17 +30,21 @@ export function storyRoster(settings:Settings,context:VoiceContext,mainSpeaker?:
   const entries:RosterEntry[]=[];
   if(mainSpeaker)entries.push({name:mainSpeaker});
   if(settings.personaName)entries.push({name:settings.personaName});
-  const active=context.characters.find(c=>c.id===context.characterId);if(active)entries.push({name:active.name});
+  const active=context.storyteller?undefined:context.characters.find(c=>c.id===context.characterId);if(active)entries.push({name:active.name});
   for(const [key,assignment] of Object.entries(settings.assignments)){
     const name=key.startsWith('id:')?context.characters.find(c=>c.id===key.slice(3))?.name:assignment.name??key.slice(5);
     if(name)entries.push({name,aliases:assignment.aliases});
   }
   for(const entry of Object.values(context.pronunciations??{}))entries.push({name:entry.name,aliases:entry.aliases});
+  entries.push(...context.people??[]);
   return entries;
 }
 /** A user's message belongs to their configured You row, even if the host uses their full persona name. */
 export function planMessageSpeech(message:MessageInfo,settings:Settings,context:VoiceContext,rules:SpeechRules=DEFAULT_SPEECH_RULES):SpeechPassage[] {
-  const speaker=message.isUser?settings.personaName||message.name:message.name;
+  // A storyteller card is not a speaker: its unnamed lines go to the chosen lead, or Everyone else.
+  const storyteller=!message.isUser && !!context.storyteller;
+  const speaker=message.isUser?settings.personaName||message.name:storyteller?context.lead||'Everyone else':message.name;
+  if(storyteller)context={...context,characterId:undefined};
   // Plain user input is their own speech. Keep explicit skips, narrated actions,
   // and speaker cues; assistant narration still follows the host's rules.
   const effectiveRules=message.isUser && rules.undecorated!=='skip'?{...rules,undecorated:'speech' as const}:rules;
@@ -46,7 +56,8 @@ export function planMessageSpeech(message:MessageInfo,settings:Settings,context:
       if(segment.speaker.trim().toLowerCase()===message.name.trim().toLowerCase() && !settings.assignments[`name:${segment.speaker.toLowerCase()}`])segment.speaker=speaker;
     }
   }
-  return planSpeech(segments,settings,{...context,mainSpeaker:speaker,...(message.isUser?{characterId:undefined}:{})});
+  // On a storyteller card nobody is the reply's own character, so voiceless speakers use Everyone else.
+  return planSpeech(segments,settings,{...context,mainSpeaker:storyteller?'':speaker,...(message.isUser?{characterId:undefined}:{})});
 }
 /** Resolve voices before batching, so narrator/character boundaries survive. */
 export function planSpeech(segments:SpeechSegment[], settings:Settings, context:VoiceContext):SpeechPassage[] {

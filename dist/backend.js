@@ -39,7 +39,7 @@ function migrateStoryCasts(settings) {
 }
 function castView(settings, chatId) {
   const story = chatId ? settings.stories[chatId] : undefined;
-  return { ...settings, assignments: { ...settings.assignments, ...story?.names ?? {} } };
+  return { ...settings, personaName: story?.you ?? settings.personaName, assignments: { ...settings.assignments, ...story?.names ?? {} } };
 }
 
 // src/speaker-detect.ts
@@ -316,7 +316,8 @@ var DEFAULTS = {
   speed: 1,
   volume: 0.85,
   assignments: {},
-  stories: {}
+  stories: {},
+  storytellers: []
 };
 function readVoiceRef(raw) {
   if (!raw || typeof raw !== "object")
@@ -325,6 +326,9 @@ function readVoiceRef(raw) {
   if (typeof v.connectionId !== "string" || !v.connectionId || v.connectionId.length > 160)
     return;
   return { connectionId: v.connectionId, voice: typeof v.voice === "string" ? v.voice.slice(0, 160) : "" };
+}
+function speakerName(v) {
+  return typeof v === "string" && v.trim() && v.trim().length <= 80 && !/[\[\]\r\n]/.test(v) && v.trim().toLowerCase() !== "narrator" ? v.trim() : "";
 }
 function normalizeSettings(raw) {
   const r = raw && typeof raw === "object" ? raw : {};
@@ -347,6 +351,8 @@ function normalizeSettings(raw) {
         ...members.length ? { members } : {},
         ...typeof v.title === "string" && v.title.trim() ? { title: str(v.title, "", 120) } : {},
         ...typeof v.characterId === "string" && v.characterId.length <= 160 ? { characterId: v.characterId } : {},
+        ...speakerName(v.you) ? { you: speakerName(v.you) } : {},
+        ...speakerName(v.lead) ? { lead: speakerName(v.lead) } : {},
         updatedAt: Number.isFinite(Number(v.updatedAt)) ? Number(v.updatedAt) : 0
       };
     }
@@ -386,7 +392,8 @@ function normalizeSettings(raw) {
     speed: clamp(r.speed, 0.5, 2, 1),
     volume: clamp(r.volume, 0, 1, 0.85),
     assignments,
-    stories
+    stories,
+    storytellers: Array.isArray(r.storytellers) ? [...new Set(r.storytellers.filter((id) => typeof id === "string" && id.length > 0 && id.length <= 160))].slice(0, 500) : []
   };
 }
 function clamp(v, min, max, fallback) {

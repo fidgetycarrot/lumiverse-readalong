@@ -25,7 +25,40 @@ export function migrateStoryCasts(settings:Settings):boolean {
 /** The settings as seen from one story: shared voices plus that story's names. */
 export function castView(settings:Settings,chatId?:string|null):Settings {
   const story=chatId?settings.stories[chatId]:undefined;
-  return {...settings,assignments:{...settings.assignments,...(story?.names??{})}};
+  return {...settings,personaName:story?.you??settings.personaName,assignments:{...settings.assignments,...(story?.names??{})}};
+}
+
+/** Your name in this story (falls back to your usual name). */
+export function youIn(settings:Settings,chatId?:string|null):string { return (chatId?settings.stories[chatId]?.you:undefined)??settings.personaName }
+
+/** Set your name for one story. The voice you had there moves to the new name. Empty goes back to your usual name. */
+export function setStoryYou(settings:Settings,chatId:string,name:string) {
+  const s=story(settings,chatId),before=youIn(settings,chatId),after=name.trim()||settings.personaName;
+  const oldKey=before?`name:${before.toLowerCase()}`:'',newKey=after?`name:${after.toLowerCase()}`:'';
+  const voice=s.names[oldKey]??(oldKey?settings.assignments[oldKey]:undefined);
+  if(s.you)delete s.names[oldKey];
+  if(name.trim() && name.trim()!==settings.personaName){
+    s.you=name.trim();
+    if(voice && newKey && !s.names[newKey])s.names[newKey]={...voice,name:name.trim()};
+  } else delete s.you;
+  s.updatedAt=Date.now();
+  return newKey;
+}
+
+/** Whether a card tells the story rather than playing one person. */
+export function isStoryteller(settings:Settings,characterId?:string|null):boolean { return !!characterId && settings.storytellers.includes(characterId) }
+export function setStoryteller(settings:Settings,characterId:string,storyteller:boolean) {
+  const all=new Set(settings.storytellers);
+  if(storyteller)all.add(characterId);else all.delete(characterId);
+  settings.storytellers=[...all];
+}
+/** Who speaks lines that name nobody, on a storyteller card. */
+export const NOBODY='Everyone else';
+export function leadIn(settings:Settings,chatId?:string|null):string { return (chatId?settings.stories[chatId]?.lead:undefined)??NOBODY }
+export function setLead(settings:Settings,chatId:string,name:string) {
+  const s=story(settings,chatId);
+  if(name && name!==NOBODY)s.lead=name;else delete s.lead;
+  s.updatedAt=Date.now();
 }
 
 function story(settings:Settings,chatId:string):StoryCast {

@@ -391,7 +391,8 @@ var DEFAULTS = {
   speed: 1,
   volume: 0.85,
   assignments: {},
-  stories: {}
+  stories: {},
+  storytellers: []
 };
 var DEFAULT_SPEECH_RULES = { quoted: "speech", asterisked: "narration", undecorated: "narration" };
 function readVoiceRef(raw) {
@@ -408,6 +409,9 @@ function speakerCharacterId(speaker, characters, fallback) {
     return;
   const matches = characters.filter((c) => c.name.trim().toLowerCase() === name || c.name.split("||")[0].trim().toLowerCase() === name);
   return matches.length === 1 ? matches[0].id : fallback;
+}
+function speakerName(v) {
+  return typeof v === "string" && v.trim() && v.trim().length <= 80 && !/[\[\]\r\n]/.test(v) && v.trim().toLowerCase() !== "narrator" ? v.trim() : "";
 }
 function normalizeSettings(raw) {
   const r = raw && typeof raw === "object" ? raw : {};
@@ -430,6 +434,8 @@ function normalizeSettings(raw) {
         ...members.length ? { members } : {},
         ...typeof v.title === "string" && v.title.trim() ? { title: str(v.title, "", 120) } : {},
         ...typeof v.characterId === "string" && v.characterId.length <= 160 ? { characterId: v.characterId } : {},
+        ...speakerName(v.you) ? { you: speakerName(v.you) } : {},
+        ...speakerName(v.lead) ? { lead: speakerName(v.lead) } : {},
         updatedAt: Number.isFinite(Number(v.updatedAt)) ? Number(v.updatedAt) : 0
       };
     }
@@ -469,7 +475,8 @@ function normalizeSettings(raw) {
     speed: clamp(r.speed, 0.5, 2, 1),
     volume: clamp(r.volume, 0, 1, 0.85),
     assignments,
-    stories
+    stories,
+    storytellers: Array.isArray(r.storytellers) ? [...new Set(r.storytellers.filter((id) => typeof id === "string" && id.length > 0 && id.length <= 160))].slice(0, 500) : []
   };
 }
 function clamp(v, min, max, fallback) {
@@ -1569,7 +1576,7 @@ function storyRoster(settings, context, mainSpeaker) {
     entries.push({ name: mainSpeaker });
   if (settings.personaName)
     entries.push({ name: settings.personaName });
-  const active = context.characters.find((c) => c.id === context.characterId);
+  const active = context.storyteller ? undefined : context.characters.find((c) => c.id === context.characterId);
   if (active)
     entries.push({ name: active.name });
   for (const [key, assignment] of Object.entries(settings.assignments)) {
@@ -1579,10 +1586,14 @@ function storyRoster(settings, context, mainSpeaker) {
   }
   for (const entry of Object.values(context.pronunciations ?? {}))
     entries.push({ name: entry.name, aliases: entry.aliases });
+  entries.push(...context.people ?? []);
   return entries;
 }
 function planMessageSpeech(message, settings, context, rules = DEFAULT_SPEECH_RULES) {
-  const speaker = message.isUser ? settings.personaName || message.name : message.name;
+  const storyteller = !message.isUser && !!context.storyteller;
+  const speaker = message.isUser ? settings.personaName || message.name : storyteller ? context.lead || "Everyone else" : message.name;
+  if (storyteller)
+    context = { ...context, characterId: undefined };
   const effectiveRules = message.isUser && rules.undecorated !== "skip" ? { ...rules, undecorated: "speech" } : rules;
   const roster = context.legacyAudio ? undefined : buildRoster(storyRoster(settings, context, speaker));
   const segments = parseSegments(context.legacyAudio ? sanitizeLegacySpeechText(message.content, true) : message.content, speaker, effectiveRules, roster);
@@ -1592,7 +1603,7 @@ function planMessageSpeech(message, settings, context, rules = DEFAULT_SPEECH_RU
         segment.speaker = speaker;
     }
   }
-  return planSpeech(segments, settings, { ...context, mainSpeaker: speaker, ...message.isUser ? { characterId: undefined } : {} });
+  return planSpeech(segments, settings, { ...context, mainSpeaker: storyteller ? "" : speaker, ...message.isUser ? { characterId: undefined } : {} });
 }
 function planSpeech(segments, settings, context) {
   const passages = [];
@@ -1749,7 +1760,48 @@ var EARLIER = "earlier";
 var MAX_STORIES = 300;
 function castView(settings, chatId) {
   const story = chatId ? settings.stories[chatId] : undefined;
-  return { ...settings, assignments: { ...settings.assignments, ...story?.names ?? {} } };
+  return { ...settings, personaName: story?.you ?? settings.personaName, assignments: { ...settings.assignments, ...story?.names ?? {} } };
+}
+function youIn(settings, chatId) {
+  return (chatId ? settings.stories[chatId]?.you : undefined) ?? settings.personaName;
+}
+function setStoryYou(settings, chatId, name) {
+  const s = story(settings, chatId), before = youIn(settings, chatId), after = name.trim() || settings.personaName;
+  const oldKey = before ? `name:${before.toLowerCase()}` : "", newKey = after ? `name:${after.toLowerCase()}` : "";
+  const voice = s.names[oldKey] ?? (oldKey ? settings.assignments[oldKey] : undefined);
+  if (s.you)
+    delete s.names[oldKey];
+  if (name.trim() && name.trim() !== settings.personaName) {
+    s.you = name.trim();
+    if (voice && newKey && !s.names[newKey])
+      s.names[newKey] = { ...voice, name: name.trim() };
+  } else
+    delete s.you;
+  s.updatedAt = Date.now();
+  return newKey;
+}
+function isStoryteller(settings, characterId) {
+  return !!characterId && settings.storytellers.includes(characterId);
+}
+function setStoryteller(settings, characterId, storyteller) {
+  const all = new Set(settings.storytellers);
+  if (storyteller)
+    all.add(characterId);
+  else
+    all.delete(characterId);
+  settings.storytellers = [...all];
+}
+var NOBODY = "Everyone else";
+function leadIn(settings, chatId) {
+  return (chatId ? settings.stories[chatId]?.lead : undefined) ?? NOBODY;
+}
+function setLead(settings, chatId, name) {
+  const s = story(settings, chatId);
+  if (name && name !== NOBODY)
+    s.lead = name;
+  else
+    delete s.lead;
+  s.updatedAt = Date.now();
 }
 function story(settings, chatId) {
   return settings.stories[chatId] ??= { names: {}, updatedAt: Date.now() };
@@ -1868,6 +1920,83 @@ function namesElsewhere(settings, chatId) {
       result.push({ key, name: a.name ?? key.slice(5), assignment: a, from: id === EARLIER ? "saved earlier" : s.title ?? "another story" });
     }
   return result.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+// src/people.ts
+var NOT_PEOPLE = new Set(["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december", "god", "gods", "lord", "lady", "sir", "madam", "ma", "mom", "mum", "dad", "mother", "father", "okay", "hey", "hi", "hello", "please", "thanks", "sorry", "no", "yes", "oh", "um", "uh", "hmm", "wait", "look", "listen", "come", "go", "stop", "let", "don", "didn", "won", "can", "isn", "wasn", "that", "this", "what", "where", "when", "why", "how", "who", "which", "whatever", "nothing", "everything", "anything", "somewhere", "maybe", "perhaps", "not", "never", "always", "all", "some", "any", "each", "every", "most", "many", "much", "more", "less", "first", "last", "next", "other", "another", "such", "very", "too", "also", "only", "just", "even", "still", "yet", "already", "almost", "enough", "quite", "rather", "really", "well", "here", "there", "now", "then", "today", "tonight", "tomorrow", "yesterday", "chapter", "part", "scene", "end", "ooc", "note", "system", "user", "assistant"]);
+var FEMALE = /\b(she|her|hers|herself)\b/gi;
+var MALE = /\b(he|him|his|himself)\b/gi;
+var WORD = /\p{Lu}[\p{Ll}\p{M}'’-]+/gu;
+function narration(text) {
+  return text.replace(/\[[^\]\n]{0,200}\]/g, " ").replace(/"[^"\n]*"|“[^”\n]*”|«[^»\n]*»/g, " … ").replace(/[*_#>~`]/g, " ");
+}
+function sentences2(text) {
+  return text.split(/(?<=[.!?…])\s+|\n+/).map((s) => s.trim()).filter(Boolean);
+}
+var usable = (word) => {
+  const w = word.replace(/['’]s$/, "").toLowerCase();
+  return w.length > 1 && !NOT_NAMES.has(w) && !TITLES.has(w) && !NOT_PEOPLE.has(w);
+};
+var clean2 = (word) => word.replace(/['’]s$/, "");
+function findPeople(texts, known = []) {
+  const skip = new Set(known.flatMap((n) => [n.toLowerCase(), n.split(/\s+/)[0].toLowerCase()]));
+  const stats = new Map;
+  const stat = (name) => {
+    const key = name.toLowerCase();
+    let s = stats.get(key);
+    if (!s) {
+      s = { name, seen: 0, mid: 0, speaks: 0, f: 0, m: 0 };
+      stats.set(key, s);
+    }
+    return s;
+  };
+  const verbAfter = new RegExp(String.raw`^\s*(?:\p{L}+ly\s+)?${SPEECH_VERBS}\b`, "iu"), verbBefore = new RegExp(String.raw`${SPEECH_VERBS}\s*$`, "iu");
+  for (const text of texts) {
+    const list = sentences2(narration(text));
+    list.forEach((sentence, i) => {
+      const words = [...sentence.matchAll(WORD)].filter((m) => usable(m[0]));
+      const names = new Set(words.map((m) => clean2(m[0]).toLowerCase()).filter((n) => !skip.has(n)));
+      for (const m of words) {
+        const name = clean2(m[0]);
+        if (skip.has(name.toLowerCase()))
+          continue;
+        const s = stat(name);
+        s.seen++;
+        const before = sentence.slice(0, m.index).replace(/[\s…,;:—–-]+$/, "");
+        if (before && !/[.!?…]$/.test(before))
+          s.mid++;
+        const after = sentence.slice(m.index + m[0].length);
+        if (verbAfter.test(after) || verbBefore.test(before))
+          s.speaks++;
+      }
+      if (names.size !== 1)
+        return;
+      const first = words.find((m) => !skip.has(clean2(m[0]).toLowerCase()));
+      if (!first || sentence.slice(0, first.index).match(WORD)?.some((w) => usable(w)))
+        return;
+      const s = stat(clean2(first[0]));
+      let window2 = sentence.slice(first.index + first[0].length);
+      const next = list[i + 1];
+      if (next) {
+        const others = [...next.matchAll(WORD)].filter((m) => usable(m[0]) && clean2(m[0]).toLowerCase() !== s.name.toLowerCase());
+        if (!others.length || /^(she|he|her|his)\b/i.test(next))
+          window2 += " " + next;
+      }
+      s.f += (window2.match(FEMALE) ?? []).length + (window2.match(/\bshe\b/gi) ?? []).length;
+      s.m += (window2.match(MALE) ?? []).length + (window2.match(/\bhe\b/gi) ?? []).length;
+    });
+  }
+  const people = [];
+  for (const s of [...stats.values()].sort((a, b) => b.seen - a.seen)) {
+    const pronouns = s.f + s.m;
+    if (!(s.mid || s.seen > 1 || pronouns >= 2))
+      continue;
+    if (!s.speaks && pronouns < 2)
+      continue;
+    const gender = pronouns >= 2 && s.f >= pronouns * 0.75 ? "f" : pronouns >= 2 && s.m >= pronouns * 0.75 ? "m" : undefined;
+    people.push({ name: s.name, ...gender ? { gender } : {} });
+  }
+  return people.slice(0, 60);
 }
 
 // src/saved-recording.ts
@@ -2457,6 +2586,7 @@ function timeLabel(seconds) {
 function setup(ctx) {
   let settings = normalizeSettings(DEFAULTS), ready = false, initialized = false, disposed = false;
   const hasKeys = { openrouter: false, local: false, freesound: false }, frontendId = crypto.randomUUID();
+  let storyPeople = [], peopleFor = "";
   const castDrafts = new Map, openCast = new Set;
   let castInitialized = false, addOpen = false, voiceQuery = "", voiceFilter = "all", fixName = "", fixSay = "", viewChosen = false;
   const addedCast = new Set, addedNames = new Map, sayDrafts = new Map, moreOpen = new Set, testPick = new Map;
@@ -3388,17 +3518,19 @@ function setup(ctx) {
   async function castNewSpeakers(message, context, rules) {
     if (!settings.autoVoices || message.isUser || settings.provider === "browser")
       return [];
-    const main = message.name, roster = buildRoster(storyRoster(settings, context, main));
+    const storyteller = !!context.storyteller, main = storyteller ? context.lead || NOBODY : message.name, roster = buildRoster(storyRoster(settings, context, main));
     const speakers = [...new Set(parseSegments(message.content, main, rules ?? DEFAULT_SPEECH_RULES, roster).map((s) => s.speaker))];
     const story = Object.values(context.pronunciations ?? {}), chatId = ctx.getActiveChat().chatId, view = castView(settings, chatId);
     const added = autoCast(view, {
       speakers,
       voices: voiceNames(),
       genderOfVoice: (v) => voiceGender(settings, v),
-      genderOf: (n) => story.find((e) => [e.name, ...e.aliases].some((a) => a.toLowerCase() === n.toLowerCase()))?.gender,
+      genderOf: (n) => story.find((e) => [e.name, ...e.aliases].some((a) => a.toLowerCase() === n.toLowerCase()))?.gender ?? readPeople(message.content).find((p) => p.name.toLowerCase() === n.toLowerCase())?.gender,
       needsVoice: (n) => {
+        if (n === NOBODY)
+          return false;
         const a = view.assignments[`name:${n.toLowerCase()}`];
-        return a ? !a.voice : isUnvoicedExtra(n, view, { ...context, mainSpeaker: main });
+        return a ? !a.voice : isUnvoicedExtra(n, view, { ...context, mainSpeaker: storyteller ? "" : main });
       }
     });
     const names = Object.values(added).map((a) => a.name);
@@ -3502,7 +3634,10 @@ function setup(ctx) {
         characterId: currentMessage.characterId,
         connections: nativeConnections,
         mainSpeaker: message.name,
-        pronunciations: await refreshPronunciations(chatId, options.restoreOnly ? undefined : message.id)
+        pronunciations: await refreshPronunciations(chatId, options.restoreOnly ? undefined : message.id),
+        storyteller: !message.isUser && isStoryteller(settings, currentMessage.characterId),
+        lead: leadIn(settings, chatId),
+        people: readPeople(message.content).map((p) => ({ name: p.name }))
       };
       let rules, hostAutomaticTts = false;
       if (snapshot.provider === "lumiverse") {
@@ -3553,7 +3688,7 @@ function setup(ctx) {
         const desiredKey = await preparationHash([messageKey, requests(currentPassages)]);
         let audioKey = desiredKey, plan = recordingPlan(currentPassages, nativeConnections);
         let partial;
-        if (retainedParts?.userId === cacheUserId && retainedParts.recording.messageKey === messageKey && (!options.updateAudio || retainedParts.key === desiredKey)) {
+        if (retainedParts?.userId === cacheUserId && retainedParts.recording.messageKey === messageKey && retainedParts.clips.some(Boolean) && (!options.updateAudio || retainedParts.key === desiredKey)) {
           audioKey = retainedParts.key;
           plan = retainedParts.recording.plan;
           partial = Array.from(retainedParts.clips);
@@ -3939,9 +4074,21 @@ function setup(ctx) {
     decorateMessages();
     await ensureStory(chatId);
   }
+  function readPeople(extra) {
+    const chatId = ctx.getActiveChat().chatId ?? "", key = `${chatId}:${messages.length}:${extra?.length ?? 0}`;
+    if (peopleFor === key)
+      return storyPeople;
+    const card = characters.find((c) => c.id === ctx.getActiveChat().characterId)?.name.split("||")[0].trim();
+    const known = [youIn(settings, chatId), ...card && !isStoryteller(settings, ctx.getActiveChat().characterId) ? [card] : [], NOBODY].filter(Boolean);
+    storyPeople = findPeople([...messages.slice(-60).map((m) => m.content), ...extra ? [extra] : []], known);
+    peopleFor = key;
+    return storyPeople;
+  }
   async function ensureStory(chatId) {
     if (!messages.length || ctx.getActiveChat().chatId !== chatId)
       return;
+    peopleFor = "";
+    readPeople();
     const first = !settings.stories[chatId];
     const claimed = claimEarlier(settings, chatId, messages.map((m) => m.content), characters);
     let title = "";
@@ -4531,6 +4678,72 @@ function setup(ctx) {
     const only = spelling && [entry.name, ...entry.aliases].includes(spelling) ? spelling : undefined;
     return preview(voice, assignment, { text: pronunciationSample(entry, only), entries: normalizePronunciations({ [entry.name]: entry }) });
   }
+  function youKey() {
+    const y = youIn(settings, ctx.getActiveChat().chatId);
+    return y ? `name:${y.toLowerCase()}` : "";
+  }
+  function youNameRow(chatId, inStartBox = false) {
+    const wrap = el("div", "", "ra-stack"), current = youIn(settings, chatId), usual = settings.personaName, own = settings.stories[chatId]?.you;
+    let typed = current;
+    const input = textInput(current, (v) => typed = v);
+    input.maxLength = 80;
+    input.placeholder = "The name you play as here";
+    input.dataset.raYou = "name";
+    const row = el("div", "", "ra-row ra-end");
+    row.append(field(inStartBox ? "Who are you in this story?" : "Your name in this story", input), button(current && !inStartBox ? "Change" : "Save", () => safe(async () => {
+      const name = typed.trim();
+      if (name && !validSpeaker(name))
+        throw new Error("Type the name you play as, up to 80 letters.");
+      if (!name && !usual)
+        throw new Error("Type the name you play as.");
+      const key = setStoryYou(settings, chatId, name);
+      if (key)
+        openCast.add(key);
+      await saveSettings();
+      renderAssignments();
+      notice(name && name !== usual ? `In this story you are ${name}.` : `In this story you are ${usual}, as usual.`);
+    }), inStartBox));
+    wrap.append(row);
+    if (usual && own) {
+      const back = button(`Use ${usual} here`, () => safe(async () => {
+        setStoryYou(settings, chatId, "");
+        await saveSettings();
+        renderAssignments();
+        notice(`In this story you are ${usual}, as usual.`);
+      }));
+      back.classList.add("ra-quiet");
+      const note = el("div", "", "ra-row");
+      note.append(el("p", `Only in this story. Elsewhere you are ${usual}.`, "ra-muted"), back);
+      wrap.append(note);
+    } else if (!inStartBox && usual)
+      wrap.append(el("p", "Change this if you play someone else in this story. Your other stories keep their own name.", "ra-muted"));
+    return wrap;
+  }
+  function storytellerToggle(characterId, name) {
+    return toggle(`${name} is a storyteller, not a person`, isStoryteller(settings, characterId), (v) => {
+      safe(async () => {
+        setStoryteller(settings, characterId, v);
+        await saveSettings();
+        renderAssignments();
+        notice(v ? `${name} now tells the story. Its lines go to the people in it, and narration uses the Narrator voice.` : `${name} is a person in the story again.`);
+      });
+    }, "For cards that run a world or a whole cast, like a game master. Turn on so lines go to the people in the story, not to the card.");
+  }
+  function leadRow(chatId, names) {
+    const wrap = el("div", "", "ra-stack"), current = leadIn(settings, chatId);
+    const options = [{ value: NOBODY, label: "Everyone else (their shared voice)" }, ...[...new Set(names)].filter((n) => n && n !== NOBODY).map((n) => ({ value: n, label: n }))];
+    if (!options.some((o) => o.value === current))
+      options.push({ value: current, label: current });
+    wrap.append(field("Lines that name nobody go to", select(options, current, (v) => {
+      safe(async () => {
+        setLead(settings, chatId, v);
+        await saveSettings();
+        renderAssignments();
+        notice(v === NOBODY ? "Lines that name nobody use the Everyone else voice." : `Lines that name nobody go to ${v}.`);
+      });
+    })), el("p", "Readalong works out who says each line from the story text. This is for lines it can’t place. Pick your companion if they do most of the talking.", "ra-muted"));
+    return wrap;
+  }
   function castForm(container, key, name, inList = true) {
     const saved = cast()[key], spoken = baseName(name), known = sayingFor(spoken), hasStory = !!ctx.getActiveChat().chatId;
     if (!castDrafts.has(key))
@@ -4544,6 +4757,17 @@ function setup(ctx) {
     if (!inList) {
       container.classList.add("ra-stack");
       container.append(el("h3", `Voice for ${spoken}`));
+    }
+    const openChat = ctx.getActiveChat().chatId, activeCard = ctx.getActiveChat().characterId;
+    if (inList && openChat && key === youKey())
+      container.append(youNameRow(openChat));
+    if (inList && activeCard && key === `id:${activeCard}`) {
+      container.append(storytellerToggle(activeCard, spoken));
+      if (isStoryteller(settings, activeCard)) {
+        if (openChat)
+          container.append(leadRow(openChat, castRows().filter((r) => !r.you && r.key !== key).map((r) => baseName(r.name))));
+        return;
+      }
     }
     const listen = withIcon(button("Listen", () => safe(() => preview(draft.voice || settings.voice, draft))), "speaker");
     listen.disabled = !settings.enabled;
@@ -4675,7 +4899,10 @@ function setup(ctx) {
       addedCast.delete(key);
       addedNames.delete(key);
       openCast.delete(key);
-      if (inList && settings.personaName && key === `name:${settings.personaName.toLowerCase()}`) {
+      if (inList && chatId && settings.stories[chatId]?.you && key === youKey()) {
+        setStoryYou(settings, chatId, "");
+        await saveSettings();
+      } else if (inList && settings.personaName && key === `name:${settings.personaName.toLowerCase()}`) {
         settings.personaName = "";
         await saveSettings();
       }
@@ -4705,15 +4932,24 @@ function setup(ctx) {
     const keys = new Set(chatId ? [...Object.keys(story?.names ?? {}), ...story?.members ?? [], ...addedCast] : [...Object.keys(settings.assignments).filter((key) => key.startsWith("id:")), ...addedCast]);
     if (active && characters.some((c) => c.id === active))
       keys.add(`id:${active}`);
-    const you = settings.personaName ? `name:${settings.personaName.toLowerCase()}` : "";
+    const you = youKey(), youName = youIn(settings, chatId);
     if (you)
       keys.add(you);
-    const rows = [...keys].map((key) => ({ key, name: key === you ? settings.personaName : castName(key), you: key === you }));
+    const rows = [...keys].map((key) => ({ key, name: key === you ? youName : castName(key), you: key === you }));
     for (const entry of storyNames()) {
       const names = [entry.name, ...entry.aliases].map((n) => n.toLowerCase());
       if (!rows.some((r) => names.includes(baseName(r.name).toLowerCase())))
         rows.push({ key: `name:${entry.name.toLowerCase()}`, name: entry.name, you: false });
     }
+    if (chatId)
+      for (const person of storyPeople) {
+        const lower = person.name.toLowerCase();
+        if (lower === youName.toLowerCase() || rows.some((r) => baseName(r.name).toLowerCase() === lower || r.key === `name:${lower}`))
+          continue;
+        if (cast()[`name:${lower}`])
+          continue;
+        rows.push({ key: `name:${lower}`, name: person.name, you: false, found: person });
+      }
     const rank = (r) => r.you ? 0 : r.key === `id:${active}` ? 1 : 2;
     return rows.sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name));
   }
@@ -4796,12 +5032,18 @@ function setup(ctx) {
       assignmentsCard.append(el("h3", "Cast for this story"), el("p", "The people in this story and their voices. The narrator, You and Everyone else sound the same in every story.", "ra-muted"));
       if (empty) {
         const start = el("div", "", "ra-start");
-        start.append(el("h3", "Set up this story’s cast"), el("p", "Nobody else in this story has a voice yet. Add the characters you want to hear, then pick a voice for each. New names also show up here as the story brings them in.", "ra-muted"));
+        start.append(el("h3", "Set up this story’s cast"), el("p", "Tell Readalong who you are here and what kind of card this is. Then give the people in the story a voice. People the story mentions show up below on their own.", "ra-muted"));
         const addButton = button("Add a character", () => {
           addOpen = true;
           renderAssignments();
           assignmentsCard.querySelector('input[placeholder="For example, Jason"]')?.focus();
         }, true);
+        start.append(youNameRow(chatId, true));
+        const card = characters.find((c) => c.id === ctx.getActiveChat().characterId);
+        if (card)
+          start.append(storytellerToggle(card.id, baseName(card.name)));
+        if (card && isStoryteller(settings, card.id))
+          start.append(leadRow(chatId, rows.filter((r) => !r.you && r.key !== `id:${card.id}`).map((r) => baseName(r.name))));
         const startActions = el("div", "", "ra-row");
         startActions.append(addButton);
         start.append(startActions);
@@ -4834,7 +5076,7 @@ function setup(ctx) {
     }, true)), narratorListen);
     narrator.body.append(narratorRow, el("p", "Reads narrative prose and actions. Your own message text uses your You voice.", "ra-muted"));
     assignmentsCard.append(narrator.details);
-    if (!settings.personaName) {
+    if (!youIn(settings, chatId)) {
       const you = disclosure([el("strong", "You"), el("span", "Add your character")], openCast.has("you"));
       you.details.addEventListener("toggle", () => {
         if (you.details.isConnected) {
@@ -4853,7 +5095,10 @@ function setup(ctx) {
         const name = mine.trim();
         if (!validSpeaker(name))
           throw new Error("Type the name you play as, up to 80 letters.");
-        settings.personaName = name;
+        if (chatId && settings.personaName)
+          setStoryYou(settings, chatId, name);
+        else
+          settings.personaName = name;
         openCast.delete("you");
         openCast.add(`name:${name.toLowerCase()}`);
         await saveSettings();
@@ -4864,10 +5109,13 @@ function setup(ctx) {
     }
     for (const row of rows) {
       const saved = cast()[row.key], known = sayingFor(baseName(row.name));
-      const summary = [el("strong", row.you ? `You (${row.name})` : baseName(row.name)), el("span", saved?.voice ? `${voiceLabel(saved.voice)}${saved.auto ? ", picked for you" : ""}` : "No voice yet")];
+      const teller = row.key === `id:${ctx.getActiveChat().characterId}` && isStoryteller(settings, ctx.getActiveChat().characterId);
+      const summary = [el("strong", row.you ? `You (${row.name})` : baseName(row.name)), el("span", teller ? `Storyteller · unnamed lines: ${leadIn(settings, chatId)}` : saved?.voice ? `${voiceLabel(saved.voice)}${saved.auto ? ", picked for you" : ""}` : "No voice yet")];
       if (known)
         summary.push(el("span", `said “${known.spokenAs}”`));
-      if (!saved && !known && !row.you)
+      if (row.found?.gender && !saved?.voice)
+        summary.push(el("span", row.found.gender === "f" ? "sounds female" : "sounds male"));
+      if (!saved && !known && !row.you && !teller)
         summary.push(el("span", "New", "ra-badge"));
       const entry = disclosure(summary, openCast.has(row.key));
       entry.details.classList.add("ra-cast-entry");
