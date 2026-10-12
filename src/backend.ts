@@ -1,3 +1,4 @@
+import {SOUND_RULES} from './sound-effects';
 import type { SpindleAPI, ChatMessageDTO } from 'lumiverse-spindle-types';
 import { DEFAULTS, CUE_PATTERN, HIDE_RULE_NAME, EMOTION_INSTRUCTION, needsPcm, normalizeSettings, speechRequest, readVoiceRef, type CharacterInfo, type Settings, type SpeechSegment, type SpeechModel } from './shared';
 import { MAX_PASSAGE_CHARS } from './playback-plan';
@@ -27,8 +28,26 @@ const failedSpeech = new Map<string,{ settings:Settings; segment:SpeechSegment; 
 const DIAGNOSTIC_TTL = 10 * 60 * 1000;
 const LOCAL_CREDENTIALS='local_credentials_v1';
 async function keyStorage<T>(work:()=>Promise<T>):Promise<T>{try{return await work()}catch{throw new Error('Could not access encrypted key storage. Check Lumiverse’s credential settings. Existing keys were not intentionally removed.')}}
-async function keyStatus(userId:string){return {openrouter:await keyStorage(()=>spindle.enclave.has('openrouter_key',userId)),local:await keyStorage(async()=>await spindle.enclave.has(LOCAL_CREDENTIALS,userId)||await spindle.enclave.has('local_key',userId))}}
-function keyProvider(value:unknown):'openrouter'|'local'{if(value!=='openrouter' && value!=='local')throw new Error('Choose a direct speech provider first.');return value}
+async function keyStatus(userId:string){return {openrouter:await keyStorage(()=>spindle.enclave.has('openrouter_key',userId)),local:await keyStorage(async()=>await spindle.enclave.has(LOCAL_CREDENTIALS,userId)||await spindle.enclave.has('local_key',userId)),freesound:await keyStorage(()=>spindle.enclave.has('freesound_key',userId))}}
+function keyProvider(value:unknown):'openrouter'|'local'|'freesound'{if(value!=='openrouter' && value!=='local' && value!=='freesound')throw new Error('Choose a direct speech provider first.');return value}
+const soundCache=new Map<string,{audio:string;mime:string}>();
+/** One short Freesound preview for a known sound; the key never leaves the backend. */
+async function soundEffect(query:string,userId:string){
+  const rule=SOUND_RULES.find(r=>r.query===query);if(!rule)throw new Error('Unknown sound.');
+  const cached=soundCache.get(`${userId}:${query}`);if(cached)return cached;
+  const key=await keyStorage(()=>spindle.enclave.get('freesound_key',userId));
+  if(!key)throw new Error('Add a Freesound key in Playback to hear sound effects.');
+  const search=await credentialRequest(`https://freesound.org/apiv2/search/text/?query=${encodeURIComponent(rule.query)}&filter=${encodeURIComponent(rule.filter)}&fields=id,previews&sort=score&page_size=5&token=${encodeURIComponent(key)}`,{headers:{Accept:'application/json'}},key) as {status:number;body:string};
+  if(search.status<200 || search.status>=300)throw new Error(search.status===401?'Freesound did not accept the key.':`Freesound search failed (HTTP ${search.status}).`);
+  let url='';
+  try{const found=(JSON.parse(search.body)?.results??[]).find((r:any)=>r?.previews);url=String(found?.previews?.['preview-hq-mp3']??found?.previews?.['preview-lq-mp3']??'')}catch{throw new Error('Freesound returned an unexpected answer.')}
+  if(!/^https:\/\/(?:cdn\.)?freesound\.org\//.test(url))throw new Error('Freesound has no sound for this yet.');
+  const file=await credentialRequest(url,{responseType:'arraybuffer',mediaType:'audio'},key) as {status:number;body:string;encoding?:string;headers?:Record<string,string>};
+  if(file.status<200 || file.status>=300 || file.encoding!=='base64')throw new Error('The sound could not be downloaded.');
+  const value={audio:file.body,mime:file.headers?.['content-type']?.split(';')[0]||'audio/mpeg'};
+  soundCache.set(`${userId}:${query}`,value);while(soundCache.size>200)soundCache.delete(soundCache.keys().next().value!);
+  return value;
+}
 let models: SpeechModel[] = [];
 function send(payload: unknown, userId: string, sessionId?: string) { spindle.sendToFrontend(payload, userId, sessionId ? { frontendSessionId: sessionId } : undefined) }
 async function load(userId: string): Promise<Settings> {
@@ -199,14 +218,18 @@ spindle.onFrontendMessage(async (payload, userId, sessionId) => {
       if(provider==='local'){
         const base=validLocalUrl(typeof p.localUrl==='string'?p.localUrl:settings.localUrl,true);
         await keyStorage(()=>spindle.enclave.put(LOCAL_CREDENTIALS,JSON.stringify({key,base}),userId));
-      }else await keyStorage(()=>spindle.enclave.put('openrouter_key',key,userId));
+      }else if(provider==='freesound'){await keyStorage(()=>spindle.enclave.put('freesound_key',key,userId));for(const k of soundCache.keys())if(k.startsWith(`${userId}:`))soundCache.delete(k)}
+      else await keyStorage(()=>spindle.enclave.put('openrouter_key',key,userId));
       for (const id of failedSpeech.keys()) if (id.startsWith(`${userId}:`)) failedSpeech.delete(id);
       reply({ hasKey:true });
     } else if(p.type==='remove_key'){
       const provider=keyProvider(p.provider);if(p.confirmed!==true)throw new Error('Confirm key removal first.');
-      for(const name of provider==='local'?[LOCAL_CREDENTIALS,'local_key']:['openrouter_key'])await keyStorage(()=>spindle.enclave.delete(name,userId));
+      for(const name of provider==='local'?[LOCAL_CREDENTIALS,'local_key']:provider==='freesound'?['freesound_key']:['openrouter_key'])await keyStorage(()=>spindle.enclave.delete(name,userId));
       for (const id of failedSpeech.keys()) if (id.startsWith(`${userId}:`)) failedSpeech.delete(id);
       reply({hasKey:false});
+    } else if (p.type === 'sound_effect') {
+      if(typeof p.query!=='string')throw new Error('Unknown sound.');
+      reply(await soundEffect(p.query,userId));
     } else if (p.type === 'models') {
       reply({ models: await speechModels() });
     } else if (p.type === 'check_connection') {

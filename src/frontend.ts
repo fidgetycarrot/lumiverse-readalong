@@ -4,8 +4,9 @@ import { PassageMarker } from './highlight';
 import { createNativeTtsClient, nativeSpeechRequest, type NativeConnection } from './native-tts';
 import { planSpeech, planMessageSpeech, prepareAll, estimatedSentenceIndex, isUnvoicedExtra, storyRoster, type SpeechPassage, type VoiceContext } from './playback-plan';
 import {buildRoster} from './speaker-detect';
+import {soundCues,type SoundCue} from './sound-effects';
 import {autoCast} from './auto-cast';
-import { PreparedPlayer, prepareClip, type PreparedClip } from './prepared-audio';
+import { PreparedPlayer, prepareClip, waveHeader, type PreparedClip } from './prepared-audio';
 import { AudioCache, preparationHash } from './audio-cache';
 import {recordingPlan,type RecordingMetadata} from './saved-recording';
 import {widgetDimensions as resolveWidgetDimensions,widgetPosition} from './widget-layout';
@@ -157,7 +158,7 @@ function timeLabel(seconds:number){const value=Math.floor(seconds);return `${Mat
 
 export function setup(ctx: SpindleFrontendContext) {
   let settings = normalizeSettings(DEFAULTS), ready = false, initialized = false, disposed = false;
-  const hasKeys={openrouter:false,local:false},frontendId=crypto.randomUUID();
+  const hasKeys={openrouter:false,local:false,freesound:false},frontendId=crypto.randomUUID();
   const castDrafts=new Map<string,VoiceAssignment>(),openCast=new Set<string>();let castInitialized=false,addOpen=false,voiceQuery='',voiceFilter:'all'|'f'|'m'|'none'='all',fixName='',fixSay='',viewChosen=false;
   const addedCast=new Set<string>(),addedNames=new Map<string,string>(),sayDrafts=new Map<string,{spokenAs:string;aliases:string}>(),moreOpen=new Set<string>(),testPick=new Map<string,string>();
   const validSpeaker=(name:string)=>!!name && name.length<=80 && !/[\[\]\r\n]/.test(name) && name.toLowerCase()!=='narrator';
@@ -414,6 +415,46 @@ export function setup(ctx: SpindleFrontendContext) {
     if(currentMessage){marker.mark(()=>contentRoot(currentMessage!.id),plainText(currentSegments[position].text));if(settings.follow)marker.follow()}
     renderPlayer();
   }
+  // ---- Sound effects: quiet sounds where the story describes them ----
+  const soundFiles=new Map<string,Promise<string>>();let soundPlayer:HTMLAudioElement|null=null;let soundError='';
+  const playedSounds=new Set<string>();let passageSounds:SoundCue[][]=[];
+  const soundsOn=()=>settings.soundEffects && hasKeys.freesound && currentPassages[0]?.settings.provider!=='browser';
+  function soundFile(query:string){
+    let file=soundFiles.get(query);
+    if(!file){
+      file=rpc('sound_effect',{query}).then((r:{audio:string;mime:string})=>URL.createObjectURL(new Blob([Uint8Array.from(atob(r.audio),c=>c.charCodeAt(0))],{type:r.mime||'audio/mpeg'})));
+      file.catch(error=>{soundFiles.delete(query);if(!soundError){soundError=error instanceof Error?error.message:'A sound effect could not be loaded.';notice(soundError,true)}});
+      soundFiles.set(query,file);
+    }
+    return file;
+  }
+  /** Cues for each part of the loaded reply; fetch their sounds ahead of time. */
+  function prepareSounds(){
+    playedSounds.clear();soundError='';
+    passageSounds=currentPassages.map(p=>soundCues(p.segments.map(s=>plainText(s.text)).join(' ')));
+    if(!soundsOn())return;
+    for(const query of [...new Set(passageSounds.flat().map(c=>c.query))].slice(0,8))void soundFile(query).catch(()=>{});
+  }
+  /** Inside the Play click: browsers only let a page start sound it was allowed to play. */
+  function primeSounds(){
+    if(!soundsOn() || soundPlayer)return;
+    soundPlayer=new Audio();const size=4800,url=URL.createObjectURL(new Blob([waveHeader(size),new Uint8Array(size)],{type:'audio/wav'}));
+    soundPlayer.src=url;void soundPlayer.play().then(()=>soundPlayer?.pause(),()=>{}).finally(()=>URL.revokeObjectURL(url));
+  }
+  function playSounds(){
+    if(!soundsOn())return;
+    const at=audioPlayer.position;
+    for(const cue of passageSounds[at.index]??[]){
+      const id=`${at.index}:${cue.query}`;
+      if(playedSounds.has(id) || at.fraction<cue.at)continue;
+      playedSounds.add(id);
+      void soundFile(cue.query).then(url=>{
+        if(phase!=='playing')return;
+        const audio=soundPlayer??=new Audio();audio.src=url;audio.volume=Math.min(1,settings.volume*.45);audio.playbackRate=1;
+        void audio.play().catch(()=>{});
+      }).catch(()=>{});
+    }
+  }
   // ---- Mixer: skip muted voices (or the narrator) and set each voice's level ----
   const speakerKey=(index:number)=>(currentPassages[index]?.segments[0]?.speaker||'').trim().toLowerCase();
   function skipped(index:number){const key=speakerKey(index);return !!key && (settings.dialogueOnly && key==='narrator' || !!settings.mix[key]?.mute)}
@@ -437,12 +478,13 @@ export function setup(ctx: SpindleFrontendContext) {
     while(index>=0 && index<currentPassages.length && skipped(index))index+=step;
     index=Math.max(0,index);if(index>=starts.length)return;
     audioPlayer.seek(starts[index]+.001);
+    for(const id of [...playedSounds])if(Number(id.split(':')[0])>=index)playedSounds.delete(id);
     if(phase==='finished'){phase='paused';paused=true}
     markSentence(index,0);applyMix();renderPlayer();
   }
   function updateClock() {
     if(phase!=='playing')return;
-    applyMix();
+    applyMix();playSounds();
     const at=audioPlayer.position,passage=currentPassages[at.index];
     if(passage)markSentence(at.index,estimatedSentenceIndex(passage,at.fraction));
     const progress=widget?.root.querySelector('progress');if(progress && !preparingAudio && !incompleteAudio)progress.value=at.duration?at.elapsed/at.duration:0;
@@ -472,6 +514,7 @@ export function setup(ctx: SpindleFrontendContext) {
   }
   function preparationNotice(text:string){notice(automaticPlaybackError || text,!!automaticPlaybackError)}
   async function playOrPause(automatic=false) {
+    if(!automatic)primeSounds();
     lastPlaybackAction=automatic?'Automatic playback':phase==='idle'?'Load saved':playState().label;updateSpeechActivity();
     // Any manual playback action owns this reading from now on. Preparation
     // updates must never undo a pause or retry a blocked automatic start.
@@ -487,7 +530,7 @@ export function setup(ctx: SpindleFrontendContext) {
     }
     const token=playbackId;
     if(phase==='paused' && browserQueueActive){speechSynthesis.resume();paused=false;playing=true;phase='playing';browserResume?.();browserResume=null;notice('Reading…');renderPlayer();return}
-    if(phase==='finished'){marker.reset();position=0;markedPosition=-1;currentPassage=0;audioPlayer.rewind()}
+    if(phase==='finished'){marker.reset();position=0;markedPosition=-1;currentPassage=0;audioPlayer.rewind();playedSounds.clear()}
     paused=false;
     if(currentPassages[0]?.settings.provider==='browser') {
       playing=true;phase='playing';browserQueueActive=true;notice('Reading…');renderPlayer();
@@ -653,7 +696,7 @@ export function setup(ctx: SpindleFrontendContext) {
       }
       if(token!==playbackId)return;
       if(!options.restoreOnly){const cast=await castNewSpeakers(message,context,rules);if(token!==playbackId)return;if(cast.length)snapshot=normalizeSettings(settings)}
-      currentPassages=planMessageSpeech(message,snapshot,context,rules);currentSegments=currentPassages.flatMap(p=>p.segments);
+      currentPassages=planMessageSpeech(message,snapshot,context,rules);currentSegments=currentPassages.flatMap(p=>p.segments);prepareSounds();
       if(!currentSegments.length){stop(false);notice('There is no readable text in this message.');return}
       let restored=false,saved=true,openingCount=0;
       if(snapshot.provider!=='browser') {
@@ -693,7 +736,7 @@ export function setup(ctx: SpindleFrontendContext) {
         }
         if(token!==playbackId)return;
         previousRecording=!!partial && audioKey!==desiredKey;
-        currentPassages=plan.passages;currentSegments=currentPassages.flatMap(p=>p.segments);
+        currentPassages=plan.passages;currentSegments=currentPassages.flatMap(p=>p.segments);prepareSounds();
         if(partial?.length!==currentPassages.length)partial=undefined;
         partial??=Array.from({length:currentPassages.length},()=>undefined);
         const parts=partial,texts=currentPassages.map(p=>plainText(p.segment.text));
@@ -916,7 +959,16 @@ export function setup(ctx: SpindleFrontendContext) {
       el('p','Changing a voice, or how a name is said, only changes new audio.','ra-muted'),
       el('p','The highlighted sentence is a close guess of where the voice is.','ra-muted'));
     const mixer=el('div','', 'ra-stack');renderMixer(mixer);
-    options.replaceChildren(sliders,mixer,
+    const sounds=el('div','', 'ra-stack');
+    sounds.append(toggle('Sound effects',settings.soundEffects,v=>{settings.soundEffects=v;renderOptions();prepareSounds();void safe(saveSettings)},'Plays quiet sounds, like a knock or footsteps, when the story describes them. Sounds come from Freesound.'));
+    if(settings.soundEffects){
+      const key=textInput('',()=>{},'password');key.autocomplete='off';key.placeholder=hasKeys.freesound?'Key saved. Leave blank to keep it':'Paste your Freesound key';
+      const keyRow=el('div','', 'ra-row ra-end');
+      keyRow.append(field('Freesound key',key),button('Save key',()=>safe(async()=>{if(!key.value.trim())throw new Error('Paste a key first.');const r=await rpc('save_key',{key:key.value,provider:'freesound'});hasKeys.freesound=r.hasKey;soundFiles.clear();renderOptions();prepareSounds();notice('Freesound key saved.')})));
+      sounds.append(keyRow,el('p',hasKeys.freesound?'Your key is stored encrypted. Each new kind of sound is fetched once and then reused.':'Get a free key by making a Freesound account and applying for an API key at freesound.org/apiv2/apply.','ra-muted'));
+      if(hasKeys.freesound){const remove=button('Remove key',()=>safe(async()=>{await rpc('remove_key',{provider:'freesound',confirmed:true});hasKeys.freesound=false;soundFiles.clear();renderOptions();notice('Freesound key removed.')}));remove.classList.add('ra-quiet');sounds.append(remove)}
+    }
+    options.replaceChildren(sliders,mixer,sounds,
       toggle('Play replies automatically',settings.automaticPlayback,v=>{void safe(()=>setAutomaticPlayback(v))},'Starts with your next new reply. Older messages still wait for Play.'),
       toggle('Scroll the chat to follow the voice',settings.follow,v=>{settings.follow=v;void safe(saveSettings)}),
       toggle('Start before the whole message is ready',settings.earlyPlayback,v=>{settings.earlyPlayback=v;void safe(saveSettings)},'Play can start once about three quarters of the audio is ready.'),
