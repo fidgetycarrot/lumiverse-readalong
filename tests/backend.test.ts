@@ -194,10 +194,15 @@ describe('backend provider and session integration',()=>{
   });
   test('cast settings persist per user and the existing prompt includes named speakers without another request',async()=>{
     const assignments={'name:jason':{name:'Jason',voice:'Charon',emotion:'curious',delivery:'normal'},'name:vasquez':{name:'Vasquez',voice:'Orus',emotion:'neutral',delivery:'normal'}};
-    await call('save',{settings:{...DEFAULTS,assignments}});const n=requests.length;
-    expect((await call('init')).p.data.settings.assignments).toEqual(assignments);
-    expect((await call('init',{},'fresh')).p.data.settings.assignments).toEqual({});
-    const prompt=await interceptor([],{userId:'one'});expect(prompt[0].content).toContain('["Jason","Vasquez"]');expect(requests.length).toBe(n);
+    await call('save',{settings:{...DEFAULTS,stories:{'one-chat':{names:assignments,updatedAt:1}}}});const n=requests.length;
+    expect((await call('init')).p.data.settings.stories['one-chat'].names).toEqual(assignments);
+    expect((await call('init',{},'fresh')).p.data.settings.stories).toEqual({});
+    const prompt=await interceptor([],{userId:'one',chatId:'one-chat',generationType:'normal'});expect(prompt[0].content).toContain('["Jason","Vasquez"]');expect(requests.length).toBe(n);
+    // Another story does not hear about this story's people.
+    const other=await interceptor([],{userId:'one',chatId:'elsewhere',generationType:'quiet'});expect(other[0]?.content ?? '').not.toContain('Jason');
+    // Names saved before per-story casts move to the earlier pool instead of applying everywhere.
+    await call('save',{settings:{...DEFAULTS,assignments}});
+    const migrated=(await call('init')).p.data.settings;expect(migrated.assignments).toEqual({});expect(Object.keys(migrated.stories.earlier.names)).toEqual(['name:jason','name:vasquez']);
     await call('save',{settings:DEFAULTS});
   });
   test('models return the complete model-specific voice list',async()=>{

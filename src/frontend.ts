@@ -6,6 +6,7 @@ import { planSpeech, planMessageSpeech, prepareAll, estimatedSentenceIndex, isUn
 import {buildRoster} from './speaker-detect';
 import {soundCues,type SoundCue} from './sound-effects';
 import {autoCast} from './auto-cast';
+import {castView,setCastEntry,setMember,claimEarlier,copyCast,otherStories,namesElsewhere,noteStory} from './story-cast';
 import { PreparedPlayer, prepareClip, waveHeader, joinPrepared, type PreparedClip } from './prepared-audio';
 import { AudioCache, preparationHash } from './audio-cache';
 import {recordingPlan,readRecordingPlan,type RecordingMetadata,type RecordingPlan} from './saved-recording';
@@ -97,6 +98,8 @@ const STYLE = `
 .ra details[open]>summary::after{transform:rotate(45deg)}
 .ra details>summary strong{overflow-wrap:anywhere}.ra details>summary span{color:var(--ra-dim);font-size:12.5px}
 .ra details>.ra-body{padding:2px 12px 12px;display:flex;flex-direction:column;gap:12px}
+.ra .ra-start{display:flex;flex-direction:column;gap:10px;padding:12px;border:1px dashed var(--ra-line);border-radius:10px}
+.ra .ra-start h3{margin:0}
 .ra .ra-fix{display:flex;flex-direction:column;gap:10px;padding:12px;border:1px solid var(--ra-line);border-left:3px solid var(--ra-mark);border-radius:10px;background:var(--ra-soft)}
 .ra button.ra-next{align-self:flex-end}
 .ra details details{background:transparent;border-style:dashed}.ra details details>summary{padding:8px 10px}
@@ -660,13 +663,13 @@ export function setup(ctx: SpindleFrontendContext) {
     if(!settings.autoVoices || message.isUser || settings.provider==='browser')return [];
     const main=message.name,roster=buildRoster(storyRoster(settings,context,main));
     const speakers=[...new Set(parseSegments(message.content,main,rules??DEFAULT_SPEECH_RULES,roster).map(s=>s.speaker))];
-    const story=Object.values(context.pronunciations??{});
-    const added=autoCast(settings,{speakers,voices:voiceNames(),genderOfVoice:v=>voiceGender(settings,v),
+    const story=Object.values(context.pronunciations??{}),chatId=ctx.getActiveChat().chatId,view=castView(settings,chatId);
+    const added=autoCast(view,{speakers,voices:voiceNames(),genderOfVoice:v=>voiceGender(settings,v),
       genderOf:n=>story.find(e=>[e.name,...e.aliases].some(a=>a.toLowerCase()===n.toLowerCase()))?.gender,
-      needsVoice:n=>{const a=settings.assignments[`name:${n.toLowerCase()}`];return a?!a.voice:isUnvoicedExtra(n,settings,{...context,mainSpeaker:main})}});
+      needsVoice:n=>{const a=view.assignments[`name:${n.toLowerCase()}`];return a?!a.voice:isUnvoicedExtra(n,view,{...context,mainSpeaker:main})}});
     const names=Object.values(added).map(a=>a.name!);
     if(!names.length)return [];
-    Object.assign(settings.assignments,added);
+    for(const [key,value] of Object.entries(added))setCastEntry(settings,chatId,key,value);
     try{await saveSettings()}catch{/* The voices still apply to this reading. */}
     renderAssignments();notice(`Gave ${names.length===1?'a voice':'voices'} to ${names.join(', ')}. Change ${names.length===1?'it':'them'} in Cast.`);
     return names;
@@ -712,8 +715,8 @@ export function setup(ctx: SpindleFrontendContext) {
     currentMessage={...message,characterId:message.isUser?undefined:message.characterId ?? speakerCharacterId(message.name,characters,ctx.getActiveChat().characterId ?? undefined)};
     phase='preparing';preparingAudio=true;checkingSavedAudio=true;preparedCount=0;showWidget();notice('Looking for saved audio…');renderPlayer();
     try {
-      let snapshot=normalizeSettings(settings);
       const chatId=ctx.getActiveChat().chatId;
+      let snapshot=castView(normalizeSettings(settings),chatId);
       const context:VoiceContext={characters,characterId:currentMessage.characterId,connections:nativeConnections,mainSpeaker:message.name,
         pronunciations:await refreshPronunciations(chatId,options.restoreOnly?undefined:message.id)};
       let rules,hostAutomaticTts=false;
@@ -724,7 +727,7 @@ export function setup(ctx: SpindleFrontendContext) {
         if(results[2].status==='fulfilled' && token===playbackId){nativeConnections=results[2].value;context.connections=nativeConnections;renderConfig()}
       }
       if(token!==playbackId)return;
-      if(!options.restoreOnly){const cast=await castNewSpeakers(message,context,rules);if(token!==playbackId)return;if(cast.length)snapshot=normalizeSettings(settings)}
+      if(!options.restoreOnly){const cast=await castNewSpeakers(message,context,rules);if(token!==playbackId)return;if(cast.length)snapshot=castView(normalizeSettings(settings),chatId)}
       currentPassages=planMessageSpeech(message,snapshot,context,rules);currentSegments=currentPassages.flatMap(p=>p.segments);prepareSounds();
       if(!currentSegments.length){stop(false);notice('There is no readable text in this message.');return}
       let restored=false,saved=true,openingCount=0;
@@ -920,6 +923,18 @@ export function setup(ctx: SpindleFrontendContext) {
     const r = await rpc('messages',{chatId}); if (ctx.getActiveChat().chatId !== chatId) return;
     messages = r.messages; selectedId = messages.some(m=>m.id === selectedId) ? selectedId : messages.at(-1)?.id ?? '';
     renderPlayer(); decorateMessages();
+    await ensureStory(chatId);
+  }
+  /** First visit to a story: bring in older voices it uses, and remember its title and main character. */
+  async function ensureStory(chatId:string) {
+    if(!messages.length || ctx.getActiveChat().chatId!==chatId)return;
+    const first=!settings.stories[chatId];
+    const claimed=claimEarlier(settings,chatId,messages.map(m=>m.content),characters);
+    let title='';try{title=(await ctx.chats.getActive?.())?.name??''}catch{}
+    if(disposed || ctx.getActiveChat().chatId!==chatId)return;
+    const noted=noteStory(settings,chatId,{characterId:ctx.getActiveChat().characterId,title});
+    if(first || claimed.length || noted){try{await saveSettings()}catch{/* Tried again next time something is saved. */}}
+    renderAssignments();
   }
   async function readId(id: string,restoreOnly=false) {
     if(messageLoad)return;
@@ -1150,10 +1165,12 @@ export function setup(ctx: SpindleFrontendContext) {
   const emptyVoice=():VoiceAssignment=>({voice:'',emotion:'neutral',delivery:'normal'});
   function storyNames(){return pronunciationChatId && pronunciationChatId===ctx.getActiveChat().chatId?Object.values(pronunciationEntries):[]}
   function sayingFor(name:string){const wanted=name.toLowerCase();return wanted?storyNames().find(e=>[e.name,...e.aliases].some(n=>n.toLowerCase()===wanted)):undefined}
-  function castName(key:string){return key.startsWith('id:')?characters.find(c=>c.id===key.slice(3))?.name??'Unknown character':settings.assignments[key]?.name??castDrafts.get(key)?.name??addedNames.get(key)??key.slice(5)}
+  /** Voices that apply in the open story. */
+  function cast(){return castView(settings,ctx.getActiveChat().chatId).assignments}
+  function castName(key:string){return key.startsWith('id:')?characters.find(c=>c.id===key.slice(3))?.name??'Unknown character':cast()[key]?.name??castDrafts.get(key)?.name??addedNames.get(key)??key.slice(5)}
   function voiceForName(name:string){
     const wanted=name.toLowerCase(),character=characters.find(c=>baseName(c.name).toLowerCase()===wanted);
-    return settings.assignments[`name:${wanted}`]??(character?settings.assignments[`id:${character.id}`]:undefined);
+    const voices=cast();return voices[`name:${wanted}`]??(character?voices[`id:${character.id}`]:undefined);
   }
   function sayingEntry(name:string,spokenAs:string,aliases:string){
     const entry=pronunciationEntry({name,spokenAs,aliases:aliases.split(',').map(s=>s.trim()).filter(Boolean)},'manual');
@@ -1179,7 +1196,7 @@ export function setup(ctx: SpindleFrontendContext) {
   }
   /** Voice and name form for one cast member. Also used by the character editor tab. */
   function castForm(container:HTMLElement,key:string,name:string,inList=true) {
-    const saved=settings.assignments[key],spoken=baseName(name),known=sayingFor(spoken),hasStory=!!ctx.getActiveChat().chatId;
+    const saved=cast()[key],spoken=baseName(name),known=sayingFor(spoken),hasStory=!!ctx.getActiveChat().chatId;
     if(!castDrafts.has(key))castDrafts.set(key,{...(saved??emptyVoice()),...(key.startsWith('name:')?{name:spoken}:{})});
     const draft=castDrafts.get(key)!;
     const say=sayDrafts.get(key)??{spokenAs:known?.spokenAs??'',aliases:[...new Set([...(known?.aliases??[]),...(saved?.aliases??[])])].join(', ')};
@@ -1222,7 +1239,9 @@ export function setup(ctx: SpindleFrontendContext) {
       const entry=hasStory && edited && say.spokenAs.trim()?sayingEntry(known?.name??spoken,say.spokenAs,say.aliases):undefined;
       if(!wantsVoice && !entry && !(edited && known))throw new Error('Pick a voice or type how to say the name first.');
       // Saving a row makes its voice the user's own choice, even if Readalong picked it.
-      if(wantsVoice){const own={...draft};delete own.auto;settings.assignments[key]=own;await saveSettings()}
+      const chatId=ctx.getActiveChat().chatId,persona=settings.personaName?`name:${settings.personaName.toLowerCase()}`:'';
+      if(wantsVoice && !chatId && key.startsWith('name:') && key!==persona)throw new Error('Open a story first. Each story keeps its own cast.');
+      if(wantsVoice){const own={...draft};delete own.auto;setCastEntry(settings,chatId,key,own);await saveSettings()}
       if(entry)await saveSaying(entry);else if(hasStory && edited && known && !say.spokenAs.trim())await removeSaying(known.name);
       done();notice(entry || (edited && known)?`Saved ${spoken}. Audio you already have keeps the old sound.`:`Saved ${spoken}.`);
     }),true);
@@ -1231,7 +1250,10 @@ export function setup(ctx: SpindleFrontendContext) {
         const result=await ctx.ui.showConfirm({title:`Remove ${spoken}?`,message:known?'This forgets their voice and how their name is said in this story.':'This forgets their voice.',variant:'danger',confirmLabel:'Remove'});
         if(!result.confirmed)return;
       }
-      if(saved){delete settings.assignments[key];await saveSettings()}
+      const chatId=ctx.getActiveChat().chatId;
+      // A library character keeps its voice for other stories; it just leaves this story's cast.
+      if(key.startsWith('id:') && chatId && inList){setMember(settings,chatId,key,false);if(saved)await saveSettings()}
+      else if(saved){setCastEntry(settings,chatId,key,undefined);await saveSettings()}
       if(known)await removeSaying(known.name);
       addedCast.delete(key);addedNames.delete(key);openCast.delete(key);if(inList && settings.personaName && key===`name:${settings.personaName.toLowerCase()}`){settings.personaName='';await saveSettings()}
       done();notice(`Removed ${spoken}.`);
@@ -1248,8 +1270,10 @@ export function setup(ctx: SpindleFrontendContext) {
     const target=assignmentsCard.querySelector<HTMLInputElement>(fixName?'[data-ra-fix="say"]':'[data-ra-fix="name"]');target?.focus();target?.select();
   }
   function castRows() {
-    const keys=new Set([...Object.keys(settings.assignments).filter(key=>/^(id|name):/.test(key)),...addedCast]);
-    if(!keys.size && !castInitialized){const id=ctx.getActiveChat().characterId??characters[0]?.id;if(id && characters.some(c=>c.id===id)){addedCast.add(`id:${id}`);keys.add(`id:${id}`)}}
+    const {chatId,characterId:active}=ctx.getActiveChat(),story=chatId?settings.stories[chatId]:undefined;
+    // In a story: its own names, its library characters and its main character. Outside one: shared voices.
+    const keys=new Set(chatId?[...Object.keys(story?.names??{}),...(story?.members??[]),...addedCast]:[...Object.keys(settings.assignments).filter(key=>key.startsWith('id:')),...addedCast]);
+    if(active && characters.some(c=>c.id===active))keys.add(`id:${active}`);
     const you=settings.personaName?`name:${settings.personaName.toLowerCase()}`:'';if(you)keys.add(you);
     const rows=[...keys].map(key=>({key,name:key===you?settings.personaName:castName(key),you:key===you}));
     // Names the story has taught Readalong join the cast, even before they have a voice.
@@ -1257,15 +1281,19 @@ export function setup(ctx: SpindleFrontendContext) {
       const names=[entry.name,...entry.aliases].map(n=>n.toLowerCase());
       if(!rows.some(r=>names.includes(baseName(r.name).toLowerCase())))rows.push({key:`name:${entry.name.toLowerCase()}`,name:entry.name,you:false});
     }
-    const active=ctx.getActiveChat().characterId,rank=(r:{key:string;you:boolean})=>r.you?0:r.key===`id:${active}`?1:2;
+    const rank=(r:{key:string;you:boolean})=>r.you?0:r.key===`id:${active}`?1:2;
     return rows.sort((a,b)=>rank(a)-rank(b) || a.name.localeCompare(b.name));
   }
   function renderAssignments() {
     assignmentsCard.replaceChildren();
     const hasStory=!!ctx.getActiveChat().chatId,rows=castRows();
     if(!castInitialized && rows.length){castInitialized=true}
+    const chatId=ctx.getActiveChat().chatId,story=chatId?settings.stories[chatId]:undefined;
+    const active=ctx.getActiveChat().characterId;
+    // Empty means nobody beyond the story's own main character yet.
+    const empty=!!chatId && !Object.keys(story?.names??{}).length && !(story?.members??[]).some(m=>m!==`id:${active}`) && !addedCast.size && !storyNames().length;
     // Quick fix: the thing people reach for in the middle of a story.
-    if(hasStory) {
+    if(hasStory && !empty) {
       const fix=el('div','', 'ra-fix'),names=el('datalist');names.id='ra-cast-names';
       for(const name of new Set(rows.map(r=>baseName(r.name)))){const option=el('option');option.value=name;names.append(option)}
       const nameInput=textInput(fixName,v=>{fixName=v;const known=sayingFor(v.trim());if(known && !fixSay){fixSay=known.spokenAs;sayInput.value=fixSay}});nameInput.maxLength=80;nameInput.placeholder='Pick or type a name';nameInput.setAttribute('list',names.id);nameInput.dataset.raFix='name';
@@ -1277,7 +1305,27 @@ export function setup(ctx: SpindleFrontendContext) {
       const actions=el('div','', 'ra-row');actions.append(save,test);
       fix.append(el('h3','Fix how a name is said'),fields,actions,names);assignmentsCard.append(fix);
     }
-    assignmentsCard.append(el('h3','Cast'),el('p','Everyone in your stories who has a voice, plus the names this story has picked up.','ra-muted'));
+    const copyFrom=(from:string)=>safe(async()=>{
+      if(!chatId)return;const added=copyCast(settings,from,chatId);await saveSettings();renderAssignments();
+      notice(added?`Copied ${added} ${added===1?'voice':'voices'} into this story.`:'This story already has all of those voices.');
+    });
+    const storyPicker=(label:string)=>{
+      const stories=otherStories(settings,chatId,ctx.getActiveChat().characterId);if(!stories.length)return null;
+      let from=stories[0].id;const row=el('div','', 'ra-row ra-end');
+      row.append(field(label,select(stories.map(o=>({value:o.id,label:`${o.title} (${o.count})`})),from,v=>from=v)),button('Copy cast',()=>copyFrom(from)));
+      return row;
+    };
+    if(chatId){
+      assignmentsCard.append(el('h3','Cast for this story'),el('p','The people in this story and their voices. The narrator, You and Everyone else sound the same in every story.','ra-muted'));
+      if(empty){
+        const start=el('div','', 'ra-start');
+        start.append(el('h3','Set up this story’s cast'),el('p','Nobody else in this story has a voice yet. Add the characters you want to hear, then pick a voice for each. New names also show up here as the story brings them in.','ra-muted'));
+        const addButton=button('Add a character',()=>{addOpen=true;renderAssignments();assignmentsCard.querySelector<HTMLInputElement>('input[placeholder="For example, Jason"]')?.focus()},true);
+        const startActions=el('div','', 'ra-row');startActions.append(addButton);start.append(startActions);
+        const copy=storyPicker('Or start with a cast from another story');if(copy)start.append(copy);
+        assignmentsCard.append(start);
+      }
+    } else assignmentsCard.append(el('h3','Cast'),el('p','Open a story to see and set up its cast. Voices here are shared by every story.','ra-muted'));
     const narrator=disclosure([el('strong','Narrator'),el('span',settings.narratorVoice?voiceLabel(settings.narratorVoice):`Main voice: ${voiceLabel(settings.voice)}`)],openCast.has('narrator'));
     narrator.details.addEventListener('toggle',()=>{if(narrator.details.isConnected){if(narrator.details.open)openCast.add('narrator');else openCast.delete('narrator')}});
     const narratorListen=withIcon(button('Listen',()=>safe(()=>preview(settings.narratorVoice||settings.voice))),'speaker');narratorListen.disabled=!settings.enabled;
@@ -1294,7 +1342,7 @@ export function setup(ctx: SpindleFrontendContext) {
       you.body.append(youRow,el('p','Gives your own messages a voice, and voices your character when a reply speaks for them. Your Lumiverse persona can use a longer name.','ra-muted'));assignmentsCard.append(you.details);
     }
     for(const row of rows){
-      const saved=settings.assignments[row.key],known=sayingFor(baseName(row.name));
+      const saved=cast()[row.key],known=sayingFor(baseName(row.name));
       const summary:(Node|string)[]=[el('strong',row.you?`You (${row.name})`:baseName(row.name)),el('span',saved?.voice?`${voiceLabel(saved.voice)}${saved.auto?', picked for you':''}`:'No voice yet')];
       if(known)summary.push(el('span',`said “${known.spokenAs}”`));
       if(!saved && !known && !row.you)summary.push(el('span','New','ra-badge'));
@@ -1312,8 +1360,11 @@ export function setup(ctx: SpindleFrontendContext) {
     if(!settings.promptEmotions)others.body.append(el('p','This only works when “Mark feelings and who is speaking” is on under Connection. That is how Readalong knows who is talking.','ra-muted'));
     assignmentsCard.append(others.details);
     function addMember(key:string,name?:string){
-      if(!rows.some(r=>r.key===key) && rows.length>=500){notice('The cast can hold up to 500 people.',true);return}
-      addedCast.add(key);if(name)addedNames.set(key,name);
+      if(!rows.some(r=>r.key===key) && rows.length>=300){notice('A story’s cast can hold up to 300 people.',true);return}
+      const chatId=ctx.getActiveChat().chatId;
+      if(key.startsWith('id:') && chatId){setMember(settings,chatId,key,true);void safe(saveSettings)}
+      else addedCast.add(key);
+      if(name)addedNames.set(key,name);
       openCast.add(key);castInitialized=true;addOpen=false;renderAssignments();
     }
     const add=disclosure([el('strong','Add someone')],addOpen);
@@ -1329,7 +1380,18 @@ export function setup(ctx: SpindleFrontendContext) {
       addMember(`name:${name.toLowerCase()}`,name);
     });addByName.dataset.raControl='Add by name';
     byName.append(field('Or anyone else, by name',speakerInput),addByName);
-    add.body.append(fromLibrary,byName,el('p','Side characters can have a voice too. For Readalong to tell several speakers apart in one reply, turn on “Mark feelings and who is speaking” under Connection.','ra-muted'));
+    add.body.append(fromLibrary,byName);
+    const elsewhere=chatId?namesElsewhere(settings,chatId).filter(n=>!rows.some(r=>r.key===n.key)):[];
+    if(elsewhere.length){
+      let pick=elsewhere[0].key;const row=el('div','', 'ra-row ra-end');
+      row.append(field('Or someone from another story',select(elsewhere.map(n=>({value:n.key,label:`${n.name} · ${voiceLabel(n.assignment.voice)} · ${n.from}`})),pick,v=>pick=v)),button('Add',()=>safe(async()=>{
+        const found=elsewhere.find(n=>n.key===pick);if(!found || !chatId)return;
+        setCastEntry(settings,chatId,found.key,{...found.assignment});openCast.add(found.key);addOpen=false;await saveSettings();renderAssignments();notice(`${found.name} joined this story with the same voice.`);
+      })));
+      add.body.append(row);
+    }
+    if(chatId && story && (Object.keys(story.names).length || story.members?.length)){const copy=storyPicker('Copy a whole cast from another story');if(copy)add.body.append(copy)}
+    add.body.append(el('p','Side characters can have a voice too. For Readalong to tell several speakers apart in one reply, turn on “Mark feelings and who is speaking” under Connection.','ra-muted'));
     assignmentsCard.append(add.details,
       toggle('Give new characters a voice automatically',settings.autoVoices,v=>{settings.autoVoices=v;void safe(saveSettings)},'When the story says a new character sounds female or male, Readalong picks an unused voice you marked that way. You can change it any time.'),
       toggle('Learn how to say new names',settings.promptPronunciations,v=>{settings.promptPronunciations=v;void safe(saveSettings)},'The story model suggests how to say each new name. Your own fixes always win.'),
@@ -1345,7 +1407,7 @@ export function setup(ctx: SpindleFrontendContext) {
   function onEvent(name:string,fn:(payload:any)=>void) {cleanups.push(ctx.events.on(name,p=>fn(p)))}
   onEvent('CHAT_SWITCHED',()=>{
     completionInbox.reset();localGenerations.clear();completionRecovery=null;
-    pronunciationEpoch++;pronunciationEntries={};pronunciationChatId='';sayDrafts.clear();testPick.clear();fixName='';fixSay='';renderAssignments();
+    pronunciationEpoch++;pronunciationEntries={};pronunciationChatId='';sayDrafts.clear();addedCast.clear();addedNames.clear();castDrafts.clear();openCast.clear();moreOpen.clear();testPick.clear();fixName='';fixSay='';renderAssignments();
     stop(false); messages=[]; selectedId='';automaticPreparations.clear();
     for (const handle of bubbleHandles.values()) ctx.dom.uninject(handle);
     bubbleHandles.clear(); notice(settings.enabled?'Looking for saved audio…':'Readalong is off.'); void safe(async()=>{await refreshPronunciations();await refreshMessages();await prepareLatest(false,true)});

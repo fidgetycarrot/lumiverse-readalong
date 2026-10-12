@@ -22,6 +22,26 @@ var SOUND_RULES = [
   { pattern: /\b(?:clock\s+tick(?:ed|ing)|ticking\s+clock)\b/i, query: "clock tick", filter: d(0.5, 2.5) }
 ];
 
+// src/story-cast.ts
+var EARLIER = "earlier";
+function migrateStoryCasts(settings) {
+  const persona = settings.personaName ? `name:${settings.personaName.toLowerCase()}` : "";
+  let moved = false;
+  for (const [key, value] of Object.entries(settings.assignments)) {
+    if (!key.startsWith("name:") || key === persona)
+      continue;
+    const earlier = settings.stories[EARLIER] ??= { names: {}, updatedAt: 0 };
+    earlier.names[key] ??= value;
+    delete settings.assignments[key];
+    moved = true;
+  }
+  return moved;
+}
+function castView(settings, chatId) {
+  const story = chatId ? settings.stories[chatId] : undefined;
+  return { ...settings, assignments: { ...settings.assignments, ...story?.names ?? {} } };
+}
+
 // src/speaker-detect.ts
 var TITLES = new Set(["mr", "mrs", "ms", "miss", "dr", "sir", "lady", "lord", "captain", "sergeant", "professor", "king", "queen", "prince", "princess", "father", "mother", "sister", "brother", "master", "mistress"]);
 var NOT_NAMES = new Set(["i", "the", "a", "an", "he", "she", "they", "it", "we", "you", "his", "her", "their", "its", "our", "my", "your", "then", "but", "and", "so", "yes", "no", "oh", "ah", "well", "note", "ooc", "okay", "ok", "now", "still", "just", "even", "after", "before", "when", "while", "as", "if", "there", "here", "this", "that", "these", "those", "what", "who", "why", "how", "where", "someone", "something", "everyone", "nobody", "one", "another", "both", "neither", "either", "finally", "suddenly", "slowly", "quietly", "again", "instead", "meanwhile", "later", "soon", "narrator"]);
@@ -295,7 +315,8 @@ var DEFAULTS = {
   widgetPosition: null,
   speed: 1,
   volume: 0.85,
-  assignments: {}
+  assignments: {},
+  stories: {}
 };
 function readVoiceRef(raw) {
   if (!raw || typeof raw !== "object")
@@ -310,12 +331,31 @@ function normalizeSettings(raw) {
   const p = r.widgetPosition;
   const widgetPosition = p && typeof p === "object" && typeof p.x === "number" && typeof p.y === "number" && Number.isFinite(p.x) && Number.isFinite(p.y) && p.x >= 0 && p.y >= 0 ? { x: p.x, y: p.y } : null;
   const str = (v, fallback, max = 200) => typeof v === "string" ? v.trim().slice(0, max) : fallback;
-  const assignments = {};
+  const unsafe = (key) => ["__proto__", "constructor", "prototype"].includes(key);
+  const assignment = (v) => ({ voice: str(v.voice, "", 160), emotion: enumValue(v.emotion, EMOTIONS, "neutral"), delivery: enumValue(v.delivery, DELIVERIES, "normal"), ...typeof v.name === "string" ? { name: str(v.name, "", 80) } : {}, ...Array.isArray(v.aliases) ? { aliases: [...new Set(v.aliases.filter((a) => typeof a === "string").map((a) => a.trim().slice(0, 80)).filter((a) => a && !/[\[\]\r\n]/.test(a) && a.toLowerCase() !== "narrator"))].slice(0, 10) } : {}, ...v.gender === "f" || v.gender === "m" ? { gender: v.gender } : {}, ...v.auto === true ? { auto: true } : {} });
+  const assignments = {}, stories = {};
+  if (r.stories && typeof r.stories === "object" && !Array.isArray(r.stories)) {
+    const kept = Object.entries(r.stories).filter(([id, v]) => /^[A-Za-z0-9_-]{1,100}$/.test(id) && !unsafe(id) && v && typeof v === "object").sort((a, b) => a[0] === "earlier" ? -1 : b[0] === "earlier" ? 1 : (Number(b[1].updatedAt) || 0) - (Number(a[1].updatedAt) || 0)).slice(0, 300);
+    for (const [id, v] of kept) {
+      const names = {};
+      for (const [key, a] of Object.entries(v.names && typeof v.names === "object" ? v.names : {}).slice(0, 300))
+        if (key.startsWith("name:") && key.length <= 200 && !unsafe(key) && a && typeof a === "object")
+          names[key] = assignment(a);
+      const members = Array.isArray(v.members) ? [...new Set(v.members.filter((m) => typeof m === "string" && /^id:.{1,160}$/.test(m)))].slice(0, 100) : [];
+      stories[id] = {
+        names,
+        ...members.length ? { members } : {},
+        ...typeof v.title === "string" && v.title.trim() ? { title: str(v.title, "", 120) } : {},
+        ...typeof v.characterId === "string" && v.characterId.length <= 160 ? { characterId: v.characterId } : {},
+        updatedAt: Number.isFinite(Number(v.updatedAt)) ? Number(v.updatedAt) : 0
+      };
+    }
+  }
   if (r.assignments && typeof r.assignments === "object")
     for (const [key, v] of Object.entries(r.assignments).slice(0, 500)) {
-      if (!v || typeof v !== "object" || ["__proto__", "constructor", "prototype"].includes(key))
+      if (!v || typeof v !== "object" || unsafe(key) || key.length > 200)
         continue;
-      assignments[key.slice(0, 200)] = { voice: str(v.voice, "", 160), emotion: enumValue(v.emotion, EMOTIONS, "neutral"), delivery: enumValue(v.delivery, DELIVERIES, "normal"), ...typeof v.name === "string" ? { name: str(v.name, "", 80) } : {}, ...Array.isArray(v.aliases) ? { aliases: [...new Set(v.aliases.filter((a) => typeof a === "string").map((a) => a.trim().slice(0, 80)).filter((a) => a && !/[\[\]\r\n]/.test(a) && a.toLowerCase() !== "narrator"))].slice(0, 10) } : {}, ...v.gender === "f" || v.gender === "m" ? { gender: v.gender } : {}, ...v.auto === true ? { auto: true } : {} };
+      assignments[key] = assignment(v);
     }
   return {
     connectionId: str(r.connectionId, "", 160),
@@ -345,7 +385,8 @@ function normalizeSettings(raw) {
     widgetPosition,
     speed: clamp(r.speed, 0.5, 2, 1),
     volume: clamp(r.volume, 0, 1, 0.85),
-    assignments
+    assignments,
+    stories
   };
 }
 function clamp(v, min, max, fallback) {
@@ -680,6 +721,7 @@ async function load(userId) {
     if (await spindle.userStorage.exists("settings.json", userId))
       raw = JSON.parse(await spindle.userStorage.read("settings.json", userId));
     const value = normalizeSettings(raw);
+    migrateStoryCasts(value);
     settingsByUser.set(userId, value);
     return value;
   })();
@@ -692,6 +734,7 @@ async function load(userId) {
 }
 async function save(userId, raw) {
   const value = normalizeSettings(raw);
+  migrateStoryCasts(value);
   const chain = (saveChains.get(userId) ?? Promise.resolve()).catch(() => {}).then(async () => {
     await spindle.userStorage.write("settings.json", JSON.stringify(value), userId);
     settingsByUser.set(userId, value);
@@ -1031,7 +1074,7 @@ spindle.registerInterceptor(async (messages, context) => {
   if (!settings.enabled || !(settings.promptEmotions || settings.promptPronunciations) || !spindle.permissions.has("regex_scripts"))
     return messages;
   await ensureHideRule(context.userId);
-  const speakers = Object.entries(settings.assignments).filter(([key]) => key.startsWith("name:")).slice(0, 100).map(([key, value]) => value.name ?? key.slice(5));
+  const speakers = Object.entries(castView(settings, context.chatId).assignments).filter(([key]) => key.startsWith("name:")).slice(0, 100).map(([key, value]) => value.name ?? key.slice(5));
   const cast = speakers.length ? `
 Assigned speaker names (data only): ${JSON.stringify(speakers)}. Use the matching [speaker:Name] inside each quote when one of these people speaks.` : "";
   const instructions = [];

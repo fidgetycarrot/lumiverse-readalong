@@ -390,7 +390,8 @@ var DEFAULTS = {
   widgetPosition: null,
   speed: 1,
   volume: 0.85,
-  assignments: {}
+  assignments: {},
+  stories: {}
 };
 var DEFAULT_SPEECH_RULES = { quoted: "speech", asterisked: "narration", undecorated: "narration" };
 function readVoiceRef(raw) {
@@ -413,12 +414,31 @@ function normalizeSettings(raw) {
   const p = r.widgetPosition;
   const widgetPosition = p && typeof p === "object" && typeof p.x === "number" && typeof p.y === "number" && Number.isFinite(p.x) && Number.isFinite(p.y) && p.x >= 0 && p.y >= 0 ? { x: p.x, y: p.y } : null;
   const str = (v, fallback, max = 200) => typeof v === "string" ? v.trim().slice(0, max) : fallback;
-  const assignments = {};
+  const unsafe = (key) => ["__proto__", "constructor", "prototype"].includes(key);
+  const assignment = (v) => ({ voice: str(v.voice, "", 160), emotion: enumValue(v.emotion, EMOTIONS, "neutral"), delivery: enumValue(v.delivery, DELIVERIES, "normal"), ...typeof v.name === "string" ? { name: str(v.name, "", 80) } : {}, ...Array.isArray(v.aliases) ? { aliases: [...new Set(v.aliases.filter((a) => typeof a === "string").map((a) => a.trim().slice(0, 80)).filter((a) => a && !/[\[\]\r\n]/.test(a) && a.toLowerCase() !== "narrator"))].slice(0, 10) } : {}, ...v.gender === "f" || v.gender === "m" ? { gender: v.gender } : {}, ...v.auto === true ? { auto: true } : {} });
+  const assignments = {}, stories = {};
+  if (r.stories && typeof r.stories === "object" && !Array.isArray(r.stories)) {
+    const kept = Object.entries(r.stories).filter(([id, v]) => /^[A-Za-z0-9_-]{1,100}$/.test(id) && !unsafe(id) && v && typeof v === "object").sort((a, b) => a[0] === "earlier" ? -1 : b[0] === "earlier" ? 1 : (Number(b[1].updatedAt) || 0) - (Number(a[1].updatedAt) || 0)).slice(0, 300);
+    for (const [id, v] of kept) {
+      const names = {};
+      for (const [key, a] of Object.entries(v.names && typeof v.names === "object" ? v.names : {}).slice(0, 300))
+        if (key.startsWith("name:") && key.length <= 200 && !unsafe(key) && a && typeof a === "object")
+          names[key] = assignment(a);
+      const members = Array.isArray(v.members) ? [...new Set(v.members.filter((m) => typeof m === "string" && /^id:.{1,160}$/.test(m)))].slice(0, 100) : [];
+      stories[id] = {
+        names,
+        ...members.length ? { members } : {},
+        ...typeof v.title === "string" && v.title.trim() ? { title: str(v.title, "", 120) } : {},
+        ...typeof v.characterId === "string" && v.characterId.length <= 160 ? { characterId: v.characterId } : {},
+        updatedAt: Number.isFinite(Number(v.updatedAt)) ? Number(v.updatedAt) : 0
+      };
+    }
+  }
   if (r.assignments && typeof r.assignments === "object")
     for (const [key, v] of Object.entries(r.assignments).slice(0, 500)) {
-      if (!v || typeof v !== "object" || ["__proto__", "constructor", "prototype"].includes(key))
+      if (!v || typeof v !== "object" || unsafe(key) || key.length > 200)
         continue;
-      assignments[key.slice(0, 200)] = { voice: str(v.voice, "", 160), emotion: enumValue(v.emotion, EMOTIONS, "neutral"), delivery: enumValue(v.delivery, DELIVERIES, "normal"), ...typeof v.name === "string" ? { name: str(v.name, "", 80) } : {}, ...Array.isArray(v.aliases) ? { aliases: [...new Set(v.aliases.filter((a) => typeof a === "string").map((a) => a.trim().slice(0, 80)).filter((a) => a && !/[\[\]\r\n]/.test(a) && a.toLowerCase() !== "narrator"))].slice(0, 10) } : {}, ...v.gender === "f" || v.gender === "m" ? { gender: v.gender } : {}, ...v.auto === true ? { auto: true } : {} };
+      assignments[key] = assignment(v);
     }
   return {
     connectionId: str(r.connectionId, "", 160),
@@ -448,7 +468,8 @@ function normalizeSettings(raw) {
     widgetPosition,
     speed: clamp(r.speed, 0.5, 2, 1),
     volume: clamp(r.volume, 0, 1, 0.85),
-    assignments
+    assignments,
+    stories
   };
 }
 function clamp(v, min, max, fallback) {
@@ -1723,6 +1744,132 @@ function autoCast(settings, input) {
   return added;
 }
 
+// src/story-cast.ts
+var EARLIER = "earlier";
+var MAX_STORIES = 300;
+function castView(settings, chatId) {
+  const story = chatId ? settings.stories[chatId] : undefined;
+  return { ...settings, assignments: { ...settings.assignments, ...story?.names ?? {} } };
+}
+function story(settings, chatId) {
+  return settings.stories[chatId] ??= { names: {}, updatedAt: Date.now() };
+}
+function trim(settings) {
+  const ids = Object.keys(settings.stories).filter((id) => id !== EARLIER);
+  if (ids.length <= MAX_STORIES)
+    return;
+  const empty = (id) => !Object.keys(settings.stories[id].names).length && !settings.stories[id].members?.length;
+  ids.sort((a, b) => Number(empty(b)) - Number(empty(a)) || settings.stories[a].updatedAt - settings.stories[b].updatedAt);
+  for (const id of ids.slice(0, ids.length - MAX_STORIES))
+    delete settings.stories[id];
+}
+function noteStory(settings, chatId, meta) {
+  const s = story(settings, chatId);
+  let changed = false;
+  if (meta.characterId && s.characterId !== meta.characterId) {
+    s.characterId = meta.characterId;
+    changed = true;
+  }
+  const title = meta.title?.trim().slice(0, 120);
+  if (title && s.title !== title) {
+    s.title = title;
+    changed = true;
+  }
+  trim(settings);
+  return changed;
+}
+function setCastEntry(settings, chatId, key, value) {
+  const persona = settings.personaName ? `name:${settings.personaName.toLowerCase()}` : "";
+  if (key.startsWith("id:") || key === persona || !chatId) {
+    if (value)
+      settings.assignments[key] = value;
+    else
+      delete settings.assignments[key];
+    if (chatId && key.startsWith("id:"))
+      setMember(settings, chatId, key, !!value);
+    return;
+  }
+  const s = story(settings, chatId);
+  if (value)
+    s.names[key] = value;
+  else
+    delete s.names[key];
+  s.updatedAt = Date.now();
+  trim(settings);
+}
+function setMember(settings, chatId, key, member) {
+  const s = story(settings, chatId), members = new Set(s.members ?? []);
+  if (member)
+    members.add(key);
+  else
+    members.delete(key);
+  if (members.size)
+    s.members = [...members].slice(0, 100);
+  else
+    delete s.members;
+  s.updatedAt = Date.now();
+}
+var mentions2 = (texts, names) => {
+  const wanted = names.map((n) => n.trim()).filter((n) => n.length > 1).map((n) => new RegExp(`(?<![\\p{L}\\p{N}])${n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\p{L}\\p{N}])`, "iu"));
+  return texts.some((t) => wanted.some((re) => re.test(t)));
+};
+function claimEarlier(settings, chatId, texts, characters) {
+  if (settings.stories[chatId] || chatId === EARLIER)
+    return [];
+  const s = story(settings, chatId), claimed = [];
+  for (const [key, a] of Object.entries(settings.stories[EARLIER]?.names ?? {})) {
+    const name = a.name ?? key.slice(5);
+    if (mentions2(texts, [name, ...a.aliases ?? []])) {
+      s.names[key] = { ...a };
+      claimed.push(name);
+    }
+  }
+  for (const key of Object.keys(settings.assignments).filter((k) => k.startsWith("id:"))) {
+    const c = characters.find((c) => c.id === key.slice(3));
+    if (c && mentions2(texts, [c.name.split("||")[0]])) {
+      s.members = [...new Set([...s.members ?? [], key])];
+      claimed.push(c.name.split("||")[0].trim());
+    }
+  }
+  trim(settings);
+  return claimed;
+}
+function otherStories(settings, chatId, characterId) {
+  return Object.entries(settings.stories).filter(([id, s]) => id !== chatId && Object.keys(s.names).length + (s.members?.length ?? 0) > 0).map(([id, s]) => ({ id, title: id === EARLIER ? "Voices saved before stories had their own cast" : s.title ?? "A story", characterId: s.characterId, count: Object.keys(s.names).length + (s.members?.length ?? 0), updatedAt: s.updatedAt })).sort((a, b) => Number(!!characterId && b.characterId === characterId) - Number(!!characterId && a.characterId === characterId) || Number(a.id === EARLIER) - Number(b.id === EARLIER) || b.updatedAt - a.updatedAt).map(({ updatedAt: _, ...rest }) => rest);
+}
+function copyCast(settings, from, to) {
+  const source = settings.stories[from];
+  if (!source || from === to)
+    return 0;
+  const s = story(settings, to);
+  let added = 0;
+  for (const [key, a] of Object.entries(source.names))
+    if (!s.names[key]) {
+      s.names[key] = { ...a };
+      added++;
+    }
+  for (const key of source.members ?? [])
+    if (!s.members?.includes(key)) {
+      s.members = [...s.members ?? [], key];
+      added++;
+    }
+  s.updatedAt = Date.now();
+  trim(settings);
+  return added;
+}
+function namesElsewhere(settings, chatId) {
+  const here = chatId ? settings.stories[chatId]?.names ?? {} : {}, seen = new Set(Object.keys(here)), result = [];
+  const order = Object.entries(settings.stories).filter(([id]) => id !== chatId).sort((a, b) => b[1].updatedAt - a[1].updatedAt);
+  for (const [id, s] of order)
+    for (const [key, a] of Object.entries(s.names)) {
+      if (seen.has(key) || !a.voice)
+        continue;
+      seen.add(key);
+      result.push({ key, name: a.name ?? key.slice(5), assignment: a, from: id === EARLIER ? "saved earlier" : s.title ?? "another story" });
+    }
+  return result.sort((a, b) => a.name.localeCompare(b.name));
+}
+
 // src/saved-recording.ts
 var segment = (value) => value && ["text", "speaker", "emotion", "delivery"].every((k) => typeof value[k] === "string") ? { text: value.text, speaker: value.speaker, emotion: value.emotion, delivery: value.delivery } : undefined;
 function recordingPlan(passages, connections) {
@@ -2171,6 +2318,8 @@ var STYLE = `
 .ra details[open]>summary::after{transform:rotate(45deg)}
 .ra details>summary strong{overflow-wrap:anywhere}.ra details>summary span{color:var(--ra-dim);font-size:12.5px}
 .ra details>.ra-body{padding:2px 12px 12px;display:flex;flex-direction:column;gap:12px}
+.ra .ra-start{display:flex;flex-direction:column;gap:10px;padding:12px;border:1px dashed var(--ra-line);border-radius:10px}
+.ra .ra-start h3{margin:0}
 .ra .ra-fix{display:flex;flex-direction:column;gap:10px;padding:12px;border:1px solid var(--ra-line);border-left:3px solid var(--ra-mark);border-radius:10px;background:var(--ra-soft)}
 .ra button.ra-next{align-self:flex-end}
 .ra details details{background:transparent;border-style:dashed}.ra details details>summary{padding:8px 10px}
@@ -3241,21 +3390,22 @@ function setup(ctx) {
       return [];
     const main = message.name, roster = buildRoster(storyRoster(settings, context, main));
     const speakers = [...new Set(parseSegments(message.content, main, rules ?? DEFAULT_SPEECH_RULES, roster).map((s) => s.speaker))];
-    const story = Object.values(context.pronunciations ?? {});
-    const added = autoCast(settings, {
+    const story = Object.values(context.pronunciations ?? {}), chatId = ctx.getActiveChat().chatId, view = castView(settings, chatId);
+    const added = autoCast(view, {
       speakers,
       voices: voiceNames(),
       genderOfVoice: (v) => voiceGender(settings, v),
       genderOf: (n) => story.find((e) => [e.name, ...e.aliases].some((a) => a.toLowerCase() === n.toLowerCase()))?.gender,
       needsVoice: (n) => {
-        const a = settings.assignments[`name:${n.toLowerCase()}`];
-        return a ? !a.voice : isUnvoicedExtra(n, settings, { ...context, mainSpeaker: main });
+        const a = view.assignments[`name:${n.toLowerCase()}`];
+        return a ? !a.voice : isUnvoicedExtra(n, view, { ...context, mainSpeaker: main });
       }
     });
     const names = Object.values(added).map((a) => a.name);
     if (!names.length)
       return [];
-    Object.assign(settings.assignments, added);
+    for (const [key, value] of Object.entries(added))
+      setCastEntry(settings, chatId, key, value);
     try {
       await saveSettings();
     } catch {}
@@ -3345,8 +3495,8 @@ function setup(ctx) {
     notice("Looking for saved audio…");
     renderPlayer();
     try {
-      let snapshot = normalizeSettings(settings);
       const chatId = ctx.getActiveChat().chatId;
+      let snapshot = castView(normalizeSettings(settings), chatId);
       const context = {
         characters,
         characterId: currentMessage.characterId,
@@ -3377,7 +3527,7 @@ function setup(ctx) {
         if (token !== playbackId)
           return;
         if (cast.length)
-          snapshot = normalizeSettings(settings);
+          snapshot = castView(normalizeSettings(settings), chatId);
       }
       currentPassages = planMessageSpeech(message, snapshot, context, rules);
       currentSegments = currentPassages.flatMap((p) => p.segments);
@@ -3787,6 +3937,26 @@ function setup(ctx) {
     selectedId = messages.some((m) => m.id === selectedId) ? selectedId : messages.at(-1)?.id ?? "";
     renderPlayer();
     decorateMessages();
+    await ensureStory(chatId);
+  }
+  async function ensureStory(chatId) {
+    if (!messages.length || ctx.getActiveChat().chatId !== chatId)
+      return;
+    const first = !settings.stories[chatId];
+    const claimed = claimEarlier(settings, chatId, messages.map((m) => m.content), characters);
+    let title = "";
+    try {
+      title = (await ctx.chats.getActive?.())?.name ?? "";
+    } catch {}
+    if (disposed || ctx.getActiveChat().chatId !== chatId)
+      return;
+    const noted = noteStory(settings, chatId, { characterId: ctx.getActiveChat().characterId, title });
+    if (first || claimed.length || noted) {
+      try {
+        await saveSettings();
+      } catch {}
+    }
+    renderAssignments();
   }
   async function readId(id, restoreOnly = false) {
     if (messageLoad)
@@ -4320,12 +4490,16 @@ function setup(ctx) {
     const wanted = name.toLowerCase();
     return wanted ? storyNames().find((e) => [e.name, ...e.aliases].some((n) => n.toLowerCase() === wanted)) : undefined;
   }
+  function cast() {
+    return castView(settings, ctx.getActiveChat().chatId).assignments;
+  }
   function castName(key) {
-    return key.startsWith("id:") ? characters.find((c) => c.id === key.slice(3))?.name ?? "Unknown character" : settings.assignments[key]?.name ?? castDrafts.get(key)?.name ?? addedNames.get(key) ?? key.slice(5);
+    return key.startsWith("id:") ? characters.find((c) => c.id === key.slice(3))?.name ?? "Unknown character" : cast()[key]?.name ?? castDrafts.get(key)?.name ?? addedNames.get(key) ?? key.slice(5);
   }
   function voiceForName(name) {
     const wanted = name.toLowerCase(), character = characters.find((c) => baseName(c.name).toLowerCase() === wanted);
-    return settings.assignments[`name:${wanted}`] ?? (character ? settings.assignments[`id:${character.id}`] : undefined);
+    const voices = cast();
+    return voices[`name:${wanted}`] ?? (character ? voices[`id:${character.id}`] : undefined);
   }
   function sayingEntry(name, spokenAs, aliases) {
     const entry = pronunciationEntry({ name, spokenAs, aliases: aliases.split(",").map((s) => s.trim()).filter(Boolean) }, "manual");
@@ -4358,7 +4532,7 @@ function setup(ctx) {
     return preview(voice, assignment, { text: pronunciationSample(entry, only), entries: normalizePronunciations({ [entry.name]: entry }) });
   }
   function castForm(container, key, name, inList = true) {
-    const saved = settings.assignments[key], spoken = baseName(name), known = sayingFor(spoken), hasStory = !!ctx.getActiveChat().chatId;
+    const saved = cast()[key], spoken = baseName(name), known = sayingFor(spoken), hasStory = !!ctx.getActiveChat().chatId;
     if (!castDrafts.has(key))
       castDrafts.set(key, { ...saved ?? emptyVoice(), ...key.startsWith("name:") ? { name: spoken } : {} });
     const draft = castDrafts.get(key);
@@ -4465,10 +4639,13 @@ function setup(ctx) {
       const entry = hasStory && edited && say.spokenAs.trim() ? sayingEntry(known?.name ?? spoken, say.spokenAs, say.aliases) : undefined;
       if (!wantsVoice && !entry && !(edited && known))
         throw new Error("Pick a voice or type how to say the name first.");
+      const chatId = ctx.getActiveChat().chatId, persona = settings.personaName ? `name:${settings.personaName.toLowerCase()}` : "";
+      if (wantsVoice && !chatId && key.startsWith("name:") && key !== persona)
+        throw new Error("Open a story first. Each story keeps its own cast.");
       if (wantsVoice) {
         const own = { ...draft };
         delete own.auto;
-        settings.assignments[key] = own;
+        setCastEntry(settings, chatId, key, own);
         await saveSettings();
       }
       if (entry)
@@ -4484,8 +4661,13 @@ function setup(ctx) {
         if (!result.confirmed)
           return;
       }
-      if (saved) {
-        delete settings.assignments[key];
+      const chatId = ctx.getActiveChat().chatId;
+      if (key.startsWith("id:") && chatId && inList) {
+        setMember(settings, chatId, key, false);
+        if (saved)
+          await saveSettings();
+      } else if (saved) {
+        setCastEntry(settings, chatId, key, undefined);
         await saveSettings();
       }
       if (known)
@@ -4519,14 +4701,10 @@ function setup(ctx) {
     target?.select();
   }
   function castRows() {
-    const keys = new Set([...Object.keys(settings.assignments).filter((key) => /^(id|name):/.test(key)), ...addedCast]);
-    if (!keys.size && !castInitialized) {
-      const id = ctx.getActiveChat().characterId ?? characters[0]?.id;
-      if (id && characters.some((c) => c.id === id)) {
-        addedCast.add(`id:${id}`);
-        keys.add(`id:${id}`);
-      }
-    }
+    const { chatId, characterId: active } = ctx.getActiveChat(), story = chatId ? settings.stories[chatId] : undefined;
+    const keys = new Set(chatId ? [...Object.keys(story?.names ?? {}), ...story?.members ?? [], ...addedCast] : [...Object.keys(settings.assignments).filter((key) => key.startsWith("id:")), ...addedCast]);
+    if (active && characters.some((c) => c.id === active))
+      keys.add(`id:${active}`);
     const you = settings.personaName ? `name:${settings.personaName.toLowerCase()}` : "";
     if (you)
       keys.add(you);
@@ -4536,7 +4714,7 @@ function setup(ctx) {
       if (!rows.some((r) => names.includes(baseName(r.name).toLowerCase())))
         rows.push({ key: `name:${entry.name.toLowerCase()}`, name: entry.name, you: false });
     }
-    const active = ctx.getActiveChat().characterId, rank = (r) => r.you ? 0 : r.key === `id:${active}` ? 1 : 2;
+    const rank = (r) => r.you ? 0 : r.key === `id:${active}` ? 1 : 2;
     return rows.sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name));
   }
   function renderAssignments() {
@@ -4545,7 +4723,10 @@ function setup(ctx) {
     if (!castInitialized && rows.length) {
       castInitialized = true;
     }
-    if (hasStory) {
+    const chatId = ctx.getActiveChat().chatId, story = chatId ? settings.stories[chatId] : undefined;
+    const active = ctx.getActiveChat().characterId;
+    const empty = !!chatId && !Object.keys(story?.names ?? {}).length && !(story?.members ?? []).some((m) => m !== `id:${active}`) && !addedCast.size && !storyNames().length;
+    if (hasStory && !empty) {
       const fix = el("div", "", "ra-fix"), names = el("datalist");
       names.id = "ra-cast-names";
       for (const name of new Set(rows.map((r) => baseName(r.name)))) {
@@ -4594,7 +4775,43 @@ function setup(ctx) {
       fix.append(el("h3", "Fix how a name is said"), fields, actions, names);
       assignmentsCard.append(fix);
     }
-    assignmentsCard.append(el("h3", "Cast"), el("p", "Everyone in your stories who has a voice, plus the names this story has picked up.", "ra-muted"));
+    const copyFrom = (from) => safe(async () => {
+      if (!chatId)
+        return;
+      const added = copyCast(settings, from, chatId);
+      await saveSettings();
+      renderAssignments();
+      notice(added ? `Copied ${added} ${added === 1 ? "voice" : "voices"} into this story.` : "This story already has all of those voices.");
+    });
+    const storyPicker = (label) => {
+      const stories = otherStories(settings, chatId, ctx.getActiveChat().characterId);
+      if (!stories.length)
+        return null;
+      let from = stories[0].id;
+      const row = el("div", "", "ra-row ra-end");
+      row.append(field(label, select(stories.map((o) => ({ value: o.id, label: `${o.title} (${o.count})` })), from, (v) => from = v)), button("Copy cast", () => copyFrom(from)));
+      return row;
+    };
+    if (chatId) {
+      assignmentsCard.append(el("h3", "Cast for this story"), el("p", "The people in this story and their voices. The narrator, You and Everyone else sound the same in every story.", "ra-muted"));
+      if (empty) {
+        const start = el("div", "", "ra-start");
+        start.append(el("h3", "Set up this story’s cast"), el("p", "Nobody else in this story has a voice yet. Add the characters you want to hear, then pick a voice for each. New names also show up here as the story brings them in.", "ra-muted"));
+        const addButton = button("Add a character", () => {
+          addOpen = true;
+          renderAssignments();
+          assignmentsCard.querySelector('input[placeholder="For example, Jason"]')?.focus();
+        }, true);
+        const startActions = el("div", "", "ra-row");
+        startActions.append(addButton);
+        start.append(startActions);
+        const copy = storyPicker("Or start with a cast from another story");
+        if (copy)
+          start.append(copy);
+        assignmentsCard.append(start);
+      }
+    } else
+      assignmentsCard.append(el("h3", "Cast"), el("p", "Open a story to see and set up its cast. Voices here are shared by every story.", "ra-muted"));
     const narrator = disclosure([el("strong", "Narrator"), el("span", settings.narratorVoice ? voiceLabel(settings.narratorVoice) : `Main voice: ${voiceLabel(settings.voice)}`)], openCast.has("narrator"));
     narrator.details.addEventListener("toggle", () => {
       if (narrator.details.isConnected) {
@@ -4646,7 +4863,7 @@ function setup(ctx) {
       assignmentsCard.append(you.details);
     }
     for (const row of rows) {
-      const saved = settings.assignments[row.key], known = sayingFor(baseName(row.name));
+      const saved = cast()[row.key], known = sayingFor(baseName(row.name));
       const summary = [el("strong", row.you ? `You (${row.name})` : baseName(row.name)), el("span", saved?.voice ? `${voiceLabel(saved.voice)}${saved.auto ? ", picked for you" : ""}` : "No voice yet")];
       if (known)
         summary.push(el("span", `said “${known.spokenAs}”`));
@@ -4695,11 +4912,16 @@ function setup(ctx) {
       others.body.append(el("p", "This only works when “Mark feelings and who is speaking” is on under Connection. That is how Readalong knows who is talking.", "ra-muted"));
     assignmentsCard.append(others.details);
     function addMember(key, name) {
-      if (!rows.some((r) => r.key === key) && rows.length >= 500) {
-        notice("The cast can hold up to 500 people.", true);
+      if (!rows.some((r) => r.key === key) && rows.length >= 300) {
+        notice("A story’s cast can hold up to 300 people.", true);
         return;
       }
-      addedCast.add(key);
+      const chatId = ctx.getActiveChat().chatId;
+      if (key.startsWith("id:") && chatId) {
+        setMember(settings, chatId, key, true);
+        safe(saveSettings);
+      } else
+        addedCast.add(key);
       if (name)
         addedNames.set(key, name);
       openCast.add(key);
@@ -4739,7 +4961,30 @@ function setup(ctx) {
     });
     addByName.dataset.raControl = "Add by name";
     byName.append(field("Or anyone else, by name", speakerInput), addByName);
-    add.body.append(fromLibrary, byName, el("p", "Side characters can have a voice too. For Readalong to tell several speakers apart in one reply, turn on “Mark feelings and who is speaking” under Connection.", "ra-muted"));
+    add.body.append(fromLibrary, byName);
+    const elsewhere = chatId ? namesElsewhere(settings, chatId).filter((n) => !rows.some((r) => r.key === n.key)) : [];
+    if (elsewhere.length) {
+      let pick = elsewhere[0].key;
+      const row = el("div", "", "ra-row ra-end");
+      row.append(field("Or someone from another story", select(elsewhere.map((n) => ({ value: n.key, label: `${n.name} · ${voiceLabel(n.assignment.voice)} · ${n.from}` })), pick, (v) => pick = v)), button("Add", () => safe(async () => {
+        const found = elsewhere.find((n) => n.key === pick);
+        if (!found || !chatId)
+          return;
+        setCastEntry(settings, chatId, found.key, { ...found.assignment });
+        openCast.add(found.key);
+        addOpen = false;
+        await saveSettings();
+        renderAssignments();
+        notice(`${found.name} joined this story with the same voice.`);
+      })));
+      add.body.append(row);
+    }
+    if (chatId && story && (Object.keys(story.names).length || story.members?.length)) {
+      const copy = storyPicker("Copy a whole cast from another story");
+      if (copy)
+        add.body.append(copy);
+    }
+    add.body.append(el("p", "Side characters can have a voice too. For Readalong to tell several speakers apart in one reply, turn on “Mark feelings and who is speaking” under Connection.", "ra-muted"));
     assignmentsCard.append(add.details, toggle("Give new characters a voice automatically", settings.autoVoices, (v) => {
       settings.autoVoices = v;
       safe(saveSettings);
@@ -4771,6 +5016,11 @@ function setup(ctx) {
     pronunciationEntries = {};
     pronunciationChatId = "";
     sayDrafts.clear();
+    addedCast.clear();
+    addedNames.clear();
+    castDrafts.clear();
+    openCast.clear();
+    moreOpen.clear();
     testPick.clear();
     fixName = "";
     fixSay = "";

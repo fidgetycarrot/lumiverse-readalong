@@ -28,6 +28,8 @@ export const CUE_PATTERN = String.raw`\[(?:emotion|delivery|speaker):[^\]\r\n]{1
 export const HIDE_RULE_NAME = 'Readalong • Hide voice cues';
 /** gender: how the character should sound. auto: Readalong picked the voice. */
 export interface VoiceAssignment { voice: string; emotion: string; delivery: string; name?:string; aliases?:string[]; gender?:VoiceGender; auto?:boolean }
+/** One story's own cast. A story is one Lumiverse chat. */
+export interface StoryCast { names: Record<string, VoiceAssignment>; members?: string[]; title?: string; characterId?: string; updatedAt: number }
 export interface Settings {
   provider: 'lumiverse' | 'openrouter' | 'browser' | 'local';
   connectionId: string;
@@ -37,12 +39,15 @@ export interface Settings {
   mix:Record<string,{gain:number;mute:boolean}>; dialogueOnly:boolean; soundEffects:boolean; saveToMessage:boolean; savedRecordings:number; voiceGenders:Record<string,VoiceGender|'n'>;
   inheritVoices: boolean; widgetMinimized: boolean; widgetPosition: {x:number;y:number}|null;
   speed: number; volume: number;
+  /** Voices shared by every story: library characters (`id:`) and You. */
   assignments: Record<string, VoiceAssignment>;
+  /** Each story's own named cast, by chat ID. `earlier` holds names saved before casts were per story. */
+  stories: Record<string, StoryCast>;
 }
 export const DEFAULTS: Settings = {
   provider: 'openrouter', connectionId:'', model: 'google/gemini-3.8-flash-tts', voice: 'Kore', narratorVoice: '',
   localUrl: 'http://localhost:8880/v1', enabled: false, follow: false, earlyPlayback:true, automaticPlayback:false,
-  promptEmotions: true, useEmotions: true, promptPronunciations:true, personaName:'', npcVoice:'', autoVoices:true, mix:{}, dialogueOnly:false, soundEffects:false, saveToMessage:false, savedRecordings:30, voiceGenders:{}, inheritVoices:true, widgetMinimized:false, widgetPosition:null, speed: 1, volume: 0.85, assignments: {},
+  promptEmotions: true, useEmotions: true, promptPronunciations:true, personaName:'', npcVoice:'', autoVoices:true, mix:{}, dialogueOnly:false, soundEffects:false, saveToMessage:false, savedRecordings:30, voiceGenders:{}, inheritVoices:true, widgetMinimized:false, widgetPosition:null, speed: 1, volume: 0.85, assignments: {}, stories: {},
 };
 export interface SpeechSegment { text: string; speaker: string; emotion: string; delivery: string }
 export interface SpeechModel { id: string; name: string; voices: string[] }
@@ -69,10 +74,24 @@ export function normalizeSettings(raw: unknown): Settings {
   const p=r.widgetPosition;
   const widgetPosition=p && typeof p==='object' && typeof p.x==='number' && typeof p.y==='number' && Number.isFinite(p.x) && Number.isFinite(p.y) && p.x>=0 && p.y>=0?{x:p.x,y:p.y}:null;
   const str = (v: unknown, fallback: string, max = 200) => typeof v === 'string' ? v.trim().slice(0, max) : fallback;
-  const assignments: Settings['assignments'] = {};
+  const unsafe = (key: string) => ['__proto__','constructor','prototype'].includes(key);
+  const assignment = (v: any): VoiceAssignment => ({ voice: str(v.voice, '', 160), emotion: enumValue(v.emotion, EMOTIONS, 'neutral'), delivery: enumValue(v.delivery, DELIVERIES, 'normal'), ...(typeof v.name==='string'?{name:str(v.name,'',80)}:{}), ...(Array.isArray(v.aliases)?{aliases:[...new Set<string>((v.aliases as unknown[]).filter((a:unknown):a is string=>typeof a==='string').map((a:string)=>a.trim().slice(0,80)).filter((a:string)=>a && !/[\[\]\r\n]/.test(a) && a.toLowerCase()!=='narrator'))].slice(0,10)}:{}), ...(v.gender==='f' || v.gender==='m'?{gender:v.gender}:{}), ...(v.auto===true?{auto:true}:{}) });
+  const assignments: Settings['assignments'] = {}, stories: Settings['stories'] = {};
+  if (r.stories && typeof r.stories === 'object' && !Array.isArray(r.stories)) {
+    const kept = Object.entries(r.stories as Record<string, any>).filter(([id, v]) => /^[A-Za-z0-9_-]{1,100}$/.test(id) && !unsafe(id) && v && typeof v === 'object')
+      .sort((a, b) => (a[0] === 'earlier' ? -1 : b[0] === 'earlier' ? 1 : (Number(b[1].updatedAt) || 0) - (Number(a[1].updatedAt) || 0))).slice(0, 300);
+    for (const [id, v] of kept) {
+      const names: Record<string, VoiceAssignment> = {};
+      for (const [key, a] of Object.entries(v.names && typeof v.names === 'object' ? v.names as Record<string, any> : {}).slice(0, 300))
+        if (key.startsWith('name:') && key.length <= 200 && !unsafe(key) && a && typeof a === 'object') names[key] = assignment(a);
+      const members: string[] = Array.isArray(v.members) ? [...new Set<string>((v.members as unknown[]).filter((m: unknown): m is string => typeof m === 'string' && /^id:.{1,160}$/.test(m)))].slice(0, 100) : [];
+      stories[id] = { names, ...(members.length ? { members } : {}), ...(typeof v.title === 'string' && v.title.trim() ? { title: str(v.title, '', 120) } : {}),
+        ...(typeof v.characterId === 'string' && v.characterId.length <= 160 ? { characterId: v.characterId } : {}), updatedAt: Number.isFinite(Number(v.updatedAt)) ? Number(v.updatedAt) : 0 };
+    }
+  }
   if (r.assignments && typeof r.assignments === 'object') for (const [key, v] of Object.entries(r.assignments).slice(0, 500)) {
-    if (!v || typeof v !== 'object' || ['__proto__','constructor','prototype'].includes(key)) continue;
-    assignments[key.slice(0, 200)] = { voice: str(v.voice, '', 160), emotion: enumValue(v.emotion, EMOTIONS, 'neutral'), delivery: enumValue(v.delivery, DELIVERIES, 'normal'), ...(typeof v.name==='string'?{name:str(v.name,'',80)}:{}), ...(Array.isArray(v.aliases)?{aliases:[...new Set(v.aliases.filter((a:unknown):a is string=>typeof a==='string').map(a=>a.trim().slice(0,80)).filter(a=>a && !/[\[\]\r\n]/.test(a) && a.toLowerCase()!=='narrator'))].slice(0,10)}:{}), ...(v.gender==='f' || v.gender==='m'?{gender:v.gender}:{}), ...(v.auto===true?{auto:true}:{}) };
+    if (!v || typeof v !== 'object' || unsafe(key) || key.length > 200) continue;
+    assignments[key] = assignment(v);
   }
   return {
     connectionId: str(r.connectionId,'',160),
@@ -82,7 +101,7 @@ export function normalizeSettings(raw: unknown): Settings {
     enabled: typeof r.enabled==='boolean'?r.enabled:DEFAULTS.enabled, follow: r.follow === true, earlyPlayback:r.earlyPlayback!==false, automaticPlayback:r.automaticPlayback===true,
     promptEmotions: r.promptEmotions !== false, useEmotions: r.useEmotions !== false,promptPronunciations:r.promptPronunciations!==false, autoVoices:r.autoVoices!==false, dialogueOnly:r.dialogueOnly===true, soundEffects:r.soundEffects===true, saveToMessage:r.saveToMessage===true, savedRecordings:Number.isFinite(Number(r.savedRecordings))?Math.round(Math.min(200,Math.max(5,Number(r.savedRecordings)))):30,
     mix:Object.fromEntries(Object.entries(r.mix && typeof r.mix==='object' && !Array.isArray(r.mix)?r.mix as Record<string,any>:{}).filter(([k,v])=>k.length>0 && k.length<=80 && k===k.trim().toLowerCase() && !['__proto__','constructor','prototype'].includes(k) && v && typeof v==='object').slice(0,200).map(([k,v])=>[k,{gain:clamp(v.gain,0,1,1),mute:v.mute===true}])), personaName:typeof r.personaName==='string' && r.personaName.trim().length<=80 && !/[\[\]\r\n]/.test(r.personaName)?r.personaName.trim():'', inheritVoices:r.inheritVoices!==false, widgetMinimized:r.widgetMinimized===true, widgetPosition,
-    speed: clamp(r.speed, 0.5, 2, 1), volume: clamp(r.volume, 0, 1, .85), assignments,
+    speed: clamp(r.speed, 0.5, 2, 1), volume: clamp(r.volume, 0, 1, .85), assignments, stories,
   };
 }
 function clamp(v: unknown, min: number, max: number, fallback: number) { return typeof v === 'number' && Number.isFinite(v) ? Math.min(max, Math.max(min, v)) : fallback }

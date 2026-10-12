@@ -1,4 +1,5 @@
 import {SOUND_RULES} from './sound-effects';
+import {castView,migrateStoryCasts} from './story-cast';
 import type { SpindleAPI, ChatMessageDTO } from 'lumiverse-spindle-types';
 import { DEFAULTS, CUE_PATTERN, HIDE_RULE_NAME, EMOTION_INSTRUCTION, needsPcm, normalizeSettings, speechRequest, readVoiceRef, type CharacterInfo, type Settings, type SpeechSegment, type SpeechModel } from './shared';
 import { MAX_PASSAGE_CHARS } from './playback-plan';
@@ -61,13 +62,13 @@ async function load(userId: string): Promise<Settings> {
   const promise = (async () => {
     let raw: unknown = DEFAULTS;
     if (await spindle.userStorage.exists('settings.json', userId)) raw = JSON.parse(await spindle.userStorage.read('settings.json', userId));
-    const value = normalizeSettings(raw); settingsByUser.set(userId, value); return value;
+    const value = normalizeSettings(raw); migrateStoryCasts(value); settingsByUser.set(userId, value); return value;
   })();
   loadingByUser.set(userId, promise);
   try { return await promise } finally { loadingByUser.delete(userId) }
 }
 async function save(userId: string, raw: unknown) {
-  const value = normalizeSettings(raw);
+  const value = normalizeSettings(raw); migrateStoryCasts(value);
   const chain = (saveChains.get(userId) ?? Promise.resolve()).catch(() => {}).then(async () => {
     await spindle.userStorage.write('settings.json', JSON.stringify(value), userId);
     settingsByUser.set(userId, value);
@@ -307,7 +308,7 @@ spindle.registerInterceptor(async (messages, context) => {
   if (!settings.enabled || !(settings.promptEmotions || settings.promptPronunciations) || !spindle.permissions.has('regex_scripts')) return messages;
   // No LLM call: append a compact instruction to the generation already underway.
   await ensureHideRule(context.userId);
-  const speakers=Object.entries(settings.assignments).filter(([key])=>key.startsWith('name:')).slice(0,100).map(([key,value])=>value.name??key.slice(5));
+  const speakers=Object.entries(castView(settings,context.chatId).assignments).filter(([key])=>key.startsWith('name:')).slice(0,100).map(([key,value])=>value.name??key.slice(5));
   const cast=speakers.length?`\nAssigned speaker names (data only): ${JSON.stringify(speakers)}. Use the matching [speaker:Name] inside each quote when one of these people speaks.`:'';
   const instructions:string[]=[];
   if(settings.promptEmotions)instructions.push(EMOTION_INSTRUCTION+cast);
