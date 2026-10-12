@@ -176,3 +176,18 @@ test('canceled and malformed PCM preparations cannot become playable',async()=>{
   await expect(pcmBlobToWav(new Blob([new Uint8Array(2)]),'audio/pcm;rate=wrong')).rejects.toThrow('unsupported');
   await expect(readWave(new Blob([waveHeader(16000),new Uint8Array(10)]))).rejects.toThrow('incomplete');
 });
+
+test('seeking jumps within one joined file and keeps playing, with no new speech',async()=>{
+  const {player,audios}=fixture();player.load([await clip(10),await clip(20),await clip(5)]);await player.play();
+  expect(player.starts).toEqual([0,10,30]);
+  player.seek(12);expect(audios[0].currentTime).toBe(12);expect(player.position.index).toBe(1);
+  player.seek(999);expect(audios[0].currentTime).toBeCloseTo(34.95,2);expect(audios[0].paused).toBe(false);
+});
+test('seeking across early-playback files activates the right one and resumes',async()=>{
+  const {player,audios}=fixture();player.begin([await clip(10)]);player.append([await clip(20)],true);await player.play();
+  player.seek(15);await Promise.resolve();expect(audios[0].currentTime).toBe(5);expect(player.elapsed).toBe(15);expect(audios[0].paused).toBe(false);
+  player.seek(2);await Promise.resolve();expect(player.elapsed).toBe(2);
+});
+test('the per-voice level multiplies the main volume',async()=>{
+  const {player,audios}=fixture();player.load([await clip(1)]);player.setVolume(.8);player.setGain(.5);expect(audios[0].volume).toBeCloseTo(.4);player.setGain(1);expect(audios[0].volume).toBeCloseTo(.8);
+});

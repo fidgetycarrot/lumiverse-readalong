@@ -79,6 +79,9 @@ const STYLE = `
 .ra button.ra-mark{min-height:30px;padding:4px 10px;font-size:12.5px;border-radius:15px;color:var(--ra-dim);background:transparent}
 .ra button.ra-mark[aria-pressed=true]{color:var(--ra-text);border-color:var(--ra-mark);background:rgba(231,178,76,.14);font-weight:600}
 .ra .ra-voice-rows>p{padding:12px}
+.ra .ra-mix{display:flex;flex-direction:column;border:1px solid var(--ra-line);border-radius:10px}
+.ra .ra-mix-row{display:flex;align-items:center;gap:10px;padding:6px 8px 6px 12px;border-bottom:1px solid var(--ra-line)}.ra .ra-mix-row:last-child{border-bottom:0}
+.ra .ra-mix-name{flex:0 0 32%;min-width:0;overflow-wrap:anywhere}.ra .ra-mix-row input[type=range]{flex:1}
 .ra .ra-row.ra-extra{margin-top:-4px}
 .ra .ra-panel{display:flex;flex-direction:column;gap:14px}
 .ra .ra-panel>h3{margin-top:4px}.ra .ra-rule{border:0;border-top:1px solid var(--ra-line);margin:2px 0;width:100%}
@@ -125,6 +128,7 @@ const TAB_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"
 const ICONS = {
   play:'M8 5v14l11-7z', pause:'M6 5h4v14H6zM14 5h4v14h-4z', stop:'M6 6h12v12H6z',
   replay:'M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z',
+  back:'M6 6h2v12H6zm3.5 6 8.5 6V6z', forward:'M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z',
   close:'M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z',
   minimize:'M19 13H5v-2h14v2z', expand:'M21 11V3h-8l3.29 3.29-10 10L3 13v8h8l-3.29-3.29 10-10z',
   power:'M13 3h-2v10h2V3zm4.83 2.17-1.42 1.42C17.99 7.86 19 9.81 19 12c0 3.87-3.13 7-7 7s-7-3.13-7-7c0-2.19 1.01-4.14 2.58-5.42L6.17 5.17C4.23 6.82 3 9.26 3 12c0 4.97 4.03 9 9 9s9-4.03 9-9c0-2.74-1.23-5.18-3.17-6.83z',
@@ -176,6 +180,9 @@ export function setup(ctx: SpindleFrontendContext) {
   const automaticPlayback=new AutomaticPlayback();let automaticPlaybackError='';
   let utterance: SpeechSynthesisUtterance | null = null;
   const audioPlayer=new PreparedPlayer();
+  // iOS Safari ignores element volume; hide level sliders there.
+  let mixerVoices='';
+  const volumeWorks=(()=>{try{const probe=new Audio();probe.volume=.5;return Math.abs(probe.volume-.5)<.01}catch{return false}})();
   const audioCache=new AudioCache();let cacheUserId='';
   const automaticPreparations=new Set<string>();
   const completionInbox=new CompletionInbox(),knownCompletions=new Map<string,string>();
@@ -390,11 +397,13 @@ export function setup(ctx: SpindleFrontendContext) {
       caption.title=warning?status.textContent??warning:caption.textContent ?? '';text.append(who,caption);
       const tools=el('div','', 'ra-row ra-widget-tools');tools.append(resize,close);top.append(play,text,tools);
       const seek=el('div','', 'ra-seek');seek.append(progress,el('span',hasTime?clock:'','ra-time'));
-      const foot=el('div','', 'ra-row ra-widget-foot'),stopButton=withIcon(button('Stop',()=>stop()),'stop');stopButton.disabled=phase==='idle';
+      const foot=el('div','', 'ra-row ra-widget-foot'),stopButton=iconButton('stop','Stop',()=>stop());stopButton.disabled=phase==='idle';
+      const seekable=!!audioPlayer.duration && currentPassages[0]?.settings.provider!=='browser';
+      const back=iconButton('back','Back one part',()=>jump(-1)),forward=iconButton('forward','Forward one part',()=>jump(1));back.disabled=forward.disabled=!seekable;
       const retry=!!retryPreparation && (incompleteAudio || preparingAudio && preparedCount>0);
       const fix=retry?button('Retry missing audio',()=>safe(async()=>{await retryPreparation?.()})):button('Fix a name',()=>fixAName());fix.title=retry?'Requests only missing parts; your speech service may charge.':'Change how a name is said';if(retry)fix.disabled=preparingAudio;
       const open=iconButton('tune','Open Readalong',()=>tab.activate());
-      power.classList.add('ra-push');foot.append(stopButton,fix,power,open);
+      power.classList.add('ra-push');foot.append(back,stopButton,forward,fix,power,open);
       patchPlaybackChildren(widget.root,top,seek,foot);
     }
   }
@@ -405,8 +414,35 @@ export function setup(ctx: SpindleFrontendContext) {
     if(currentMessage){marker.mark(()=>contentRoot(currentMessage!.id),plainText(currentSegments[position].text));if(settings.follow)marker.follow()}
     renderPlayer();
   }
+  // ---- Mixer: skip muted voices (or the narrator) and set each voice's level ----
+  const speakerKey=(index:number)=>(currentPassages[index]?.segments[0]?.speaker||'').trim().toLowerCase();
+  function skipped(index:number){const key=speakerKey(index);return !!key && (settings.dialogueOnly && key==='narrator' || !!settings.mix[key]?.mute)}
+  function applyMix(){
+    if(!audioPlayer.duration || currentPassages[0]?.settings.provider==='browser')return;
+    const at=audioPlayer.position;
+    if(skipped(at.index)){
+      let next=at.index+1;while(next<currentPassages.length && skipped(next))next++;
+      const starts=audioPlayer.starts;
+      if(next<starts.length)audioPlayer.seek(starts[next]+.001);
+      else if(next>=currentPassages.length)audioPlayer.seek(audioPlayer.duration);
+      return;
+    }
+    audioPlayer.setGain(settings.mix[speakerKey(at.index)]?.gain??1);
+  }
+  /** Back: to the start of this part (or the one before, near its start). Forward: the next part. Never requests speech. */
+  function jump(step:-1|1){
+    if(!audioPlayer.duration || currentPassages[0]?.settings.provider==='browser')return;
+    const at=audioPlayer.position,starts=audioPlayer.starts;
+    let index=step<0 && at.seconds>2?at.index:at.index+step;
+    while(index>=0 && index<currentPassages.length && skipped(index))index+=step;
+    index=Math.max(0,index);if(index>=starts.length)return;
+    audioPlayer.seek(starts[index]+.001);
+    if(phase==='finished'){phase='paused';paused=true}
+    markSentence(index,0);applyMix();renderPlayer();
+  }
   function updateClock() {
     if(phase!=='playing')return;
+    applyMix();
     const at=audioPlayer.position,passage=currentPassages[at.index];
     if(passage)markSentence(at.index,estimatedSentenceIndex(passage,at.fraction));
     const progress=widget?.root.querySelector('progress');if(progress && !preparingAudio && !incompleteAudio)progress.value=at.duration?at.elapsed/at.duration:0;
@@ -836,7 +872,9 @@ export function setup(ctx: SpindleFrontendContext) {
     const row=el('div','', 'ra-row'),extra=el('div','', 'ra-row ra-extra');
     if (phase !== 'idle') {
       const play=playButton(()=>safe(playOrPause));play.disabled=phase==='preparing' || !!playAttempt || incompleteAudio && !audioPlayer.duration;
-      row.append(play,iconButton('stop','Stop',()=>stop(),'ra-icon'));
+      const seekable=!!audioPlayer.duration && currentPassages[0]?.settings.provider!=='browser';
+      const back=iconButton('back','Back one part',()=>jump(-1),'ra-icon'),forward=iconButton('forward','Forward one part',()=>jump(1),'ra-icon');back.disabled=forward.disabled=!seekable;
+      row.append(back,play,forward,iconButton('stop','Stop',()=>stop(),'ra-icon'));
       if (currentMessage) row.append(button('Show in chat',()=>marker.follow()),button('Fix a name',()=>fixAName()));
       if(retryPreparation && (incompleteAudio || preparingAudio && preparedCount>0)){const retry=button('Retry missing audio',()=>safe(async()=>{await retryPreparation?.()}),true);retry.disabled=preparingAudio;extra.append(retry)}
       if(currentMessage && !preparingAudio && currentPassages[0]?.settings.provider!=='browser' && preparedCount>0){
@@ -855,6 +893,9 @@ export function setup(ctx: SpindleFrontendContext) {
     if(phase==='idle' && settings.enabled)content.append(el('p','Uses saved audio if there is any. If not, it makes new audio, which may cost money.','ra-muted'));
     if(ready && canFloat && (widgetError || !permissions.includes('ui_panels')))content.append(el('p',widgetError || widgetPermissionHint,'ra-muted'));
     patchPlaybackChildren(player,...content.childNodes);renderWidget();
+    // The mixer lists the loaded reply's voices; rebuild it only when they change.
+    const voicesHere=[...new Set(currentPassages.map((_,i)=>speakerKey(i)))].join('|');
+    if(voicesHere!==mixerVoices){mixerVoices=voicesHere;renderOptions()}
   }
   function renderOptions() {
     const slider=el('input');slider.type='range';slider.min='.5';slider.max='2';slider.step='.1';slider.value=String(settings.speed);
@@ -874,11 +915,35 @@ export function setup(ctx: SpindleFrontendContext) {
       speechActivityNote,
       el('p','Changing a voice, or how a name is said, only changes new audio.','ra-muted'),
       el('p','The highlighted sentence is a close guess of where the voice is.','ra-muted'));
-    options.replaceChildren(sliders,
+    const mixer=el('div','', 'ra-stack');renderMixer(mixer);
+    options.replaceChildren(sliders,mixer,
       toggle('Play replies automatically',settings.automaticPlayback,v=>{void safe(()=>setAutomaticPlayback(v))},'Starts with your next new reply. Older messages still wait for Play.'),
       toggle('Scroll the chat to follow the voice',settings.follow,v=>{settings.follow=v;void safe(saveSettings)}),
       toggle('Start before the whole message is ready',settings.earlyPlayback,v=>{settings.earlyPlayback=v;void safe(saveSettings)},'Play can start once about three quarters of the audio is ready.'),
       about.details);
+  }
+  /** Per-voice levels and skips for the reply that is loaded. */
+  function renderMixer(container:HTMLElement){
+    container.replaceChildren(el('h3','Voices in this reply'));
+    container.append(toggle('Dialogue only',settings.dialogueOnly,v=>{settings.dialogueOnly=v;applyMix();renderMixer(container);void safe(saveSettings)},'Skips the narrator and plays only what characters say.'));
+    const seen=new Map<string,string>();
+    for(let i=0;i<currentPassages.length;i++){const key=speakerKey(i);if(key && !seen.has(key))seen.set(key,currentPassages[i].segments[0].speaker)}
+    if(!seen.size){container.append(el('p','Prepare or play a reply to adjust its voices here.','ra-muted'));return}
+    const list=el('div','', 'ra-mix');
+    for(const [key,speaker] of seen){
+      const level=settings.mix[key]??{gain:1,mute:false},row=el('div','', 'ra-mix-row');
+      const name=el('span','', 'ra-mix-name');name.append(el('strong',speakerLabel(speaker,'Voice')));
+      const set=(next:{gain:number;mute:boolean})=>{settings.mix[key]=next;if(next.gain===1 && !next.mute)delete settings.mix[key];applyMix()};
+      const mute=button(level.mute?'Skipped':'Skip',()=>{set({...level,mute:!level.mute});renderMixer(container);void safe(saveSettings)});
+      mute.className='ra-mark';mute.setAttribute('aria-pressed',String(level.mute));mute.setAttribute('aria-label',`Skip ${speakerLabel(speaker,'this voice')}`);
+      row.append(name);
+      if(volumeWorks){
+        const range=el('input');range.type='range';range.min='0';range.max='1';range.step='.05';range.value=String(level.gain);range.setAttribute('aria-label',`${speakerLabel(speaker,'Voice')} volume`);
+        range.oninput=()=>{level.gain=Number(range.value);set({...level})};range.onchange=()=>{void safe(saveSettings)};row.append(range);
+      }
+      row.append(mute);list.append(row);
+    }
+    container.append(list,el('p',volumeWorks?'Changes apply right away and are remembered for each voice. Skipped voices are still prepared.':'Skip works here. This browser does not let pages change volume, so levels are hidden.','ra-muted'));
   }
   function nextStep(label:string,to:View) { const b=button(label,()=>showView(to,true));b.classList.add('ra-quiet','ra-next');return b }
   function renderConfig() {

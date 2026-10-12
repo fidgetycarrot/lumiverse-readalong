@@ -83,6 +83,7 @@ export class PreparedPlayer {
   private generation=0;
   private speed=1;
   private volume=.85;
+  private gain=1;
   private primed=false;
   private reserve:HTMLAudioElement|null=null;
   private reservePrimed=false;
@@ -143,7 +144,7 @@ export class PreparedPlayer {
     if(this.waiting){this.pause();this.onWaiting(true)}
   }
   get hasStarted(){return this.started}
-  private configure(audio:HTMLAudioElement){audio.preload='auto';audio.volume=this.volume;audio.playbackRate=this.speed}
+  private configure(audio:HTMLAudioElement){audio.preload='auto';audio.volume=this.volume*this.gain;audio.playbackRate=this.speed}
   private activate(index:number) {
     this.index=index;this.configure(this.audio);if(this.audio.src!==this.tracks[index].url)this.audio.src=this.tracks[index].url;
     const generation=this.generation,audio=this.audio;
@@ -223,7 +224,35 @@ export class PreparedPlayer {
   }
   pause(){this.playEpoch++;this.cancelPlay?.();this.pendingPlay=null;this.audio.pause();this.running=false}
   setSpeed(speed:number){this.speed=Math.max(.5,Math.min(2,speed));this.audio.playbackRate=this.speed;if(this.next)this.next.playbackRate=this.speed}
-  setVolume(volume:number){this.volume=Math.max(0,Math.min(1,volume));this.audio.volume=this.volume;if(this.next)this.next.volume=this.volume}
+  setVolume(volume:number){this.volume=Math.max(0,Math.min(1,volume));this.applyVolume()}
+  /** A per-voice level on top of the main volume (the mixer). */
+  setGain(gain:number){const next=Math.max(0,Math.min(1,gain));if(next===this.gain)return;this.gain=next;this.applyVolume()}
+  private applyVolume(){const value=this.volume*this.gain;this.audio.volume=value;if(this.next)this.next.volume=value}
+  /** Start time of each prepared part, in seconds from the start. */
+  get starts(){let t=0;return this.durations.map(d=>{const start=t;t+=d;return start})}
+  /**
+   * Jump to a time in the prepared audio, across joined files if needed.
+   * Local only: never requests speech. A running reading keeps playing.
+   */
+  seek(seconds:number){
+    if(!this.tracks.length)return;
+    const loaded=this.tracks.reduce((sum,t)=>sum+t.duration,0);
+    const target=Math.max(0,Math.min(seconds,Math.max(0,loaded-.05)));
+    let index=0,start=0;
+    while(index+1<this.tracks.length && start+this.tracks[index].duration<=target)start+=this.tracks[index++].duration;
+    const offset=target-start,running=this.running,generation=this.generation;
+    this.finished=false;
+    if(this.waiting){this.waiting=false;this.onWaiting(false)}
+    if(index!==this.index){
+      this.pause();
+      this.next?.removeAttribute('src');this.next?.load();this.next=null;
+      this.audio.onended=null;this.audio.onerror=null;this.audio.onplaying=null;this.audio.onloadedmetadata=null;
+      this.activate(index);
+    }
+    const audio=this.audio,apply=()=>{if(generation!==this.generation || audio!==this.audio)return;try{audio.currentTime=offset;audio.onloadedmetadata=null}catch{ /* Retried once metadata is available. */ }};
+    if(audio.readyState>=1)apply();else{audio.onloadedmetadata=apply;apply()}
+    if(running && !this.running)void this.play().catch(()=>{if(generation===this.generation)this.onError(new Error('Prepared audio is ready. Press Resume to continue playback.'))});
+  }
   rewind(){this.pause();this.finished=false;this.waiting=false;if(this.index===0)this.audio.currentTime=0;else{this.next?.removeAttribute('src');this.next?.load();this.next=null;this.activate(0)}}
   clear(){
     if(this.priming?.audio===this.audio)this.priming.cancel();
