@@ -59,3 +59,7 @@ test('status blocks and ordinary capitalised words are not people',()=>{
   const names=findPeople(story,['Elliot']).map(p=>p.name).sort();
   expect(names).toEqual(['Vane','Zoe']);
 });
+test('character sheets in markup and ordinary words next to a speech verb are not people',()=>{
+  const story=['<b>Hair</b>: auburn | <b>Skin</b>: freckled\n**Mood:** wary','Hair whispered against her collar. Skin prickled, she said nothing. Zoe pressed closer. She smiled. "Hi," Zoe said.','Her hair was wet and her skin was cold.'];
+  expect(findPeople(story).map(p=>p.name)).toEqual(['Zoe']);
+});

@@ -4,6 +4,8 @@ Listen to story passages and your own messages, and find your place at a glance.
 
 Recommended connection: **your saved Lumiverse OpenRouter TTS connection → `google/gemini-3.8-flash-tts` → Kore**. Readalong reuses Lumiverse’s native TTS endpoint and saved provider key. When upgrading an existing Gemini setup, it automatically selects a matching saved OpenRouter TTS connection if one is available. Readalong fetches OpenRouter's speech model catalog and the full voice list reported for each model. Gemini's 30 studio voices are bundled as a fallback. Voice previews use one short sample. Native connection keys remain entirely in Lumiverse’s server-side encrypted storage. Direct-mode keys use the encrypted, per-user extension enclave. No provider key is returned to the frontend.
 
+Version **0.3.2** also skips character-sheet words (*Hair*, *Skin*, *Mood* and the like), labels inside HTML or bold markup, and any word the story also writes in lower case.
+
 Version **0.3.1** stops status-block labels and ordinary words (*Height*, *Eyes*, *By*, *Early*) from showing up as people, adds **Not a person** to hide a wrong one, and guesses storyteller cards on its own: a card the story never names is treated as a storyteller until you say otherwise.
 
 Version **0.3.0** gives each story its own cast, handles storyteller cards, finds the people in a story and their likely gender, works out who says each line, and adds a fuller player, optional sound effects and optional audio saved with the message. See [New in 0.3.0](#new-in-030).
