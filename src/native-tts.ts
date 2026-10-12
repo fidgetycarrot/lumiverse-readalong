@@ -98,5 +98,23 @@ export function createNativeTtsClient(transport:typeof fetch = fetch) {
       if(mime.startsWith('audio/pcm') || mime.startsWith('audio/x-pcm'))return {blob:await pcmBlobToWav(blob,mime),mime:'audio/wav'};
       return {blob,mime};
     },
+    /** Attach finished audio to the message's current swipe. Lumiverse replaces that swipe's earlier audio. */
+    async saveMessageAudio(chatId:string,messageId:string,blob:Blob,filename:string):Promise<string> {
+      const form=new FormData();form.set('chatId',chatId);form.set('messageId',messageId);form.set('filename',filename);form.append('segment',blob,filename);
+      const result=await readJson(await request('/tts/save-message-audio',{method:'POST',body:form,signal:AbortSignal.timeout(120000)}));
+      if(typeof result.audio?.id!=='string')throw new Error('Lumiverse did not keep the audio.');
+      return result.audio.id;
+    },
+    /** A saved audio file, or undefined when it is gone. */
+    async audio(id:string,limit:number):Promise<Blob|undefined> {
+      const response=await request(`/audio/${encodeURIComponent(id)}`);
+      if(response.status===404){await response.body?.cancel().catch(()=>{});return}
+      if(!response.ok)throw new Error(nativeProviderError(response.status,new TextDecoder().decode(await boundedBytes(response,64*1024))));
+      return new Blob([await boundedBytes(response,limit)],{type:'audio/wav'});
+    },
+    async removeMessageAudio(chatId:string,messageId:string,audioId:string):Promise<void> {
+      const response=await request(`/chats/${encodeURIComponent(chatId)}/messages/${encodeURIComponent(messageId)}/attachments/${encodeURIComponent(audioId)}`,{method:'DELETE'});
+      await response.body?.cancel().catch(()=>{});
+    },
   };
 }

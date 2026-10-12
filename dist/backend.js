@@ -1,4 +1,33 @@
 // @bun
+// src/sound-effects.ts
+var d = (min, max) => `duration:[${min} TO ${max}]`;
+var SOUND_RULES = [
+  { pattern: /\b(?:knock(?:ed|ing|s)?\s+(?:on|at)\s+(?:the|a|his|her|my|their)\s+door|a\s+knock\s+(?:at|on)\s+the\s+door|rapped\s+(?:on|at)\s+the\s+door)\b/i, query: "knock on wooden door", filter: d(0.3, 2.5) },
+  { pattern: /\b(?:slam(?:med|s)?\s+the\s+door|door\s+slammed)\b/i, query: "door slam", filter: d(0.3, 2.5) },
+  { pattern: /\b(?:door\s+(?:creaked|creaks|swung\s+open|groaned\s+open)|creak(?:ed|ing)?\s+(?:door|floorboards?|hinges?))\b/i, query: "door creak", filter: d(0.3, 2.5) },
+  { pattern: /\b(?:drew\s+the\s+bolt|bolted\s+the\s+door|lock\s+clicked|turned\s+the\s+key)\b/i, query: "door bolt latch", filter: d(0.2, 2) },
+  { pattern: /\b(?:footsteps?\s+(?:approached|echoed|sounded|slowed|receded)|heavy\s+footsteps|boots\s+(?:on|against)\s+the\s+(?:floor|stairs|stone)|pac(?:ed|ing)\s+(?:the\s+floor|back\s+and\s+forth))\b/i, query: "footsteps", filter: d(0.5, 3) },
+  { pattern: /\b(?:page\s+(?:turned|flipped)|turn(?:ed|ing)?\s+(?:the\s+)?page|flipp(?:ed|ing)\s+(?:through\s+)?(?:the\s+)?pages?|rustl(?:ed|ing)\s+(?:the\s+)?papers?)\b/i, query: "page turn", filter: d(0.1, 2.5) },
+  { pattern: /\b(?:glass\s+(?:shattered|broke|smashed)|shattering\s+glass)\b/i, query: "glass shatter", filter: d(0.3, 2.5) },
+  { pattern: /\b(?:glasses\s+clinked|clink(?:ed)?\s+(?:of\s+)?glasses|cups?\s+clatter(?:ed)?|dishes\s+clatter(?:ed)?)\b/i, query: "glass clink", filter: d(0.1, 2) },
+  { pattern: /\b(?:kettle\s+(?:hissed|whistled|sang))\b/i, query: "kettle whistle", filter: d(0.5, 3) },
+  { pattern: /\b(?:thunder\s+(?:rolled|cracked|rumbled|boomed)|crack\s+of\s+thunder)\b/i, query: "thunder", filter: d(1, 4) },
+  { pattern: /\b(?:rain\s+(?:ticked|drummed|pattered|tapped|lashed)\s+(?:on|against))\b/i, query: "rain on window", filter: d(1, 4) },
+  { pattern: /\b(?:fire\s+(?:crackled|popped|hissed)|crackl(?:ed|ing)\s+fire)\b/i, query: "fire crackle", filter: d(1, 4) },
+  { pattern: /\b(?:dr[ae]w\s+(?:his|her|their|my|a|the)\s+(?:sword|blade)|steel\s+rang|blades?\s+clashed)\b/i, query: "sword unsheathe", filter: d(0.3, 2.5) },
+  { pattern: /\b(?:horses?\s+(?:whinnied|neighed|snorted))\b/i, query: "horse whinny", filter: d(0.5, 3) },
+  { pattern: /\b(?:bells?\s+(?:rang|tolled|chimed))\b/i, query: "bell toll", filter: d(1, 4) },
+  { pattern: /\b(?:thump(?:ed)?|thudd?ed|a\s+(?:dull|heavy)\s+thud)\b/i, query: "thump", filter: d(0.1, 2) },
+  { pattern: /\b(?:heart\s+(?:pounded|hammered|thumped|raced))\b/i, query: "heartbeat", filter: d(0.5, 2.5) },
+  { pattern: /\b(?:clock\s+tick(?:ed|ing)|ticking\s+clock)\b/i, query: "clock tick", filter: d(0.5, 2.5) }
+];
+
+// src/speaker-detect.ts
+var TITLES = new Set(["mr", "mrs", "ms", "miss", "dr", "sir", "lady", "lord", "captain", "sergeant", "professor", "king", "queen", "prince", "princess", "father", "mother", "sister", "brother", "master", "mistress"]);
+var NOT_NAMES = new Set(["i", "the", "a", "an", "he", "she", "they", "it", "we", "you", "his", "her", "their", "its", "our", "my", "your", "then", "but", "and", "so", "yes", "no", "oh", "ah", "well", "note", "ooc", "okay", "ok", "now", "still", "just", "even", "after", "before", "when", "while", "as", "if", "there", "here", "this", "that", "these", "those", "what", "who", "why", "how", "where", "someone", "something", "everyone", "nobody", "one", "another", "both", "neither", "either", "finally", "suddenly", "slowly", "quietly", "again", "instead", "meanwhile", "later", "soon", "narrator"]);
+var SPEECH_VERBS = String.raw`(?:said|says|say|asked|asks|ask|replied|replies|answered|answers|whispered|whispers|murmured|murmurs|muttered|mutters|shouted|shouts|yelled|yells|called|calls|cried|cries|snapped|snaps|growled|growls|hissed|hisses|added|adds|continued|continues|began|begins|offered|offers|demanded|demands|admitted|admits|insisted|insists|repeated|repeats|breathed|breathes|laughed|laughs|sighed|sighs|told|tells|declared|declares|announced|announces|warned|warns|explained|explains|agreed|agrees|teased|teases|whimpered|whimpers|purred|purrs|drawled|drawls|scoffed|scoffs|groaned|groans|managed|manages|pressed|presses|corrected|corrects|interrupted|interrupts|chimed in|chimes in|spoke|speaks)`;
+var B = String.raw`[\p{L}\p{M}\p{N}_]`;
+
 // src/speech-text.ts
 var PROSE_TAGS = new Set(`p div span section article header footer main aside nav address blockquote q cite figure figcaption hgroup ul ol li dl dt dd menu br hr wbr h1 h2 h3 h4 h5 h6 b strong i em u s strike del ins mark small big sub sup abbr acronym dfn kbd samp var time font tt bdi bdo data ruby rb rp rt rtc a table thead tbody tfoot tr td th caption col colgroup label legend fieldset`.split(" "));
 var VOID_TAGS = new Set("area base br col embed hr img input link meta param source track wbr".split(" "));
@@ -70,6 +99,10 @@ function sanitizeSpeechText(raw, keepVocalTags = false) {
 
 // src/pronunciation.ts
 var PRONUNCIATION_CUE_PATTERN = String.raw`\[pronounce:[^\]\r\n]*(?:\]|(?=\r?\n)|$)`;
+function cueGender(value) {
+  const s = typeof value === "string" ? value.trim().toLowerCase() : "";
+  return /^(?:f|female|woman|girl|feminine)$/.test(s) ? "f" : /^(?:m|male|man|boy|masculine)$/.test(s) ? "m" : undefined;
+}
 var LIMIT = 500;
 var normalized = (s) => s.normalize("NFC").trim().toLowerCase();
 var escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -89,7 +122,8 @@ function pronunciationEntry(raw, source) {
   if (r.aliases !== undefined && (!Array.isArray(r.aliases) || r.aliases.length > 10 || r.aliases.some((v) => !clean(v, 80))))
     return;
   const aliases = Array.isArray(r.aliases) ? [...new Set(r.aliases.slice(0, 10).map((v) => clean(v, 80)).filter((v) => v && normalized(v) !== normalized(name)))] : [];
-  return { name, spokenAs, aliases, source };
+  const gender = cueGender(r.gender);
+  return { name, spokenAs, aliases, source, ...gender ? { gender } : {} };
 }
 function normalizePronunciations(raw) {
   const result = Object.create(null);
@@ -118,12 +152,16 @@ function learnPronunciations(entries, raw) {
     if (!match[0].endsWith("]") || match[0].length > 252)
       continue;
     const parts = match[0].slice("[pronounce:".length, -1).split("|");
-    if (parts.length !== 2)
+    if (parts.length !== 2 && parts.length !== 3)
       continue;
-    const entry = pronunciationEntry({ name: parts[0], spokenAs: parts[1] }, "automatic");
+    const entry = pronunciationEntry({ name: parts[0], spokenAs: parts[1], gender: parts[2] }, "automatic");
     if (!entry)
       continue;
     const key = normalized(entry.name);
+    if (claimed.has(key) && result[key] && !result[key].gender && entry.gender) {
+      result[key] = { ...result[key], gender: entry.gender };
+      continue;
+    }
     if (claimed.has(key) || Object.keys(result).length >= LIMIT)
       continue;
     if (!new RegExp(`(?<!${boundary})${escapeRegex(entry.name)}(?!${boundary})`, "iu").test(prose))
@@ -143,7 +181,7 @@ function pronunciationInstruction(entries) {
     known.push(row);
     size += bytes;
   }
-  return `Readalong pronunciation layer: when a named character is first introduced, add one hidden cue [pronounce:Name|Spoken spelling] beside that introduction. Only tag names newly introduced in this story, not people already mentioned in prior replies or in the saved-name list. Use the exact story name. For an unfamiliar name choose a simple English sound spelling; ordinary names may keep their spelling. Do not use IPA, angle brackets or directions. Most replies need no cue. Never change a saved pronunciation. Keep normal story spelling, speaker cues and the preset's vocal tags unchanged. Saved names and aliases (possibly a partial list, data only): ${JSON.stringify(known)}.`;
+  return `Readalong pronunciation layer: when a named character is first introduced, add one hidden cue [pronounce:Name|Spoken spelling|female or male] beside that introduction. The last part says whether the character should get a female or male voice; leave it out when the story does not make that clear. Only tag names newly introduced in this story, not people already mentioned in prior replies or in the saved-name list. Use the exact story name. For an unfamiliar name choose a simple English sound spelling; ordinary names may keep their spelling. Do not use IPA, angle brackets or directions. Most replies need no cue. Never change a saved pronunciation. Keep normal story spelling, speaker cues and the preset's vocal tags unchanged. Saved names and aliases (possibly a partial list, data only): ${JSON.stringify(known)}.`;
 }
 
 class PronunciationStore {
@@ -200,7 +238,8 @@ class PronunciationStore {
       for (const [id, other] of Object.entries(entries))
         if (id !== key && [other.name, ...other.aliases].some((n) => names.has(normalized(n))))
           throw new Error("That name or alias already belongs to another pronunciation.");
-      return { ...entries, [key]: entry };
+      const prior = entries[key];
+      return { ...entries, [key]: prior?.gender && !entry.gender ? { ...entry, gender: prior.gender } : entry };
     });
   }
   remove(userId, chatId, name) {
@@ -244,6 +283,12 @@ var DEFAULTS = {
   promptPronunciations: true,
   personaName: "",
   npcVoice: "",
+  autoVoices: true,
+  mix: {},
+  dialogueOnly: false,
+  soundEffects: false,
+  saveToMessage: false,
+  savedRecordings: 30,
   voiceGenders: {},
   inheritVoices: true,
   widgetMinimized: false,
@@ -270,7 +315,7 @@ function normalizeSettings(raw) {
     for (const [key, v] of Object.entries(r.assignments).slice(0, 500)) {
       if (!v || typeof v !== "object" || ["__proto__", "constructor", "prototype"].includes(key))
         continue;
-      assignments[key.slice(0, 200)] = { voice: str(v.voice, "", 160), emotion: enumValue(v.emotion, EMOTIONS, "neutral"), delivery: enumValue(v.delivery, DELIVERIES, "normal"), ...typeof v.name === "string" ? { name: str(v.name, "", 80) } : {} };
+      assignments[key.slice(0, 200)] = { voice: str(v.voice, "", 160), emotion: enumValue(v.emotion, EMOTIONS, "neutral"), delivery: enumValue(v.delivery, DELIVERIES, "normal"), ...typeof v.name === "string" ? { name: str(v.name, "", 80) } : {}, ...Array.isArray(v.aliases) ? { aliases: [...new Set(v.aliases.filter((a) => typeof a === "string").map((a) => a.trim().slice(0, 80)).filter((a) => a && !/[\[\]\r\n]/.test(a) && a.toLowerCase() !== "narrator"))].slice(0, 10) } : {}, ...v.gender === "f" || v.gender === "m" ? { gender: v.gender } : {}, ...v.auto === true ? { auto: true } : {} };
     }
   return {
     connectionId: str(r.connectionId, "", 160),
@@ -288,6 +333,12 @@ function normalizeSettings(raw) {
     promptEmotions: r.promptEmotions !== false,
     useEmotions: r.useEmotions !== false,
     promptPronunciations: r.promptPronunciations !== false,
+    autoVoices: r.autoVoices !== false,
+    dialogueOnly: r.dialogueOnly === true,
+    soundEffects: r.soundEffects === true,
+    saveToMessage: r.saveToMessage === true,
+    savedRecordings: Number.isFinite(Number(r.savedRecordings)) ? Math.round(Math.min(200, Math.max(5, Number(r.savedRecordings)))) : 30,
+    mix: Object.fromEntries(Object.entries(r.mix && typeof r.mix === "object" && !Array.isArray(r.mix) ? r.mix : {}).filter(([k, v]) => k.length > 0 && k.length <= 80 && k === k.trim().toLowerCase() && !["__proto__", "constructor", "prototype"].includes(k) && v && typeof v === "object").slice(0, 200).map(([k, v]) => [k, { gain: clamp(v.gain, 0, 1, 1), mute: v.mute === true }])),
     personaName: typeof r.personaName === "string" && r.personaName.trim().length <= 80 && !/[\[\]\r\n]/.test(r.personaName) ? r.personaName.trim() : "",
     inheritVoices: r.inheritVoices !== false,
     widgetMinimized: r.widgetMinimized === true,
@@ -449,6 +500,98 @@ async function preparationHash(value) {
   return Array.from(new Uint8Array(digest), (n) => n.toString(16).padStart(2, "0")).join("");
 }
 
+// src/message-recordings.ts
+var DEFAULT_KEEP = 30;
+var MAX_KEEP = 200;
+var HASH = /^[a-f0-9]{64}$/;
+var ID = /^[A-Za-z0-9_-]{1,100}$/;
+function readMessageRecording(raw) {
+  if (!raw || typeof raw !== "object")
+    return;
+  const r = raw;
+  if (!HASH.test(r.messageKey) || !HASH.test(r.key) || !ID.test(r.audioId) || !ID.test(r.chatId) || !ID.test(r.messageId))
+    return;
+  if (r.swipeId !== undefined && !(Number.isInteger(r.swipeId) && r.swipeId >= 0))
+    return;
+  if (!Array.isArray(r.sizes) || !r.sizes.length || r.sizes.length > 2000 || r.sizes.some((n) => !Number.isInteger(n) || n <= 0))
+    return;
+  const w = r.wave;
+  if (!w || ![8, 16, 24, 32].includes(w.bits) || !Number.isInteger(w.rate) || w.rate < 8000 || w.rate > 192000 || !Number.isInteger(w.channels) || w.channels < 1 || w.channels > 8)
+    return;
+  if (r.sizes.some((n) => n % (w.channels * w.bits / 8)))
+    return;
+  if (!r.plan || typeof r.plan !== "object" || JSON.stringify(r.plan).length > 2000000)
+    return;
+  return {
+    messageKey: r.messageKey,
+    key: r.key,
+    audioId: r.audioId,
+    chatId: r.chatId,
+    messageId: r.messageId,
+    ...r.swipeId !== undefined ? { swipeId: r.swipeId } : {},
+    sizes: r.sizes,
+    wave: { rate: w.rate, channels: w.channels, bits: w.bits },
+    plan: r.plan,
+    savedAt: typeof r.savedAt === "number" ? r.savedAt : Date.now()
+  };
+}
+
+class RecordingStore {
+  storage;
+  chains = new Map;
+  constructor(storage) {
+    this.storage = storage;
+  }
+  async all(userId) {
+    const raw = await this.storage.read(userId);
+    if (!raw)
+      return {};
+    try {
+      const parsed = JSON.parse(raw), result = {};
+      for (const value of Object.values(parsed ?? {})) {
+        const record = readMessageRecording(value);
+        if (record)
+          result[record.messageKey] = record;
+      }
+      return result;
+    } catch {
+      return {};
+    }
+  }
+  edit(userId, change) {
+    const work = (this.chains.get(userId) ?? Promise.resolve()).catch(() => {}).then(async () => {
+      const records = await this.all(userId), result = change(records);
+      await this.storage.write(userId, JSON.stringify(records));
+      return result;
+    });
+    this.chains.set(userId, work);
+    return work.finally(() => {
+      if (this.chains.get(userId) === work)
+        this.chains.delete(userId);
+    });
+  }
+  async get(userId, messageKey) {
+    return (await this.all(userId))[messageKey];
+  }
+  remember(userId, record, keep = DEFAULT_KEEP) {
+    return this.edit(userId, (records) => {
+      const prior = records[record.messageKey];
+      records[record.messageKey] = { ...record, savedAt: Date.now() };
+      const replaced = prior && prior.audioId !== record.audioId ? [prior] : [];
+      const newest = Object.values(records).sort((a, b) => b.savedAt - a.savedAt);
+      const expired = newest.slice(Math.max(1, Math.min(MAX_KEEP, keep)));
+      for (const old of expired)
+        delete records[old.messageKey];
+      return [...replaced, ...expired];
+    });
+  }
+  forget(userId, messageKey) {
+    return this.edit(userId, (records) => {
+      delete records[messageKey];
+    });
+  }
+}
+
 // src/backend.ts
 var pronunciationPath = async (chatId) => `pronunciations-${await preparationHash([chatId])}.json`;
 var pronunciations = new PronunciationStore({
@@ -461,6 +604,10 @@ var pronunciations = new PronunciationStore({
 var preparationLedger = new PreparationLedger({
   read: async (userId) => await spindle.userStorage.exists("preparations.json", userId) ? spindle.userStorage.read("preparations.json", userId) : undefined,
   write: (userId, value) => spindle.userStorage.write("preparations.json", value, userId)
+});
+var recordings = new RecordingStore({
+  read: async (userId) => await spindle.userStorage.exists("recordings.json", userId) ? spindle.userStorage.read("recordings.json", userId) : undefined,
+  write: (userId, value) => spindle.userStorage.write("recordings.json", value, userId)
 });
 var settingsByUser = new Map;
 var loadingByUser = new Map;
@@ -480,11 +627,43 @@ async function keyStorage(work) {
   }
 }
 async function keyStatus(userId) {
-  return { openrouter: await keyStorage(() => spindle.enclave.has("openrouter_key", userId)), local: await keyStorage(async () => await spindle.enclave.has(LOCAL_CREDENTIALS, userId) || await spindle.enclave.has("local_key", userId)) };
+  return { openrouter: await keyStorage(() => spindle.enclave.has("openrouter_key", userId)), local: await keyStorage(async () => await spindle.enclave.has(LOCAL_CREDENTIALS, userId) || await spindle.enclave.has("local_key", userId)), freesound: await keyStorage(() => spindle.enclave.has("freesound_key", userId)) };
 }
 function keyProvider(value) {
-  if (value !== "openrouter" && value !== "local")
+  if (value !== "openrouter" && value !== "local" && value !== "freesound")
     throw new Error("Choose a direct speech provider first.");
+  return value;
+}
+var soundCache = new Map;
+async function soundEffect(query, userId) {
+  const rule = SOUND_RULES.find((r) => r.query === query);
+  if (!rule)
+    throw new Error("Unknown sound.");
+  const cached = soundCache.get(`${userId}:${query}`);
+  if (cached)
+    return cached;
+  const key = await keyStorage(() => spindle.enclave.get("freesound_key", userId));
+  if (!key)
+    throw new Error("Add a Freesound key in Playback to hear sound effects.");
+  const search = await credentialRequest(`https://freesound.org/apiv2/search/text/?query=${encodeURIComponent(rule.query)}&filter=${encodeURIComponent(rule.filter)}&fields=id,previews&sort=score&page_size=5&token=${encodeURIComponent(key)}`, { headers: { Accept: "application/json" } }, key);
+  if (search.status < 200 || search.status >= 300)
+    throw new Error(search.status === 401 ? "Freesound did not accept the key." : `Freesound search failed (HTTP ${search.status}).`);
+  let url = "";
+  try {
+    const found = (JSON.parse(search.body)?.results ?? []).find((r) => r?.previews);
+    url = String(found?.previews?.["preview-hq-mp3"] ?? found?.previews?.["preview-lq-mp3"] ?? "");
+  } catch {
+    throw new Error("Freesound returned an unexpected answer.");
+  }
+  if (!/^https:\/\/(?:cdn\.)?freesound\.org\//.test(url))
+    throw new Error("Freesound has no sound for this yet.");
+  const file = await credentialRequest(url, { responseType: "arraybuffer", mediaType: "audio" }, key);
+  if (file.status < 200 || file.status >= 300 || file.encoding !== "base64")
+    throw new Error("The sound could not be downloaded.");
+  const value = { audio: file.body, mime: file.headers?.["content-type"]?.split(";")[0] || "audio/mpeg" };
+  soundCache.set(`${userId}:${query}`, value);
+  while (soundCache.size > 200)
+    soundCache.delete(soundCache.keys().next().value);
   return value;
 }
 var models = [];
@@ -732,6 +911,11 @@ spindle.onFrontendMessage(async (payload, userId, sessionId) => {
       if (provider === "local") {
         const base = validLocalUrl(typeof p.localUrl === "string" ? p.localUrl : settings.localUrl, true);
         await keyStorage(() => spindle.enclave.put(LOCAL_CREDENTIALS, JSON.stringify({ key, base }), userId));
+      } else if (provider === "freesound") {
+        await keyStorage(() => spindle.enclave.put("freesound_key", key, userId));
+        for (const k of soundCache.keys())
+          if (k.startsWith(`${userId}:`))
+            soundCache.delete(k);
       } else
         await keyStorage(() => spindle.enclave.put("openrouter_key", key, userId));
       for (const id of failedSpeech.keys())
@@ -742,12 +926,30 @@ spindle.onFrontendMessage(async (payload, userId, sessionId) => {
       const provider = keyProvider(p.provider);
       if (p.confirmed !== true)
         throw new Error("Confirm key removal first.");
-      for (const name of provider === "local" ? [LOCAL_CREDENTIALS, "local_key"] : ["openrouter_key"])
+      for (const name of provider === "local" ? [LOCAL_CREDENTIALS, "local_key"] : provider === "freesound" ? ["freesound_key"] : ["openrouter_key"])
         await keyStorage(() => spindle.enclave.delete(name, userId));
       for (const id of failedSpeech.keys())
         if (id.startsWith(`${userId}:`))
           failedSpeech.delete(id);
       reply({ hasKey: false });
+    } else if (p.type === "remember_recording") {
+      const record = readMessageRecording(p.record);
+      if (!record)
+        throw new Error("That recording could not be saved.");
+      await requireChat(record.chatId, userId);
+      reply({ expired: (await recordings.remember(userId, record, settings.savedRecordings)).map((r) => ({ audioId: r.audioId, chatId: r.chatId, messageId: r.messageId })) });
+    } else if (p.type === "recording" || p.type === "forget_recording") {
+      if (typeof p.messageKey !== "string" || !/^[a-f0-9]{64}$/.test(p.messageKey))
+        throw new Error("Unknown recording.");
+      if (p.type === "forget_recording") {
+        await recordings.forget(userId, p.messageKey);
+        reply({});
+      } else
+        reply({ record: await recordings.get(userId, p.messageKey) ?? null });
+    } else if (p.type === "sound_effect") {
+      if (typeof p.query !== "string")
+        throw new Error("Unknown sound.");
+      reply(await soundEffect(p.query, userId));
     } else if (p.type === "models") {
       reply({ models: await speechModels() });
     } else if (p.type === "check_connection") {

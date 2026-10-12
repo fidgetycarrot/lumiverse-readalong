@@ -1,3 +1,168 @@
+// src/speaker-detect.ts
+var TITLES = new Set(["mr", "mrs", "ms", "miss", "dr", "sir", "lady", "lord", "captain", "sergeant", "professor", "king", "queen", "prince", "princess", "father", "mother", "sister", "brother", "master", "mistress"]);
+var NOT_NAMES = new Set(["i", "the", "a", "an", "he", "she", "they", "it", "we", "you", "his", "her", "their", "its", "our", "my", "your", "then", "but", "and", "so", "yes", "no", "oh", "ah", "well", "note", "ooc", "okay", "ok", "now", "still", "just", "even", "after", "before", "when", "while", "as", "if", "there", "here", "this", "that", "these", "those", "what", "who", "why", "how", "where", "someone", "something", "everyone", "nobody", "one", "another", "both", "neither", "either", "finally", "suddenly", "slowly", "quietly", "again", "instead", "meanwhile", "later", "soon", "narrator"]);
+var SPEECH_VERBS = String.raw`(?:said|says|say|asked|asks|ask|replied|replies|answered|answers|whispered|whispers|murmured|murmurs|muttered|mutters|shouted|shouts|yelled|yells|called|calls|cried|cries|snapped|snaps|growled|growls|hissed|hisses|added|adds|continued|continues|began|begins|offered|offers|demanded|demands|admitted|admits|insisted|insists|repeated|repeats|breathed|breathes|laughed|laughs|sighed|sighs|told|tells|declared|declares|announced|announces|warned|warns|explained|explains|agreed|agrees|teased|teases|whimpered|whimpers|purred|purrs|drawled|drawls|scoffed|scoffs|groaned|groans|managed|manages|pressed|presses|corrected|corrects|interrupted|interrupts|chimed in|chimes in|spoke|speaks)`;
+var NAME_SHAPE = /^\p{Lu}[\p{L}\p{M}'’-]*(?: \p{Lu}[\p{L}\p{M}'’-]*){0,2}$/u;
+var escape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+var B = String.raw`[\p{L}\p{M}\p{N}_]`;
+function looksLikeName(value) {
+  const s = value.trim();
+  return NAME_SHAPE.test(s) && s.length <= 40 && !NOT_NAMES.has(s.toLowerCase()) && !NOT_NAMES.has(s.split(" ")[0].toLowerCase());
+}
+function buildRoster(entries) {
+  const names = new Map, firsts = new Map;
+  for (const entry of entries) {
+    const name = entry.name.split("||")[0].trim();
+    if (!name || name.toLowerCase() === "narrator")
+      continue;
+    const display = names.get(name.toLowerCase()) ?? name;
+    for (const alias of [name, ...entry.aliases ?? []]) {
+      const key = alias.trim().toLowerCase();
+      if (key && key !== "narrator" && !names.has(key))
+        names.set(key, display);
+    }
+    const words = name.split(/\s+/);
+    const first = words.find((w) => !TITLES.has(w.toLowerCase().replace(/\.$/, "")));
+    if (words.length > 1 && first) {
+      const key = first.toLowerCase();
+      if (!firsts.has(key))
+        firsts.set(key, new Set);
+      firsts.get(key).add(display);
+    }
+  }
+  for (const [key, owners] of firsts)
+    if (owners.size === 1 && !names.has(key) && !NOT_NAMES.has(key))
+      names.set(key, [...owners][0]);
+  const patterns = [...names.entries()].sort((a, b) => b[0].length - a[0].length).map(([key, name]) => {
+    const original = [...entries.flatMap((e) => [e.name.split("||")[0].trim(), ...e.aliases ?? []]), name.split(/\s+/)[0]].find((a) => a.toLowerCase() === key) ?? key;
+    const flags = /^\p{Lu}/u.test(original) ? "u" : "iu";
+    return { re: new RegExp(`(?<!${B})${escape(original)}(?!${B})`, flags), name };
+  });
+  return { names, patterns };
+}
+function canonicalSpeaker(roster, value) {
+  return roster?.names.get(value.trim().toLowerCase());
+}
+function mentions(roster, text) {
+  const found = [];
+  for (const { re, name } of roster.patterns) {
+    const g = new RegExp(re.source, re.flags + "g");
+    for (const m of text.matchAll(g)) {
+      const start = m.index, end = start + m[0].length;
+      if (found.some((f) => start < f.index + f.length && end > f.index))
+        continue;
+      found.push({ name, index: start, length: m[0].length });
+    }
+  }
+  const seen = new Set;
+  return found.sort((a, b) => a.index - b.index).filter((f) => !seen.has(f.name) && !!seen.add(f.name));
+}
+function leadingName(roster, text, allowNew) {
+  const s = text.replace(/^[\s,;:—–*_-]+/, "");
+  const lead = "^(?:then |but |and |finally |at last |slowly |quietly |softly )?";
+  for (const { re, name } of roster.patterns) {
+    const m = s.match(new RegExp(lead + re.source, re.flags.includes("i") ? "iu" : "u"));
+    if (m)
+      return { name, rest: s.slice(m[0].length) };
+  }
+  if (!allowNew)
+    return;
+  const m = s.match(/^(\p{Lu}[\p{L}\p{M}'’-]*(?: \p{Lu}[\p{L}\p{M}'’-]*){0,2})/u);
+  return m && looksLikeName(m[1]) ? { name: m[1], rest: s.slice(m[0].length) } : undefined;
+}
+var SENTENCE_END = /[.!?…](?:["”’)\]]*)\s+/g;
+function sentences(text) {
+  return text.split(SENTENCE_END).map((s) => s.trim()).filter(Boolean);
+}
+function attributeQuotes(text, quotes, roster) {
+  const result = [];
+  const lineStart = (i) => text.lastIndexOf(`
+`, i - 1) + 1;
+  const lineEnd = (i) => {
+    const n = text.indexOf(`
+`, i);
+    return n === -1 ? text.length : n;
+  };
+  const paras = [];
+  quotes.forEach((q, i) => {
+    const start = lineStart(q.start);
+    let para = paras.at(-1);
+    if (!para || para.start !== start) {
+      const end = lineEnd(q.end - 1), inside = quotes.filter((o) => o.start >= start && o.end <= end);
+      let narration = "", cursor = start;
+      for (const o of inside) {
+        narration += text.slice(cursor, o.start) + " … ";
+        cursor = o.end;
+      }
+      narration += text.slice(cursor, end);
+      para = { start, quotes: [], speakers: [], narration };
+      paras.push(para);
+    }
+    para.quotes.push(i);
+  });
+  const narratedBetween = (from, to) => {
+    const between = text.slice(from, to).split(`
+`).map((l) => l.trim()).filter(Boolean);
+    return between.some((l) => !/["“”«»]/.test(l) && l.split(/\s+/).length > 6);
+  };
+  const history = [];
+  for (const para of paras) {
+    const quiet = para.narration.replace(/…/g, "").replace(/[\s*_]/g, "");
+    const pure = quiet.length === 0;
+    const paraNames = mentions(roster, para.narration).map((m) => m.name);
+    const end = lineEnd(quotes[para.quotes.at(-1)].end - 1);
+    para.quotes.forEach((qi, k) => {
+      const q = quotes[qi];
+      const prevEnd = k ? quotes[para.quotes[k - 1]].end : para.start;
+      const nextStart = k + 1 < para.quotes.length ? quotes[para.quotes[k + 1]].start : end;
+      const before = text.slice(prevEnd, q.start), after = text.slice(q.end, nextStart);
+      let speaker;
+      const label = before.match(/(?:^|\n|[.!?]\s)[\s>*_-]*([\p{L}][\p{L}\p{M}'’ .-]{0,40}?)[*_]*\s*:[*_]*\s*$/u);
+      if (label)
+        speaker = canonicalSpeaker(roster, label[1]) ?? (looksLikeName(label[1]) ? label[1].trim() : undefined);
+      if (!speaker) {
+        const tag = after.split(/[.!?\n]/)[0].slice(0, 90).replace(/^[\s,—–-]+/, "");
+        const verbFirst = tag.match(new RegExp(String.raw`^${SPEECH_VERBS}\s+(.+)$`, "iu"));
+        const who = verbFirst ? leadingName(roster, verbFirst[1], true) : leadingName(roster, tag, true);
+        if (who && (verbFirst || new RegExp(String.raw`^\s*(?:\p{L}+ly\s+)?${SPEECH_VERBS}`, "iu").test(who.rest)))
+          speaker = who.name;
+      }
+      if (!speaker) {
+        const lead = before.split(/[.!?\n]\s*/).at(-1) ?? "";
+        if (new RegExp(SPEECH_VERBS + String.raw`[^.!?]{0,30}[,:]?\s*$`, "iu").test(lead))
+          speaker = leadingName(roster, lead, true)?.name;
+      }
+      if (!speaker) {
+        const next = sentences(after)[0];
+        if (next)
+          speaker = leadingName(roster, next, false)?.name;
+      }
+      if (!speaker) {
+        const prev = sentences(before).at(-1);
+        if (prev)
+          speaker = leadingName(roster, prev, false)?.name;
+      }
+      if (!speaker && paraNames.length === 1)
+        speaker = paraNames[0];
+      if (!speaker && k)
+        speaker = para.speakers[k - 1];
+      if (!speaker && pure && k === 0 && history.length >= 2) {
+        const [a, b] = history.slice(-2);
+        if (a.speaker !== b.speaker && !narratedBetween(b.end, q.start) && !narratedBetween(a.end, lineStart(quotes[para.quotes[0]].start) - 1))
+          speaker = a.speaker;
+      }
+      para.speakers.push(speaker);
+      result[qi] = speaker;
+    });
+    const known = para.speakers.filter(Boolean);
+    if (known.length)
+      history.push({ speaker: known.at(-1), end, pure });
+    else if (!pure)
+      history.length = 0;
+  }
+  return result;
+}
+
 // src/speech-text.ts
 var PROSE_TAGS = new Set(`p div span section article header footer main aside nav address blockquote q cite figure figcaption hgroup ul ol li dl dt dd menu br hr wbr h1 h2 h3 h4 h5 h6 b strong i em u s strike del ins mark small big sub sup abbr acronym dfn kbd samp var time font tt bdi bdo data ruby rb rp rt rtc a table thead tbody tfoot tr td th caption col colgroup label legend fieldset`.split(" "));
 var VOID_TAGS = new Set("area base br col embed hr img input link meta param source track wbr".split(" "));
@@ -99,6 +264,10 @@ function sanitizeSpeechText(raw, keepVocalTags = false) {
 
 // src/pronunciation.ts
 var PRONUNCIATION_CUE_PATTERN = String.raw`\[pronounce:[^\]\r\n]*(?:\]|(?=\r?\n)|$)`;
+function cueGender(value) {
+  const s = typeof value === "string" ? value.trim().toLowerCase() : "";
+  return /^(?:f|female|woman|girl|feminine)$/.test(s) ? "f" : /^(?:m|male|man|boy|masculine)$/.test(s) ? "m" : undefined;
+}
 var LIMIT = 500;
 var normalized = (s) => s.normalize("NFC").trim().toLowerCase();
 var escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -118,7 +287,8 @@ function pronunciationEntry(raw, source) {
   if (r.aliases !== undefined && (!Array.isArray(r.aliases) || r.aliases.length > 10 || r.aliases.some((v) => !clean(v, 80))))
     return;
   const aliases = Array.isArray(r.aliases) ? [...new Set(r.aliases.slice(0, 10).map((v) => clean(v, 80)).filter((v) => v && normalized(v) !== normalized(name)))] : [];
-  return { name, spokenAs, aliases, source };
+  const gender = cueGender(r.gender);
+  return { name, spokenAs, aliases, source, ...gender ? { gender } : {} };
 }
 function normalizePronunciations(raw) {
   const result = Object.create(null);
@@ -208,6 +378,12 @@ var DEFAULTS = {
   promptPronunciations: true,
   personaName: "",
   npcVoice: "",
+  autoVoices: true,
+  mix: {},
+  dialogueOnly: false,
+  soundEffects: false,
+  saveToMessage: false,
+  savedRecordings: 30,
   voiceGenders: {},
   inheritVoices: true,
   widgetMinimized: false,
@@ -229,7 +405,7 @@ function speakerCharacterId(speaker, characters, fallback) {
   const name = speaker.trim().toLowerCase();
   if (name === "narrator")
     return;
-  const matches = characters.filter((c) => c.name.trim().toLowerCase() === name);
+  const matches = characters.filter((c) => c.name.trim().toLowerCase() === name || c.name.split("||")[0].trim().toLowerCase() === name);
   return matches.length === 1 ? matches[0].id : fallback;
 }
 function normalizeSettings(raw) {
@@ -242,7 +418,7 @@ function normalizeSettings(raw) {
     for (const [key, v] of Object.entries(r.assignments).slice(0, 500)) {
       if (!v || typeof v !== "object" || ["__proto__", "constructor", "prototype"].includes(key))
         continue;
-      assignments[key.slice(0, 200)] = { voice: str(v.voice, "", 160), emotion: enumValue(v.emotion, EMOTIONS, "neutral"), delivery: enumValue(v.delivery, DELIVERIES, "normal"), ...typeof v.name === "string" ? { name: str(v.name, "", 80) } : {} };
+      assignments[key.slice(0, 200)] = { voice: str(v.voice, "", 160), emotion: enumValue(v.emotion, EMOTIONS, "neutral"), delivery: enumValue(v.delivery, DELIVERIES, "normal"), ...typeof v.name === "string" ? { name: str(v.name, "", 80) } : {}, ...Array.isArray(v.aliases) ? { aliases: [...new Set(v.aliases.filter((a) => typeof a === "string").map((a) => a.trim().slice(0, 80)).filter((a) => a && !/[\[\]\r\n]/.test(a) && a.toLowerCase() !== "narrator"))].slice(0, 10) } : {}, ...v.gender === "f" || v.gender === "m" ? { gender: v.gender } : {}, ...v.auto === true ? { auto: true } : {} };
     }
   return {
     connectionId: str(r.connectionId, "", 160),
@@ -260,6 +436,12 @@ function normalizeSettings(raw) {
     promptEmotions: r.promptEmotions !== false,
     useEmotions: r.useEmotions !== false,
     promptPronunciations: r.promptPronunciations !== false,
+    autoVoices: r.autoVoices !== false,
+    dialogueOnly: r.dialogueOnly === true,
+    soundEffects: r.soundEffects === true,
+    saveToMessage: r.saveToMessage === true,
+    savedRecordings: Number.isFinite(Number(r.savedRecordings)) ? Math.round(Math.min(200, Math.max(5, Number(r.savedRecordings)))) : 30,
+    mix: Object.fromEntries(Object.entries(r.mix && typeof r.mix === "object" && !Array.isArray(r.mix) ? r.mix : {}).filter(([k, v]) => k.length > 0 && k.length <= 80 && k === k.trim().toLowerCase() && !["__proto__", "constructor", "prototype"].includes(k) && v && typeof v === "object").slice(0, 200).map(([k, v]) => [k, { gain: clamp(v.gain, 0, 1, 1), mute: v.mute === true }])),
     personaName: typeof r.personaName === "string" && r.personaName.trim().length <= 80 && !/[\[\]\r\n]/.test(r.personaName) ? r.personaName.trim() : "",
     inheritVoices: r.inheritVoices !== false,
     widgetMinimized: r.widgetMinimized === true,
@@ -302,7 +484,7 @@ function splitSentences(text) {
     return chunks;
   });
 }
-function parseSegments(raw, defaultSpeaker = "", rules = DEFAULT_SPEECH_RULES) {
+function parseSegments(raw, defaultSpeaker = "", rules = DEFAULT_SPEECH_RULES, roster) {
   raw = stripPronunciationCues(sanitizeSpeechText(raw, true)).replace(/!\[[^\]]*\]\([^)]*\)/g, " ").replace(/\[([^\]]+)\]\([^)]*\)/g, "$1");
   const cue = new RegExp(`\\[(emotion|delivery|speaker):([^\\]\\r\\n]{1,80})\\]`, "gi");
   const pieces = [];
@@ -333,7 +515,7 @@ function parseSegments(raw, defaultSpeaker = "", rules = DEFAULT_SPEECH_RULES) {
       append(text.slice(offset, match.index));
       const value = match[2].trim(), kind = match[1].toLowerCase();
       if (kind === "speaker") {
-        speaker = value;
+        speaker = canonicalSpeaker(roster, value) ?? value;
         explicitSpeaker = true;
         emotion = "";
         delivery = "";
@@ -351,9 +533,19 @@ function parseSegments(raw, defaultSpeaker = "", rules = DEFAULT_SPEECH_RULES) {
   const pattern = /"[^"\n]*(?:\n[^"\n]*)*"|“[^”]*”|«[^»]*»|(?<!\*)\*(?!\*)([^*]+)\*(?!\*)/g;
   const detection = raw.replace(new RegExp(CUE_PATTERN, "gi"), (match) => " ".repeat(match.length));
   let cursor = 0;
+  const spans = [...detection.matchAll(pattern)].filter((m) => m[1] === undefined).map((m) => ({ start: m.index, end: m.index + m[0].length }));
+  const guesses = roster && rules.quoted === "speech" ? attributeQuotes(detection, spans, roster) : [];
+  let quoteIndex = 0;
   for (const match of detection.matchAll(pattern)) {
     classify(raw.slice(cursor, match.index), rules.undecorated);
     const quoted = match[1] === undefined;
+    if (quoted) {
+      const guess = guesses[quoteIndex++];
+      if (guess && !explicitSpeaker) {
+        speaker = guess;
+        explicitSpeaker = true;
+      }
+    }
     classify(raw.slice(match.index, match.index + match[0].length), quoted ? rules.quoted : rules.asterisked);
     if (quoted) {
       speaker = defaultSpeaker;
@@ -683,6 +875,7 @@ class PreparedPlayer {
   generation = 0;
   speed = 1;
   volume = 0.85;
+  gain = 1;
   primed = false;
   reserve = null;
   reservePrimed = false;
@@ -791,7 +984,7 @@ class PreparedPlayer {
   }
   configure(audio) {
     audio.preload = "auto";
-    audio.volume = this.volume;
+    audio.volume = this.volume * this.gain;
     audio.playbackRate = this.speed;
   }
   activate(index) {
@@ -1000,9 +1193,73 @@ class PreparedPlayer {
   }
   setVolume(volume) {
     this.volume = Math.max(0, Math.min(1, volume));
-    this.audio.volume = this.volume;
+    this.applyVolume();
+  }
+  setGain(gain) {
+    const next = Math.max(0, Math.min(1, gain));
+    if (next === this.gain)
+      return;
+    this.gain = next;
+    this.applyVolume();
+  }
+  applyVolume() {
+    const value = this.volume * this.gain;
+    this.audio.volume = value;
     if (this.next)
-      this.next.volume = this.volume;
+      this.next.volume = value;
+  }
+  get starts() {
+    let t = 0;
+    return this.durations.map((d) => {
+      const start = t;
+      t += d;
+      return start;
+    });
+  }
+  seek(seconds) {
+    if (!this.tracks.length)
+      return;
+    const loaded = this.tracks.reduce((sum, t) => sum + t.duration, 0);
+    const target = Math.max(0, Math.min(seconds, Math.max(0, loaded - 0.05)));
+    let index = 0, start = 0;
+    while (index + 1 < this.tracks.length && start + this.tracks[index].duration <= target)
+      start += this.tracks[index++].duration;
+    const offset = target - start, running = this.running, generation = this.generation;
+    this.finished = false;
+    if (this.waiting) {
+      this.waiting = false;
+      this.onWaiting(false);
+    }
+    if (index !== this.index) {
+      this.pause();
+      this.next?.removeAttribute("src");
+      this.next?.load();
+      this.next = null;
+      this.audio.onended = null;
+      this.audio.onerror = null;
+      this.audio.onplaying = null;
+      this.audio.onloadedmetadata = null;
+      this.activate(index);
+    }
+    const audio = this.audio, apply = () => {
+      if (generation !== this.generation || audio !== this.audio)
+        return;
+      try {
+        audio.currentTime = offset;
+        audio.onloadedmetadata = null;
+      } catch {}
+    };
+    if (audio.readyState >= 1)
+      apply();
+    else {
+      audio.onloadedmetadata = apply;
+      apply();
+    }
+    if (running && !this.running)
+      this.play().catch(() => {
+        if (generation === this.generation)
+          this.onError(new Error("Prepared audio is ready. Press Resume to continue playback."));
+      });
   }
   rewind() {
     this.pause();
@@ -1242,6 +1499,31 @@ function createNativeTtsClient(transport = fetch) {
       if (mime.startsWith("audio/pcm") || mime.startsWith("audio/x-pcm"))
         return { blob: await pcmBlobToWav(blob, mime), mime: "audio/wav" };
       return { blob, mime };
+    },
+    async saveMessageAudio(chatId, messageId, blob, filename) {
+      const form = new FormData;
+      form.set("chatId", chatId);
+      form.set("messageId", messageId);
+      form.set("filename", filename);
+      form.append("segment", blob, filename);
+      const result = await readJson(await request("/tts/save-message-audio", { method: "POST", body: form, signal: AbortSignal.timeout(120000) }));
+      if (typeof result.audio?.id !== "string")
+        throw new Error("Lumiverse did not keep the audio.");
+      return result.audio.id;
+    },
+    async audio(id, limit) {
+      const response = await request(`/audio/${encodeURIComponent(id)}`);
+      if (response.status === 404) {
+        await response.body?.cancel().catch(() => {});
+        return;
+      }
+      if (!response.ok)
+        throw new Error(nativeProviderError(response.status, new TextDecoder().decode(await boundedBytes(response, 64 * 1024))));
+      return new Blob([await boundedBytes(response, limit)], { type: "audio/wav" });
+    },
+    async removeMessageAudio(chatId, messageId, audioId) {
+      const response = await request(`/chats/${encodeURIComponent(chatId)}/messages/${encodeURIComponent(messageId)}/attachments/${encodeURIComponent(audioId)}`, { method: "DELETE" });
+      await response.body?.cancel().catch(() => {});
     }
   };
 }
@@ -1260,10 +1542,29 @@ function isUnvoicedExtra(speaker, settings, context) {
     return false;
   return true;
 }
+function storyRoster(settings, context, mainSpeaker) {
+  const entries = [];
+  if (mainSpeaker)
+    entries.push({ name: mainSpeaker });
+  if (settings.personaName)
+    entries.push({ name: settings.personaName });
+  const active = context.characters.find((c) => c.id === context.characterId);
+  if (active)
+    entries.push({ name: active.name });
+  for (const [key, assignment] of Object.entries(settings.assignments)) {
+    const name = key.startsWith("id:") ? context.characters.find((c) => c.id === key.slice(3))?.name : assignment.name ?? key.slice(5);
+    if (name)
+      entries.push({ name, aliases: assignment.aliases });
+  }
+  for (const entry of Object.values(context.pronunciations ?? {}))
+    entries.push({ name: entry.name, aliases: entry.aliases });
+  return entries;
+}
 function planMessageSpeech(message, settings, context, rules = DEFAULT_SPEECH_RULES) {
   const speaker = message.isUser ? settings.personaName || message.name : message.name;
   const effectiveRules = message.isUser && rules.undecorated !== "skip" ? { ...rules, undecorated: "speech" } : rules;
-  const segments = parseSegments(context.legacyAudio ? sanitizeLegacySpeechText(message.content, true) : message.content, speaker, effectiveRules);
+  const roster = context.legacyAudio ? undefined : buildRoster(storyRoster(settings, context, speaker));
+  const segments = parseSegments(context.legacyAudio ? sanitizeLegacySpeechText(message.content, true) : message.content, speaker, effectiveRules, roster);
   if (message.isUser && settings.personaName) {
     for (const segment of segments) {
       if (segment.speaker.trim().toLowerCase() === message.name.trim().toLowerCase() && !settings.assignments[`name:${segment.speaker.toLowerCase()}`])
@@ -1352,6 +1653,74 @@ function estimatedSentenceIndex(passage, fraction) {
       return i;
   }
   return weights.length - 1;
+}
+
+// src/sound-effects.ts
+var d = (min, max) => `duration:[${min} TO ${max}]`;
+var SOUND_RULES = [
+  { pattern: /\b(?:knock(?:ed|ing|s)?\s+(?:on|at)\s+(?:the|a|his|her|my|their)\s+door|a\s+knock\s+(?:at|on)\s+the\s+door|rapped\s+(?:on|at)\s+the\s+door)\b/i, query: "knock on wooden door", filter: d(0.3, 2.5) },
+  { pattern: /\b(?:slam(?:med|s)?\s+the\s+door|door\s+slammed)\b/i, query: "door slam", filter: d(0.3, 2.5) },
+  { pattern: /\b(?:door\s+(?:creaked|creaks|swung\s+open|groaned\s+open)|creak(?:ed|ing)?\s+(?:door|floorboards?|hinges?))\b/i, query: "door creak", filter: d(0.3, 2.5) },
+  { pattern: /\b(?:drew\s+the\s+bolt|bolted\s+the\s+door|lock\s+clicked|turned\s+the\s+key)\b/i, query: "door bolt latch", filter: d(0.2, 2) },
+  { pattern: /\b(?:footsteps?\s+(?:approached|echoed|sounded|slowed|receded)|heavy\s+footsteps|boots\s+(?:on|against)\s+the\s+(?:floor|stairs|stone)|pac(?:ed|ing)\s+(?:the\s+floor|back\s+and\s+forth))\b/i, query: "footsteps", filter: d(0.5, 3) },
+  { pattern: /\b(?:page\s+(?:turned|flipped)|turn(?:ed|ing)?\s+(?:the\s+)?page|flipp(?:ed|ing)\s+(?:through\s+)?(?:the\s+)?pages?|rustl(?:ed|ing)\s+(?:the\s+)?papers?)\b/i, query: "page turn", filter: d(0.1, 2.5) },
+  { pattern: /\b(?:glass\s+(?:shattered|broke|smashed)|shattering\s+glass)\b/i, query: "glass shatter", filter: d(0.3, 2.5) },
+  { pattern: /\b(?:glasses\s+clinked|clink(?:ed)?\s+(?:of\s+)?glasses|cups?\s+clatter(?:ed)?|dishes\s+clatter(?:ed)?)\b/i, query: "glass clink", filter: d(0.1, 2) },
+  { pattern: /\b(?:kettle\s+(?:hissed|whistled|sang))\b/i, query: "kettle whistle", filter: d(0.5, 3) },
+  { pattern: /\b(?:thunder\s+(?:rolled|cracked|rumbled|boomed)|crack\s+of\s+thunder)\b/i, query: "thunder", filter: d(1, 4) },
+  { pattern: /\b(?:rain\s+(?:ticked|drummed|pattered|tapped|lashed)\s+(?:on|against))\b/i, query: "rain on window", filter: d(1, 4) },
+  { pattern: /\b(?:fire\s+(?:crackled|popped|hissed)|crackl(?:ed|ing)\s+fire)\b/i, query: "fire crackle", filter: d(1, 4) },
+  { pattern: /\b(?:dr[ae]w\s+(?:his|her|their|my|a|the)\s+(?:sword|blade)|steel\s+rang|blades?\s+clashed)\b/i, query: "sword unsheathe", filter: d(0.3, 2.5) },
+  { pattern: /\b(?:horses?\s+(?:whinnied|neighed|snorted))\b/i, query: "horse whinny", filter: d(0.5, 3) },
+  { pattern: /\b(?:bells?\s+(?:rang|tolled|chimed))\b/i, query: "bell toll", filter: d(1, 4) },
+  { pattern: /\b(?:thump(?:ed)?|thudd?ed|a\s+(?:dull|heavy)\s+thud)\b/i, query: "thump", filter: d(0.1, 2) },
+  { pattern: /\b(?:heart\s+(?:pounded|hammered|thumped|raced))\b/i, query: "heartbeat", filter: d(0.5, 2.5) },
+  { pattern: /\b(?:clock\s+tick(?:ed|ing)|ticking\s+clock)\b/i, query: "clock tick", filter: d(0.5, 2.5) }
+];
+function soundCues(text, rules = SOUND_RULES) {
+  const cues = [];
+  for (const rule of rules) {
+    const m = rule.pattern.exec(text);
+    if (m && !cues.some((c) => c.query === rule.query))
+      cues.push({ query: rule.query, filter: rule.filter, at: text.length ? m.index / text.length : 0 });
+  }
+  return cues.sort((a, b) => a.at - b.at);
+}
+
+// src/auto-cast.ts
+function hash(text) {
+  let h = 2166136261;
+  for (const c of text.toLowerCase()) {
+    h ^= c.codePointAt(0);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+function pickVoice(name, candidates, used) {
+  if (!candidates.length)
+    return;
+  const counts = new Map(candidates.map((v) => [v, used.filter((u) => u === v).length]));
+  const least = Math.min(...counts.values());
+  const pool = candidates.filter((v) => counts.get(v) === least);
+  return pool[hash(name) % pool.length];
+}
+function autoCast(settings, input) {
+  const added = {};
+  const used = [settings.voice, settings.narratorVoice, settings.npcVoice, ...Object.values(settings.assignments).map((a) => a.voice)].filter(Boolean);
+  for (const speaker of input.speakers) {
+    const name = speaker.trim(), key = `name:${name.toLowerCase()}`;
+    if (!name || name.toLowerCase() === "narrator" || added[key] || !input.needsVoice(name))
+      continue;
+    const gender = settings.assignments[key]?.gender ?? input.genderOf(name);
+    if (!gender)
+      continue;
+    const voice = pickVoice(name, input.voices.filter((v) => input.genderOfVoice(v) === gender), used);
+    if (!voice)
+      continue;
+    used.push(voice);
+    added[key] = { ...settings.assignments[key] ?? { emotion: "neutral", delivery: "normal" }, voice, name, gender, auto: true };
+  }
+  return added;
 }
 
 // src/saved-recording.ts
@@ -1554,6 +1923,20 @@ class AudioCache {
       db.close();
     }
   }
+}
+
+// src/message-recordings.ts
+function splitRecording(blob, record) {
+  const total = record.sizes.reduce((sum, n) => sum + n, 0);
+  if (blob.size !== 44 + total)
+    return;
+  const bytesPerSecond = record.wave.rate * record.wave.channels * record.wave.bits / 8;
+  let offset = 44;
+  return record.sizes.map((size) => {
+    const clip = { blob, duration: size / bytesPerSecond, wave: { ...record.wave, offset, size } };
+    offset += size;
+    return clip;
+  });
 }
 
 // src/widget-layout.ts
@@ -1772,6 +2155,9 @@ var STYLE = `
 .ra button.ra-mark{min-height:30px;padding:4px 10px;font-size:12.5px;border-radius:15px;color:var(--ra-dim);background:transparent}
 .ra button.ra-mark[aria-pressed=true]{color:var(--ra-text);border-color:var(--ra-mark);background:rgba(231,178,76,.14);font-weight:600}
 .ra .ra-voice-rows>p{padding:12px}
+.ra .ra-mix{display:flex;flex-direction:column;border:1px solid var(--ra-line);border-radius:10px}
+.ra .ra-mix-row{display:flex;align-items:center;gap:10px;padding:6px 8px 6px 12px;border-bottom:1px solid var(--ra-line)}.ra .ra-mix-row:last-child{border-bottom:0}
+.ra .ra-mix-name{flex:0 0 32%;min-width:0;overflow-wrap:anywhere}.ra .ra-mix-row input[type=range]{flex:1}
 .ra .ra-row.ra-extra{margin-top:-4px}
 .ra .ra-panel{display:flex;flex-direction:column;gap:14px}
 .ra .ra-panel>h3{margin-top:4px}.ra .ra-rule{border:0;border-top:1px solid var(--ra-line);margin:2px 0;width:100%}
@@ -1819,6 +2205,8 @@ var ICONS = {
   pause: "M6 5h4v14H6zM14 5h4v14h-4z",
   stop: "M6 6h12v12H6z",
   replay: "M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z",
+  back: "M6 6h2v12H6zm3.5 6 8.5 6V6z",
+  forward: "M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z",
   close: "M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z",
   minimize: "M19 13H5v-2h14v2z",
   expand: "M21 11V3h-8l3.29 3.29-10 10L3 13v8h8l-3.29-3.29 10-10z",
@@ -1919,7 +2307,7 @@ function timeLabel(seconds) {
 }
 function setup(ctx) {
   let settings = normalizeSettings(DEFAULTS), ready = false, initialized = false, disposed = false;
-  const hasKeys = { openrouter: false, local: false }, frontendId = crypto.randomUUID();
+  const hasKeys = { openrouter: false, local: false, freesound: false }, frontendId = crypto.randomUUID();
   const castDrafts = new Map, openCast = new Set;
   let castInitialized = false, addOpen = false, voiceQuery = "", voiceFilter = "all", fixName = "", fixSay = "", viewChosen = false;
   const addedCast = new Set, addedNames = new Map, sayDrafts = new Map, moreOpen = new Set, testPick = new Map;
@@ -1944,6 +2332,16 @@ function setup(ctx) {
   let automaticPlaybackError = "";
   let utterance = null;
   const audioPlayer = new PreparedPlayer;
+  let mixerVoices = "";
+  const volumeWorks = (() => {
+    try {
+      const probe = new Audio;
+      probe.volume = 0.5;
+      return Math.abs(probe.volume - 0.5) < 0.01;
+    } catch {
+      return false;
+    }
+  })();
   const audioCache = new AudioCache;
   let cacheUserId = "";
   const automaticPreparations = new Set;
@@ -2336,8 +2734,11 @@ function setup(ctx) {
       top.append(play, text, tools);
       const seek = el("div", "", "ra-seek");
       seek.append(progress, el("span", hasTime ? clock : "", "ra-time"));
-      const foot = el("div", "", "ra-row ra-widget-foot"), stopButton = withIcon(button("Stop", () => stop()), "stop");
+      const foot = el("div", "", "ra-row ra-widget-foot"), stopButton = iconButton("stop", "Stop", () => stop());
       stopButton.disabled = phase === "idle";
+      const seekable = !!audioPlayer.duration && currentPassages[0]?.settings.provider !== "browser";
+      const back = iconButton("back", "Back one part", () => jump(-1)), forward = iconButton("forward", "Forward one part", () => jump(1));
+      back.disabled = forward.disabled = !seekable;
       const retry = !!retryPreparation && (incompleteAudio || preparingAudio && preparedCount > 0);
       const fix = retry ? button("Retry missing audio", () => safe(async () => {
         await retryPreparation?.();
@@ -2347,7 +2748,7 @@ function setup(ctx) {
         fix.disabled = preparingAudio;
       const open = iconButton("tune", "Open Readalong", () => tab.activate());
       power.classList.add("ra-push");
-      foot.append(stopButton, fix, power, open);
+      foot.append(back, stopButton, forward, fix, power, open);
       patchPlaybackChildren(widget.root, top, seek, foot);
     }
   }
@@ -2365,9 +2766,113 @@ function setup(ctx) {
     }
     renderPlayer();
   }
+  const soundFiles = new Map;
+  let soundPlayer = null;
+  let soundError = "";
+  const playedSounds = new Set;
+  let passageSounds = [];
+  const soundsOn = () => settings.soundEffects && hasKeys.freesound && currentPassages[0]?.settings.provider !== "browser";
+  function soundFile(query) {
+    let file = soundFiles.get(query);
+    if (!file) {
+      file = rpc("sound_effect", { query }).then((r) => URL.createObjectURL(new Blob([Uint8Array.from(atob(r.audio), (c) => c.charCodeAt(0))], { type: r.mime || "audio/mpeg" })));
+      file.catch((error) => {
+        soundFiles.delete(query);
+        if (!soundError) {
+          soundError = error instanceof Error ? error.message : "A sound effect could not be loaded.";
+          notice(soundError, true);
+        }
+      });
+      soundFiles.set(query, file);
+    }
+    return file;
+  }
+  function prepareSounds() {
+    playedSounds.clear();
+    soundError = "";
+    passageSounds = currentPassages.map((p) => soundCues(p.segments.map((s) => plainText(s.text)).join(" ")));
+    if (!soundsOn())
+      return;
+    for (const query of [...new Set(passageSounds.flat().map((c) => c.query))].slice(0, 8))
+      soundFile(query).catch(() => {});
+  }
+  function primeSounds() {
+    if (!soundsOn() || soundPlayer)
+      return;
+    soundPlayer = new Audio;
+    const size = 4800, url = URL.createObjectURL(new Blob([waveHeader(size), new Uint8Array(size)], { type: "audio/wav" }));
+    soundPlayer.src = url;
+    soundPlayer.play().then(() => soundPlayer?.pause(), () => {}).finally(() => URL.revokeObjectURL(url));
+  }
+  function playSounds() {
+    if (!soundsOn())
+      return;
+    const at = audioPlayer.position;
+    for (const cue of passageSounds[at.index] ?? []) {
+      const id = `${at.index}:${cue.query}`;
+      if (playedSounds.has(id) || at.fraction < cue.at)
+        continue;
+      playedSounds.add(id);
+      soundFile(cue.query).then((url) => {
+        if (phase !== "playing")
+          return;
+        const audio = soundPlayer ??= new Audio;
+        audio.src = url;
+        audio.volume = Math.min(1, settings.volume * 0.45);
+        audio.playbackRate = 1;
+        audio.play().catch(() => {});
+      }).catch(() => {});
+    }
+  }
+  const speakerKey = (index) => (currentPassages[index]?.segments[0]?.speaker || "").trim().toLowerCase();
+  function skipped(index) {
+    const key = speakerKey(index);
+    return !!key && (settings.dialogueOnly && key === "narrator" || !!settings.mix[key]?.mute);
+  }
+  function applyMix() {
+    if (!audioPlayer.duration || currentPassages[0]?.settings.provider === "browser")
+      return;
+    const at = audioPlayer.position;
+    if (skipped(at.index)) {
+      let next = at.index + 1;
+      while (next < currentPassages.length && skipped(next))
+        next++;
+      const starts = audioPlayer.starts;
+      if (next < starts.length)
+        audioPlayer.seek(starts[next] + 0.001);
+      else if (next >= currentPassages.length)
+        audioPlayer.seek(audioPlayer.duration);
+      return;
+    }
+    audioPlayer.setGain(settings.mix[speakerKey(at.index)]?.gain ?? 1);
+  }
+  function jump(step) {
+    if (!audioPlayer.duration || currentPassages[0]?.settings.provider === "browser")
+      return;
+    const { position: at, starts } = audioPlayer;
+    let index = step < 0 && at.seconds > 2 ? at.index : at.index + step;
+    while (index >= 0 && index < currentPassages.length && skipped(index))
+      index += step;
+    index = Math.max(0, index);
+    if (index >= starts.length)
+      return;
+    audioPlayer.seek(starts[index] + 0.001);
+    for (const id of [...playedSounds])
+      if (Number(id.split(":")[0]) >= index)
+        playedSounds.delete(id);
+    if (phase === "finished") {
+      phase = "paused";
+      paused = true;
+    }
+    markSentence(index, 0);
+    applyMix();
+    renderPlayer();
+  }
   function updateClock() {
     if (phase !== "playing")
       return;
+    applyMix();
+    playSounds();
     const at = audioPlayer.position, passage = currentPassages[at.index];
     if (passage)
       markSentence(at.index, estimatedSentenceIndex(passage, at.fraction));
@@ -2426,6 +2931,8 @@ function setup(ctx) {
     notice(automaticPlaybackError || text, !!automaticPlaybackError);
   }
   async function playOrPause(automatic = false) {
+    if (!automatic)
+      primeSounds();
     lastPlaybackAction = automatic ? "Automatic playback" : phase === "idle" ? "Load saved" : playState().label;
     updateSpeechActivity();
     if (!automatic) {
@@ -2477,6 +2984,7 @@ function setup(ctx) {
       markedPosition = -1;
       currentPassage = 0;
       audioPlayer.rewind();
+      playedSounds.clear();
     }
     paused = false;
     if (currentPassages[0]?.settings.provider === "browser") {
@@ -2728,6 +3236,92 @@ function setup(ctx) {
     renderPlayer();
     await saveSettings();
   }
+  async function castNewSpeakers(message, context, rules) {
+    if (!settings.autoVoices || message.isUser || settings.provider === "browser")
+      return [];
+    const main = message.name, roster = buildRoster(storyRoster(settings, context, main));
+    const speakers = [...new Set(parseSegments(message.content, main, rules ?? DEFAULT_SPEECH_RULES, roster).map((s) => s.speaker))];
+    const story = Object.values(context.pronunciations ?? {});
+    const added = autoCast(settings, {
+      speakers,
+      voices: voiceNames(),
+      genderOfVoice: (v) => voiceGender(settings, v),
+      genderOf: (n) => story.find((e) => [e.name, ...e.aliases].some((a) => a.toLowerCase() === n.toLowerCase()))?.gender,
+      needsVoice: (n) => {
+        const a = settings.assignments[`name:${n.toLowerCase()}`];
+        return a ? !a.voice : isUnvoicedExtra(n, settings, { ...context, mainSpeaker: main });
+      }
+    });
+    const names = Object.values(added).map((a) => a.name);
+    if (!names.length)
+      return [];
+    Object.assign(settings.assignments, added);
+    try {
+      await saveSettings();
+    } catch {}
+    renderAssignments();
+    notice(`Gave ${names.length === 1 ? "a voice" : "voices"} to ${names.join(", ")}. Change ${names.length === 1 ? "it" : "them"} in Cast.`);
+    return names;
+  }
+  const MESSAGE_AUDIO_LIMIT = 9.5 * 1024 * 1024;
+  async function savedMessageAudio(messageKey) {
+    let record;
+    try {
+      record = (await rpc("recording", { messageKey }))?.record;
+    } catch {
+      return;
+    }
+    if (!record)
+      return;
+    const plan = readRecordingPlan(record.plan, record.sizes.length);
+    if (!plan)
+      return;
+    let blob;
+    try {
+      blob = await nativeTts.audio(record.audioId, MESSAGE_AUDIO_LIMIT + 1024 * 1024);
+    } catch {
+      return;
+    }
+    if (!blob) {
+      rpc("forget_recording", { messageKey }).catch(() => {});
+      return;
+    }
+    const clips = splitRecording(blob, record);
+    if (!clips)
+      return;
+    return { key: record.key, plan, clips };
+  }
+  async function keepWithMessage(chatId, messageId, key, clips, recording, force = false) {
+    if (!settings.saveToMessage || settings.provider === "browser" || !clips.length)
+      return;
+    const first = clips[0].wave;
+    if (!first || !clips.every((c) => c.wave && c.wave.rate === first.rate && c.wave.channels === first.channels && c.wave.bits === first.bits))
+      return;
+    const joined = joinPrepared(clips);
+    if (joined.length !== 1 || joined[0].blob.size > MESSAGE_AUDIO_LIMIT)
+      return;
+    try {
+      if (!force) {
+        const existing = (await rpc("recording", { messageKey: recording.messageKey }))?.record;
+        if (existing?.key === key)
+          return;
+      }
+      const audioId = await nativeTts.saveMessageAudio(chatId, messageId, joined[0].blob, `readalong-${key.slice(0, 16)}.wav`);
+      const { expired } = await rpc("remember_recording", { record: {
+        messageKey: recording.messageKey,
+        key,
+        audioId,
+        chatId,
+        messageId,
+        sizes: clips.map((c) => c.wave.size),
+        wave: { rate: first.rate, channels: first.channels, bits: first.bits },
+        plan: recording.plan
+      } });
+      for (const old of Array.isArray(expired) ? expired : [])
+        if (old.audioId !== audioId)
+          nativeTts.removeMessageAudio(old.chatId, old.messageId, old.audioId).catch(() => {});
+    } catch {}
+  }
   async function startMessage(message, options = {}) {
     if (!settings.enabled)
       throw new Error("Readalong is off. Turn it on to prepare audio.");
@@ -2751,7 +3345,7 @@ function setup(ctx) {
     notice("Looking for saved audio…");
     renderPlayer();
     try {
-      const snapshot = normalizeSettings(settings);
+      let snapshot = normalizeSettings(settings);
       const chatId = ctx.getActiveChat().chatId;
       const context = {
         characters,
@@ -2778,8 +3372,16 @@ function setup(ctx) {
       }
       if (token !== playbackId)
         return;
+      if (!options.restoreOnly) {
+        const cast = await castNewSpeakers(message, context, rules);
+        if (token !== playbackId)
+          return;
+        if (cast.length)
+          snapshot = normalizeSettings(settings);
+      }
       currentPassages = planMessageSpeech(message, snapshot, context, rules);
       currentSegments = currentPassages.flatMap((p) => p.segments);
+      prepareSounds();
       if (!currentSegments.length) {
         stop(false);
         notice("There is no readable text in this message.");
@@ -2820,6 +3422,19 @@ function setup(ctx) {
             partial = await audioCache.getPartial(cacheUserId, audioKey, plan.passages.length);
           } catch {}
         if (!partial && !options.updateAudio) {
+          const kept = await savedMessageAudio(messageKey);
+          if (kept && token === playbackId) {
+            audioKey = kept.key;
+            plan = kept.plan;
+            partial = kept.clips;
+            try {
+              saved = await audioCache.putPartial(cacheUserId, audioKey, kept.clips, { messageKey, plan });
+            } catch {
+              saved = false;
+            }
+          }
+        }
+        if (!partial && !options.updateAudio) {
           const legacy = planMessageSpeech(message, snapshot, { ...context, legacyAudio: true }, rules);
           if (legacy.length) {
             const legacyKey = await preparationHash([messageKey, requests(legacy, true)]);
@@ -2843,6 +3458,7 @@ function setup(ctx) {
         previousRecording = !!partial && audioKey !== desiredKey;
         currentPassages = plan.passages;
         currentSegments = currentPassages.flatMap((p) => p.segments);
+        prepareSounds();
         if (partial?.length !== currentPassages.length)
           partial = undefined;
         partial ??= Array.from({ length: currentPassages.length }, () => {
@@ -2958,6 +3574,8 @@ function setup(ctx) {
             preparingAudio = false;
             checkingSavedAudio = false;
             preparedCount = clips.length;
+            if (chatId)
+              keepWithMessage(chatId, message.id, audioKey, clips, recording, true);
             audioPlayer.setSpeed(settings.speed);
             audioPlayer.setVolume(settings.volume);
             if (phase === "preparing")
@@ -2997,6 +3615,8 @@ function setup(ctx) {
             }
             retained.saved = saved;
           }
+          if (chatId)
+            keepWithMessage(chatId, message.id, audioKey, parts, recording, !!options.updateAudio);
           restored = true;
           preparedCount = parts.length;
           retryPreparation = null;
@@ -3229,7 +3849,10 @@ function setup(ctx) {
     if (phase !== "idle") {
       const play = playButton(() => safe(playOrPause));
       play.disabled = phase === "preparing" || !!playAttempt || incompleteAudio && !audioPlayer.duration;
-      row.append(play, iconButton("stop", "Stop", () => stop(), "ra-icon"));
+      const seekable = !!audioPlayer.duration && currentPassages[0]?.settings.provider !== "browser";
+      const back = iconButton("back", "Back one part", () => jump(-1), "ra-icon"), forward = iconButton("forward", "Forward one part", () => jump(1), "ra-icon");
+      back.disabled = forward.disabled = !seekable;
+      row.append(back, play, forward, iconButton("stop", "Stop", () => stop(), "ra-icon"));
       if (currentMessage)
         row.append(button("Show in chat", () => marker.follow()), button("Fix a name", () => fixAName()));
       if (retryPreparation && (incompleteAudio || preparingAudio && preparedCount > 0)) {
@@ -3278,6 +3901,11 @@ function setup(ctx) {
       content.append(el("p", widgetError || widgetPermissionHint, "ra-muted"));
     patchPlaybackChildren(player, ...content.childNodes);
     renderWidget();
+    const voicesHere = [...new Set(currentPassages.map((_, i) => speakerKey(i)))].join("|");
+    if (voicesHere !== mixerVoices) {
+      mixerVoices = voicesHere;
+      renderOptions();
+    }
   }
   function renderOptions() {
     const slider = el("input");
@@ -3318,7 +3946,70 @@ function setup(ctx) {
     sliders.append(speedField, volumeField);
     const about = disclosure([el("strong", "About cost and saved audio")]);
     about.body.append(el("p", "While Readalong is on, each new reply gets audio as soon as it is written. Automatic playback can start it for you; otherwise press Play.", "ra-muted"), el("p", "Each successful audio part is saved on this device. Reloading or switching chats reuses what is still saved. Play never requests speech.", "ra-muted"), el("p", "If preparation fails, Retry missing audio keeps the successful parts and requests only what is missing. That retry can cost money. Storage limits or clearing app data can remove saved audio.", "ra-muted"), speechActivityNote, el("p", "Changing a voice, or how a name is said, only changes new audio.", "ra-muted"), el("p", "The highlighted sentence is a close guess of where the voice is.", "ra-muted"));
-    options.replaceChildren(sliders, toggle("Play replies automatically", settings.automaticPlayback, (v) => {
+    const mixer = el("div", "", "ra-stack");
+    renderMixer(mixer);
+    const sounds = el("div", "", "ra-stack");
+    sounds.append(toggle("Sound effects", settings.soundEffects, (v) => {
+      settings.soundEffects = v;
+      renderOptions();
+      prepareSounds();
+      safe(saveSettings);
+    }, "Plays quiet sounds, like a knock or footsteps, when the story describes them. Sounds come from Freesound."));
+    if (settings.soundEffects) {
+      const key = textInput("", () => {}, "password");
+      key.autocomplete = "off";
+      key.placeholder = hasKeys.freesound ? "Key saved. Leave blank to keep it" : "Paste your Freesound key";
+      const keyRow = el("div", "", "ra-row ra-end");
+      keyRow.append(field("Freesound key", key), button("Save key", () => safe(async () => {
+        if (!key.value.trim())
+          throw new Error("Paste a key first.");
+        const r = await rpc("save_key", { key: key.value, provider: "freesound" });
+        hasKeys.freesound = r.hasKey;
+        soundFiles.clear();
+        renderOptions();
+        prepareSounds();
+        notice("Freesound key saved.");
+      })));
+      sounds.append(keyRow, el("p", hasKeys.freesound ? "Your key is stored encrypted. Each new kind of sound is fetched once and then reused." : "Get a free key by making a Freesound account and applying for an API key at freesound.org/apiv2/apply.", "ra-muted"));
+      if (hasKeys.freesound) {
+        const remove = button("Remove key", () => safe(async () => {
+          await rpc("remove_key", { provider: "freesound", confirmed: true });
+          hasKeys.freesound = false;
+          soundFiles.clear();
+          renderOptions();
+          notice("Freesound key removed.");
+        }));
+        remove.classList.add("ra-quiet");
+        sounds.append(remove);
+      }
+    }
+    const keep = el("div", "", "ra-stack");
+    keep.append(toggle("Keep audio with the message", settings.saveToMessage, (v) => {
+      settings.saveToMessage = v;
+      renderOptions();
+      safe(saveSettings);
+    }, "Saves finished audio in Lumiverse, so your other devices can play it without making it again. Very long replies stay on this device only."));
+    if (settings.saveToMessage) {
+      const count = el("select");
+      count.setAttribute("aria-label", "Recordings to keep");
+      for (const n of [10, 30, 60, 100, 200]) {
+        const o = el("option", `${n} most recent replies`);
+        o.value = String(n);
+        count.append(o);
+      }
+      if (![10, 30, 60, 100, 200].includes(settings.savedRecordings)) {
+        const o = el("option", `${settings.savedRecordings} most recent replies`);
+        o.value = String(settings.savedRecordings);
+        count.prepend(o);
+      }
+      count.value = String(settings.savedRecordings);
+      count.onchange = () => {
+        settings.savedRecordings = Number(count.value);
+        safe(saveSettings);
+      };
+      keep.append(field("Recordings to keep", count), el("p", "Older recordings are removed from their messages when a new one is saved.", "ra-muted"));
+    }
+    options.replaceChildren(sliders, mixer, sounds, keep, toggle("Play replies automatically", settings.automaticPlayback, (v) => {
       safe(() => setAutomaticPlayback(v));
     }, "Starts with your next new reply. Older messages still wait for Play."), toggle("Scroll the chat to follow the voice", settings.follow, (v) => {
       settings.follow = v;
@@ -3327,6 +4018,66 @@ function setup(ctx) {
       settings.earlyPlayback = v;
       safe(saveSettings);
     }, "Play can start once about three quarters of the audio is ready."), about.details);
+  }
+  function renderMixer(container) {
+    container.replaceChildren(el("h3", "Voices in this reply"));
+    container.append(toggle("Dialogue only", settings.dialogueOnly, (v) => {
+      settings.dialogueOnly = v;
+      applyMix();
+      renderMixer(container);
+      safe(saveSettings);
+    }, "Skips the narrator and plays only what characters say."));
+    const seen = new Map;
+    for (let i = 0;i < currentPassages.length; i++) {
+      const key = speakerKey(i);
+      if (key && !seen.has(key))
+        seen.set(key, currentPassages[i].segments[0].speaker);
+    }
+    if (!seen.size) {
+      container.append(el("p", "Prepare or play a reply to adjust its voices here.", "ra-muted"));
+      return;
+    }
+    const list = el("div", "", "ra-mix");
+    for (const [key, speaker] of seen) {
+      const level = settings.mix[key] ?? { gain: 1, mute: false }, row = el("div", "", "ra-mix-row");
+      const name = el("span", "", "ra-mix-name");
+      name.append(el("strong", speakerLabel(speaker, "Voice")));
+      const set = (next) => {
+        settings.mix[key] = next;
+        if (next.gain === 1 && !next.mute)
+          delete settings.mix[key];
+        applyMix();
+      };
+      const mute = button(level.mute ? "Skipped" : "Skip", () => {
+        set({ ...level, mute: !level.mute });
+        renderMixer(container);
+        safe(saveSettings);
+      });
+      mute.className = "ra-mark";
+      mute.setAttribute("aria-pressed", String(level.mute));
+      mute.setAttribute("aria-label", `Skip ${speakerLabel(speaker, "this voice")}`);
+      row.append(name);
+      if (volumeWorks) {
+        const range = el("input");
+        range.type = "range";
+        range.min = "0";
+        range.max = "1";
+        range.step = ".05";
+        range.value = String(level.gain);
+        range.setAttribute("aria-label", `${speakerLabel(speaker, "Voice")} volume`);
+        range.oninput = () => {
+          level.gain = Number(range.value);
+          set({ ...level });
+        };
+        range.onchange = () => {
+          safe(saveSettings);
+        };
+        row.append(range);
+      }
+      row.append(mute);
+      list.append(row);
+    }
+    container.append(list, el("p", volumeWorks ? "Changes apply right away and are remembered for each voice. Skipped voices are still prepared." : "Skip works here. This browser does not let pages change volume, so levels are hidden.", "ra-muted"));
   }
   function nextStep(label, to) {
     const b = button(label, () => showView(to, true));
@@ -3611,7 +4362,7 @@ function setup(ctx) {
     if (!castDrafts.has(key))
       castDrafts.set(key, { ...saved ?? emptyVoice(), ...key.startsWith("name:") ? { name: spoken } : {} });
     const draft = castDrafts.get(key);
-    const say = sayDrafts.get(key) ?? { spokenAs: known?.spokenAs ?? "", aliases: (known?.aliases ?? []).join(", ") };
+    const say = sayDrafts.get(key) ?? { spokenAs: known?.spokenAs ?? "", aliases: [...new Set([...known?.aliases ?? [], ...saved?.aliases ?? []])].join(", ") };
     const touch = () => {
       sayDrafts.set(key, say);
     };
@@ -3651,6 +4402,7 @@ function setup(ctx) {
           moreOpen.delete(key);
       }
     });
+    let refreshPick;
     if (hasStory) {
       const pick = el("select"), pickField = field("Which spelling to test", pick);
       pick.onchange = () => {
@@ -3659,7 +4411,7 @@ function setup(ctx) {
         else
           testPick.delete(key);
       };
-      const refreshPick = () => {
+      refreshPick = () => {
         const names = [...new Set([known?.name ?? spoken, ...say.aliases.split(",").map((s) => s.trim())].filter(Boolean))];
         if (!names.includes(testPick.get(key) ?? ""))
           testPick.delete(key);
@@ -3672,16 +4424,24 @@ function setup(ctx) {
         pick.value = testPick.get(key) ?? "";
         pickField.hidden = names.length < 2;
       };
-      const also = textInput(say.aliases, (v) => {
-        say.aliases = v;
-        touch();
-        refreshPick();
-      });
-      also.maxLength = 810;
-      also.placeholder = "Nicknames or other spellings, with commas between";
       refreshPick();
-      more.body.append(field("Also goes by", also), pickField);
+      more.body.append(pickField);
     }
+    const also = textInput(say.aliases, (v) => {
+      say.aliases = v;
+      touch();
+      refreshPick?.();
+    });
+    also.maxLength = 810;
+    also.placeholder = "Nicknames or other spellings, with commas between";
+    more.body.prepend(field("Also goes by", also), el("p", "Every name here uses this voice.", "ra-muted"));
+    const sounds = field("Sounds", select([{ value: "", label: "Not set" }, { value: "f", label: "Female" }, { value: "m", label: "Male" }], draft.gender ?? "", (v) => {
+      if (v === "f" || v === "m")
+        draft.gender = v;
+      else
+        delete draft.gender;
+    }));
+    more.body.append(sounds);
     const moods = el("div", "", "ra-grid");
     moods.append(field("Usual mood", select(EMOTIONS.map((v) => ({ value: v, label: v })), draft.emotion, (v) => draft.emotion = v)), field("Usual way of speaking", select(DELIVERIES.map((v) => ({ value: v, label: v })), draft.delivery, (v) => draft.delivery = v)));
     more.body.append(moods);
@@ -3694,17 +4454,26 @@ function setup(ctx) {
         castForm(container, key, name, false);
     };
     const save = button("Save", () => safe(async () => {
-      const edited = sayDrafts.has(key), wantsVoice = !!saved || !!draft.voice || draft.emotion !== "neutral" || draft.delivery !== "normal";
-      const entry = edited && say.spokenAs.trim() ? sayingEntry(known?.name ?? spoken, say.spokenAs, say.aliases) : undefined;
+      const edited = sayDrafts.has(key), aliases = say.aliases.split(",").map((a) => a.trim()).filter(Boolean);
+      if (edited) {
+        if (aliases.length)
+          draft.aliases = aliases;
+        else
+          delete draft.aliases;
+      }
+      const wantsVoice = !!saved || !!draft.voice || draft.emotion !== "neutral" || draft.delivery !== "normal" || !!draft.aliases?.length || !!draft.gender;
+      const entry = hasStory && edited && say.spokenAs.trim() ? sayingEntry(known?.name ?? spoken, say.spokenAs, say.aliases) : undefined;
       if (!wantsVoice && !entry && !(edited && known))
         throw new Error("Pick a voice or type how to say the name first.");
       if (wantsVoice) {
-        settings.assignments[key] = { ...draft };
+        const own = { ...draft };
+        delete own.auto;
+        settings.assignments[key] = own;
         await saveSettings();
       }
       if (entry)
         await saveSaying(entry);
-      else if (edited && known)
+      else if (hasStory && edited && known && !say.spokenAs.trim())
         await removeSaying(known.name);
       done();
       notice(entry || edited && known ? `Saved ${spoken}. Audio you already have keeps the old sound.` : `Saved ${spoken}.`);
@@ -3878,7 +4647,7 @@ function setup(ctx) {
     }
     for (const row of rows) {
       const saved = settings.assignments[row.key], known = sayingFor(baseName(row.name));
-      const summary = [el("strong", row.you ? `You (${row.name})` : baseName(row.name)), el("span", saved?.voice ? voiceLabel(saved.voice) : "No voice yet")];
+      const summary = [el("strong", row.you ? `You (${row.name})` : baseName(row.name)), el("span", saved?.voice ? `${voiceLabel(saved.voice)}${saved.auto ? ", picked for you" : ""}` : "No voice yet")];
       if (known)
         summary.push(el("span", `said “${known.spokenAs}”`));
       if (!saved && !known && !row.you)
@@ -3971,7 +4740,10 @@ function setup(ctx) {
     addByName.dataset.raControl = "Add by name";
     byName.append(field("Or anyone else, by name", speakerInput), addByName);
     add.body.append(fromLibrary, byName, el("p", "Side characters can have a voice too. For Readalong to tell several speakers apart in one reply, turn on “Mark feelings and who is speaking” under Connection.", "ra-muted"));
-    assignmentsCard.append(add.details, toggle("Learn how to say new names", settings.promptPronunciations, (v) => {
+    assignmentsCard.append(add.details, toggle("Give new characters a voice automatically", settings.autoVoices, (v) => {
+      settings.autoVoices = v;
+      safe(saveSettings);
+    }, "When the story says a new character sounds female or male, Readalong picks an unused voice you marked that way. You can change it any time."), toggle("Learn how to say new names", settings.promptPronunciations, (v) => {
       settings.promptPronunciations = v;
       safe(saveSettings);
     }, "The story model suggests how to say each new name. Your own fixes always win."), nextStep("Next: playback options", "options"));

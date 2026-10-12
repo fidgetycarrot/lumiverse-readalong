@@ -6,9 +6,10 @@ import { planSpeech, planMessageSpeech, prepareAll, estimatedSentenceIndex, isUn
 import {buildRoster} from './speaker-detect';
 import {soundCues,type SoundCue} from './sound-effects';
 import {autoCast} from './auto-cast';
-import { PreparedPlayer, prepareClip, waveHeader, type PreparedClip } from './prepared-audio';
+import { PreparedPlayer, prepareClip, waveHeader, joinPrepared, type PreparedClip } from './prepared-audio';
 import { AudioCache, preparationHash } from './audio-cache';
-import {recordingPlan,type RecordingMetadata} from './saved-recording';
+import {recordingPlan,readRecordingPlan,type RecordingMetadata,type RecordingPlan} from './saved-recording';
+import {splitRecording} from './message-recordings';
 import {widgetDimensions as resolveWidgetDimensions,widgetPosition} from './widget-layout';
 import {patchPlaybackChildren} from './playback-ui';
 import {readingChanged} from './message-update';
@@ -670,6 +671,34 @@ export function setup(ctx: SpindleFrontendContext) {
     renderAssignments();notice(`Gave ${names.length===1?'a voice':'voices'} to ${names.join(', ')}. Change ${names.length===1?'it':'them'} in Cast.`);
     return names;
   }
+  /** Most Lumiverse uploads are capped at 10 MB; leave room for the form. */
+  const MESSAGE_AUDIO_LIMIT=9.5*1024*1024;
+  /** Audio kept on the message in Lumiverse, so other devices can play it without a new request. */
+  async function savedMessageAudio(messageKey:string):Promise<{key:string;plan:RecordingPlan;clips:PreparedClip[]}|undefined> {
+    let record:any;
+    try{record=(await rpc('recording',{messageKey}))?.record}catch{return}
+    if(!record)return;
+    const plan=readRecordingPlan(record.plan,record.sizes.length);if(!plan)return;
+    let blob:Blob|undefined;
+    try{blob=await nativeTts.audio(record.audioId,MESSAGE_AUDIO_LIMIT+1024*1024)}catch{return}
+    if(!blob){rpc('forget_recording',{messageKey}).catch(()=>{});return}
+    const clips=splitRecording(blob,record);if(!clips)return;
+    return {key:record.key,plan,clips};
+  }
+  /** Upload a finished reading onto its message. Quietly does nothing if it can't. */
+  async function keepWithMessage(chatId:string,messageId:string,key:string,clips:PreparedClip[],recording:RecordingMetadata,force=false) {
+    if(!settings.saveToMessage || settings.provider==='browser' || !clips.length)return;
+    const first=clips[0].wave;
+    if(!first || !clips.every(c=>c.wave && c.wave.rate===first.rate && c.wave.channels===first.channels && c.wave.bits===first.bits))return;
+    const joined=joinPrepared(clips);if(joined.length!==1 || joined[0].blob.size>MESSAGE_AUDIO_LIMIT)return;
+    try{
+      if(!force){const existing=(await rpc('recording',{messageKey:recording.messageKey}))?.record;if(existing?.key===key)return}
+      const audioId=await nativeTts.saveMessageAudio(chatId,messageId,joined[0].blob,`readalong-${key.slice(0,16)}.wav`);
+      const {expired}=await rpc('remember_recording',{record:{messageKey:recording.messageKey,key,audioId,chatId,messageId,
+        sizes:clips.map(c=>c.wave!.size),wave:{rate:first.rate,channels:first.channels,bits:first.bits},plan:recording.plan}});
+      for(const old of Array.isArray(expired)?expired:[])if(old.audioId!==audioId)nativeTts.removeMessageAudio(old.chatId,old.messageId,old.audioId).catch(()=>{});
+    }catch{/* The audio is still kept on this device. */}
+  }
   async function startMessage(message: MessageInfo,options:{automatic?:boolean;restoreOnly?:boolean;autoStart?:boolean;updateAudio?:boolean}={}) {
     if(!settings.enabled)throw new Error('Readalong is off. Turn it on to prepare audio.');
     if(!options.restoreOnly){
@@ -718,6 +747,13 @@ export function setup(ctx: SpindleFrontendContext) {
           if(existing){audioKey=existing.key;plan=existing.plan;partial=existing.clips}
         }catch{/* The server ledger still prevents automatic regeneration. */}
         if(!partial)try{partial=await audioCache.getPartial(cacheUserId,audioKey,plan.passages.length)}catch{/* Storage never authorizes a retry. */}
+        if(!partial && !options.updateAudio){
+          const kept=await savedMessageAudio(messageKey);
+          if(kept && token===playbackId){
+            audioKey=kept.key;plan=kept.plan;partial=kept.clips;
+            try{saved=await audioCache.putPartial(cacheUserId,audioKey,kept.clips,{messageKey,plan})}catch{saved=false}
+          }
+        }
         if(!partial && !options.updateAudio){
           // Migrate 0.2.10 audio by its original batching and request identity,
           // without replacing a byte or making a speech request.
@@ -794,6 +830,7 @@ export function setup(ctx: SpindleFrontendContext) {
             if(openingCount && (audioPlayer.hasStarted || playAttempt))audioPlayer.append(clips.slice(openingCount),true);
             else audioPlayer.load(clips);
             incompleteAudio=false;retryPreparation=null;preparingAudio=false;checkingSavedAudio=false;preparedCount=clips.length;
+            if(chatId)keepWithMessage(chatId,message.id,audioKey,clips,recording,true);
             audioPlayer.setSpeed(settings.speed);audioPlayer.setVolume(settings.volume);
             if(phase==='preparing')phase='ready';
             preparationNotice(!saved?'The audio is ready, but some parts could not be saved. Keep this window open.':phase==='playing'?'Reading… The whole message is ready.':phase==='paused'?'Paused. The whole message is ready.':'The whole message is ready. Press Play.');
@@ -811,6 +848,7 @@ export function setup(ctx: SpindleFrontendContext) {
           // Explicitly selecting an already saved take makes it the default
           // again without paying for it, including after switching styles back.
           if(options.updateAudio){try{saved=await audioCache.putPartial(cacheUserId,audioKey,parts,recording)}catch{saved=false}retained.saved=saved}
+          if(chatId)keepWithMessage(chatId,message.id,audioKey,parts as PreparedClip[],recording,!!options.updateAudio);
           restored=true;preparedCount=parts.length;retryPreparation=null;audioPlayer.load(parts as PreparedClip[]);audioPlayer.setSpeed(settings.speed);audioPlayer.setVolume(settings.volume);
         }else if(options.restoreOnly || options.automatic && parts.some(Boolean)){
           if(parts.some(Boolean)){retainPartial();notice(`Kept ${preparedCount} of ${parts.length} parts${saved?' on this device':' in this window'}. Play uses the prepared opening. Retry missing audio requests only missing parts and may cost money.`,true);renderPlayer()}
@@ -968,7 +1006,16 @@ export function setup(ctx: SpindleFrontendContext) {
       sounds.append(keyRow,el('p',hasKeys.freesound?'Your key is stored encrypted. Each new kind of sound is fetched once and then reused.':'Get a free key by making a Freesound account and applying for an API key at freesound.org/apiv2/apply.','ra-muted'));
       if(hasKeys.freesound){const remove=button('Remove key',()=>safe(async()=>{await rpc('remove_key',{provider:'freesound',confirmed:true});hasKeys.freesound=false;soundFiles.clear();renderOptions();notice('Freesound key removed.')}));remove.classList.add('ra-quiet');sounds.append(remove)}
     }
-    options.replaceChildren(sliders,mixer,sounds,
+    const keep=el('div','', 'ra-stack');
+    keep.append(toggle('Keep audio with the message',settings.saveToMessage,v=>{settings.saveToMessage=v;renderOptions();void safe(saveSettings)},'Saves finished audio in Lumiverse, so your other devices can play it without making it again. Very long replies stay on this device only.'));
+    if(settings.saveToMessage){
+      const count=el('select');count.setAttribute('aria-label','Recordings to keep');
+      for(const n of [10,30,60,100,200]){const o=el('option',`${n} most recent replies`);o.value=String(n);count.append(o)}
+      if(![10,30,60,100,200].includes(settings.savedRecordings)){const o=el('option',`${settings.savedRecordings} most recent replies`);o.value=String(settings.savedRecordings);count.prepend(o)}
+      count.value=String(settings.savedRecordings);count.onchange=()=>{settings.savedRecordings=Number(count.value);void safe(saveSettings)};
+      keep.append(field('Recordings to keep',count),el('p','Older recordings are removed from their messages when a new one is saved.','ra-muted'));
+    }
+    options.replaceChildren(sliders,mixer,sounds,keep,
       toggle('Play replies automatically',settings.automaticPlayback,v=>{void safe(()=>setAutomaticPlayback(v))},'Starts with your next new reply. Older messages still wait for Play.'),
       toggle('Scroll the chat to follow the voice',settings.follow,v=>{settings.follow=v;void safe(saveSettings)}),
       toggle('Start before the whole message is ready',settings.earlyPlayback,v=>{settings.earlyPlayback=v;void safe(saveSettings)},'Play can start once about three quarters of the audio is ready.'),

@@ -34,7 +34,7 @@ export interface Settings {
   model: string; voice: string; narratorVoice: string; localUrl: string;
   enabled: boolean; follow: boolean; earlyPlayback:boolean; automaticPlayback:boolean; promptEmotions: boolean; useEmotions: boolean;promptPronunciations:boolean; personaName:string; npcVoice:string; autoVoices:boolean;
   /** Mixer: per speaker (lowercase name, 'narrator') level and skip. */
-  mix:Record<string,{gain:number;mute:boolean}>; dialogueOnly:boolean; soundEffects:boolean; voiceGenders:Record<string,VoiceGender|'n'>;
+  mix:Record<string,{gain:number;mute:boolean}>; dialogueOnly:boolean; soundEffects:boolean; saveToMessage:boolean; savedRecordings:number; voiceGenders:Record<string,VoiceGender|'n'>;
   inheritVoices: boolean; widgetMinimized: boolean; widgetPosition: {x:number;y:number}|null;
   speed: number; volume: number;
   assignments: Record<string, VoiceAssignment>;
@@ -42,7 +42,7 @@ export interface Settings {
 export const DEFAULTS: Settings = {
   provider: 'openrouter', connectionId:'', model: 'google/gemini-3.8-flash-tts', voice: 'Kore', narratorVoice: '',
   localUrl: 'http://localhost:8880/v1', enabled: false, follow: false, earlyPlayback:true, automaticPlayback:false,
-  promptEmotions: true, useEmotions: true, promptPronunciations:true, personaName:'', npcVoice:'', autoVoices:true, mix:{}, dialogueOnly:false, soundEffects:false, voiceGenders:{}, inheritVoices:true, widgetMinimized:false, widgetPosition:null, speed: 1, volume: 0.85, assignments: {},
+  promptEmotions: true, useEmotions: true, promptPronunciations:true, personaName:'', npcVoice:'', autoVoices:true, mix:{}, dialogueOnly:false, soundEffects:false, saveToMessage:false, savedRecordings:30, voiceGenders:{}, inheritVoices:true, widgetMinimized:false, widgetPosition:null, speed: 1, volume: 0.85, assignments: {},
 };
 export interface SpeechSegment { text: string; speaker: string; emotion: string; delivery: string }
 export interface SpeechModel { id: string; name: string; voices: string[] }
@@ -80,7 +80,7 @@ export function normalizeSettings(raw: unknown): Settings {
     model: str(r.model, DEFAULTS.model), voice: str(r.voice, DEFAULTS.voice), narratorVoice: str(r.narratorVoice, ''), npcVoice: str(r.npcVoice, ''), voiceGenders: Object.fromEntries(Object.entries(r.voiceGenders && typeof r.voiceGenders==='object' && !Array.isArray(r.voiceGenders) ? r.voiceGenders as Record<string,unknown> : {}).filter(([k,v]) => k.length>0 && k.length<=100 && k===k.trim().toLowerCase() && (v==='f' || v==='m' || v==='n')).slice(0,500)) as Record<string,VoiceGender|'n'>,
     localUrl: str(r.localUrl, DEFAULTS.localUrl, 500),
     enabled: typeof r.enabled==='boolean'?r.enabled:DEFAULTS.enabled, follow: r.follow === true, earlyPlayback:r.earlyPlayback!==false, automaticPlayback:r.automaticPlayback===true,
-    promptEmotions: r.promptEmotions !== false, useEmotions: r.useEmotions !== false,promptPronunciations:r.promptPronunciations!==false, autoVoices:r.autoVoices!==false, dialogueOnly:r.dialogueOnly===true, soundEffects:r.soundEffects===true,
+    promptEmotions: r.promptEmotions !== false, useEmotions: r.useEmotions !== false,promptPronunciations:r.promptPronunciations!==false, autoVoices:r.autoVoices!==false, dialogueOnly:r.dialogueOnly===true, soundEffects:r.soundEffects===true, saveToMessage:r.saveToMessage===true, savedRecordings:Number.isFinite(Number(r.savedRecordings))?Math.round(Math.min(200,Math.max(5,Number(r.savedRecordings)))):30,
     mix:Object.fromEntries(Object.entries(r.mix && typeof r.mix==='object' && !Array.isArray(r.mix)?r.mix as Record<string,any>:{}).filter(([k,v])=>k.length>0 && k.length<=80 && k===k.trim().toLowerCase() && !['__proto__','constructor','prototype'].includes(k) && v && typeof v==='object').slice(0,200).map(([k,v])=>[k,{gain:clamp(v.gain,0,1,1),mute:v.mute===true}])), personaName:typeof r.personaName==='string' && r.personaName.trim().length<=80 && !/[\[\]\r\n]/.test(r.personaName)?r.personaName.trim():'', inheritVoices:r.inheritVoices!==false, widgetMinimized:r.widgetMinimized===true, widgetPosition,
     speed: clamp(r.speed, 0.5, 2, 1), volume: clamp(r.volume, 0, 1, .85), assignments,
   };

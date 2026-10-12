@@ -7,6 +7,7 @@ import { PreparationLedger } from './preparation-ledger';
 import {CompletionRegistry,type CompletionTicket} from './auto-preparation';
 import {PronunciationStore,pronunciationInstruction} from './pronunciation';
 import {preparationHash} from './audio-cache';
+import {RecordingStore,readMessageRecording} from './message-recordings';
 declare const spindle: SpindleAPI;
 const pronunciationPath=async(chatId:string)=>`pronunciations-${await preparationHash([chatId])}.json`;
 const pronunciations=new PronunciationStore({
@@ -16,6 +17,10 @@ const pronunciations=new PronunciationStore({
 const preparationLedger=new PreparationLedger({
   read:async userId=>await spindle.userStorage.exists('preparations.json',userId)?spindle.userStorage.read('preparations.json',userId):undefined,
   write:(userId,value)=>spindle.userStorage.write('preparations.json',value,userId),
+});
+const recordings=new RecordingStore({
+  read:async userId=>await spindle.userStorage.exists('recordings.json',userId)?spindle.userStorage.read('recordings.json',userId):undefined,
+  write:(userId,value)=>spindle.userStorage.write('recordings.json',value,userId),
 });
 const settingsByUser = new Map<string, Settings>();
 const loadingByUser = new Map<string, Promise<Settings>>();
@@ -227,6 +232,14 @@ spindle.onFrontendMessage(async (payload, userId, sessionId) => {
       for(const name of provider==='local'?[LOCAL_CREDENTIALS,'local_key']:provider==='freesound'?['freesound_key']:['openrouter_key'])await keyStorage(()=>spindle.enclave.delete(name,userId));
       for (const id of failedSpeech.keys()) if (id.startsWith(`${userId}:`)) failedSpeech.delete(id);
       reply({hasKey:false});
+    } else if (p.type === 'remember_recording') {
+      const record=readMessageRecording(p.record);if(!record)throw new Error('That recording could not be saved.');
+      await requireChat(record.chatId,userId);
+      reply({expired:(await recordings.remember(userId,record,settings.savedRecordings)).map(r=>({audioId:r.audioId,chatId:r.chatId,messageId:r.messageId}))});
+    } else if (p.type === 'recording' || p.type === 'forget_recording') {
+      if(typeof p.messageKey!=='string' || !/^[a-f0-9]{64}$/.test(p.messageKey))throw new Error('Unknown recording.');
+      if(p.type==='forget_recording'){await recordings.forget(userId,p.messageKey);reply({})}
+      else reply({record:await recordings.get(userId,p.messageKey)??null});
     } else if (p.type === 'sound_effect') {
       if(typeof p.query!=='string')throw new Error('Unknown sound.');
       reply(await soundEffect(p.query,userId));
