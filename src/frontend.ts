@@ -1,8 +1,10 @@
 import type { SpindleFrontendContext, SpindleCharacterEditorTabHandle, SpindleFloatWidgetHandle } from 'lumiverse-spindle-types';
-import { DEFAULTS, GEMINI_VOICES, voiceGender, markVoiceGender, type VoiceGender, EMOTIONS, DELIVERIES, needsPcm, normalizeSettings, speakerCharacterId, plainText, stripCues, speechRequest, type CharacterInfo, type Settings, type SpeechSegment, type SpeechModel, type MessageInfo, type VoiceAssignment } from './shared';
+import { DEFAULTS, GEMINI_VOICES, parseSegments, DEFAULT_SPEECH_RULES, type SpeechRules, voiceGender, markVoiceGender, type VoiceGender, EMOTIONS, DELIVERIES, needsPcm, normalizeSettings, speakerCharacterId, plainText, stripCues, speechRequest, type CharacterInfo, type Settings, type SpeechSegment, type SpeechModel, type MessageInfo, type VoiceAssignment } from './shared';
 import { PassageMarker } from './highlight';
 import { createNativeTtsClient, nativeSpeechRequest, type NativeConnection } from './native-tts';
-import { planSpeech, planMessageSpeech, prepareAll, estimatedSentenceIndex, type SpeechPassage, type VoiceContext } from './playback-plan';
+import { planSpeech, planMessageSpeech, prepareAll, estimatedSentenceIndex, isUnvoicedExtra, storyRoster, type SpeechPassage, type VoiceContext } from './playback-plan';
+import {buildRoster} from './speaker-detect';
+import {autoCast} from './auto-cast';
 import { PreparedPlayer, prepareClip, type PreparedClip } from './prepared-audio';
 import { AudioCache, preparationHash } from './audio-cache';
 import {recordingPlan,type RecordingMetadata} from './saved-recording';
@@ -573,6 +575,22 @@ export function setup(ctx: SpindleFrontendContext) {
     renderOptions();renderPlayer();
     await saveSettings();
   }
+  /** Give side characters in this reply a voice of their gender, once. Returns who was cast. */
+  async function castNewSpeakers(message:MessageInfo,context:VoiceContext,rules?:SpeechRules):Promise<string[]> {
+    if(!settings.autoVoices || message.isUser || settings.provider==='browser')return [];
+    const main=message.name,roster=buildRoster(storyRoster(settings,context,main));
+    const speakers=[...new Set(parseSegments(message.content,main,rules??DEFAULT_SPEECH_RULES,roster).map(s=>s.speaker))];
+    const story=Object.values(context.pronunciations??{});
+    const added=autoCast(settings,{speakers,voices:voiceNames(),genderOfVoice:v=>voiceGender(settings,v),
+      genderOf:n=>story.find(e=>[e.name,...e.aliases].some(a=>a.toLowerCase()===n.toLowerCase()))?.gender,
+      needsVoice:n=>{const a=settings.assignments[`name:${n.toLowerCase()}`];return a?!a.voice:isUnvoicedExtra(n,settings,{...context,mainSpeaker:main})}});
+    const names=Object.values(added).map(a=>a.name!);
+    if(!names.length)return [];
+    Object.assign(settings.assignments,added);
+    try{await saveSettings()}catch{/* The voices still apply to this reading. */}
+    renderAssignments();notice(`Gave ${names.length===1?'a voice':'voices'} to ${names.join(', ')}. Change ${names.length===1?'it':'them'} in Cast.`);
+    return names;
+  }
   async function startMessage(message: MessageInfo,options:{automatic?:boolean;restoreOnly?:boolean;autoStart?:boolean;updateAudio?:boolean}={}) {
     if(!settings.enabled)throw new Error('Readalong is off. Turn it on to prepare audio.');
     if(!options.restoreOnly){
@@ -586,7 +604,7 @@ export function setup(ctx: SpindleFrontendContext) {
     currentMessage={...message,characterId:message.isUser?undefined:message.characterId ?? speakerCharacterId(message.name,characters,ctx.getActiveChat().characterId ?? undefined)};
     phase='preparing';preparingAudio=true;checkingSavedAudio=true;preparedCount=0;showWidget();notice('Looking for saved audio…');renderPlayer();
     try {
-      const snapshot=normalizeSettings(settings);
+      let snapshot=normalizeSettings(settings);
       const chatId=ctx.getActiveChat().chatId;
       const context:VoiceContext={characters,characterId:currentMessage.characterId,connections:nativeConnections,mainSpeaker:message.name,
         pronunciations:await refreshPronunciations(chatId,options.restoreOnly?undefined:message.id)};
@@ -598,6 +616,7 @@ export function setup(ctx: SpindleFrontendContext) {
         if(results[2].status==='fulfilled' && token===playbackId){nativeConnections=results[2].value;context.connections=nativeConnections;renderConfig()}
       }
       if(token!==playbackId)return;
+      if(!options.restoreOnly){const cast=await castNewSpeakers(message,context,rules);if(token!==playbackId)return;if(cast.length)snapshot=normalizeSettings(settings)}
       currentPassages=planMessageSpeech(message,snapshot,context,rules);currentSegments=currentPassages.flatMap(p=>p.segments);
       if(!currentSegments.length){stop(false);notice('There is no readable text in this message.');return}
       let restored=false,saved=true,openingCount=0;
@@ -998,7 +1017,7 @@ export function setup(ctx: SpindleFrontendContext) {
     const saved=settings.assignments[key],spoken=baseName(name),known=sayingFor(spoken),hasStory=!!ctx.getActiveChat().chatId;
     if(!castDrafts.has(key))castDrafts.set(key,{...(saved??emptyVoice()),...(key.startsWith('name:')?{name:spoken}:{})});
     const draft=castDrafts.get(key)!;
-    const say=sayDrafts.get(key)??{spokenAs:known?.spokenAs??'',aliases:(known?.aliases??[]).join(', ')};
+    const say=sayDrafts.get(key)??{spokenAs:known?.spokenAs??'',aliases:[...new Set([...(known?.aliases??[]),...(saved?.aliases??[])])].join(', ')};
     const touch=()=>{sayDrafts.set(key,say)};
     container.replaceChildren();
     if(!inList){container.classList.add('ra-stack');container.append(el('h3',`Voice for ${spoken}`))}
@@ -1012,27 +1031,34 @@ export function setup(ctx: SpindleFrontendContext) {
     } else container.append(el('p','Open a story to set how this name is said.','ra-muted'));
     const more=disclosure([el('strong','More')],moreOpen.has(key));
     more.details.addEventListener('toggle',()=>{if(more.details.isConnected){if(more.details.open)moreOpen.add(key);else moreOpen.delete(key)}});
+    let refreshPick:(()=>void)|undefined;
     if(hasStory){
       const pick=el('select'),pickField=field('Which spelling to test',pick);pick.onchange=()=>{if(pick.value)testPick.set(key,pick.value);else testPick.delete(key)};
-      const refreshPick=()=>{
+      refreshPick=()=>{
         const names=[...new Set([known?.name??spoken,...say.aliases.split(',').map(s=>s.trim())].filter(Boolean))];
         if(!names.includes(testPick.get(key)??''))testPick.delete(key);
         pick.replaceChildren();
         for(const choice of [{value:'',label:'All of them'},...names.map(value=>({value,label:value}))]){const option=el('option',choice.label);option.value=choice.value;pick.append(option)}
         pick.value=testPick.get(key)??'';pickField.hidden=names.length<2;
       };
-      const also=textInput(say.aliases,v=>{say.aliases=v;touch();refreshPick()});also.maxLength=810;also.placeholder='Nicknames or other spellings, with commas between';
-      refreshPick();more.body.append(field('Also goes by',also),pickField);
+      refreshPick!();more.body.append(pickField);
     }
+    const also=textInput(say.aliases,v=>{say.aliases=v;touch();refreshPick?.()});also.maxLength=810;also.placeholder='Nicknames or other spellings, with commas between';
+    more.body.prepend(field('Also goes by',also),el('p','Every name here uses this voice.','ra-muted'));
+    const sounds=field('Sounds',select([{value:'',label:'Not set'},{value:'f',label:'Female'},{value:'m',label:'Male'}],draft.gender??'',v=>{if(v==='f' || v==='m')draft.gender=v;else delete draft.gender}));
+    more.body.append(sounds);
     const moods=el('div','', 'ra-grid');moods.append(field('Usual mood',select(EMOTIONS.map(v=>({value:v,label:v})),draft.emotion,v=>draft.emotion=v)),field('Usual way of speaking',select(DELIVERIES.map(v=>({value:v,label:v})),draft.delivery,v=>draft.delivery=v)));
     more.body.append(moods);container.append(more.details);
     const done=()=>{castDrafts.delete(key);sayDrafts.delete(key);renderAssignments();if(!inList)castForm(container,key,name,false)};
     const save=button('Save',()=>safe(async()=>{
-      const edited=sayDrafts.has(key),wantsVoice=!!saved || !!draft.voice || draft.emotion!=='neutral' || draft.delivery!=='normal';
-      const entry=edited && say.spokenAs.trim()?sayingEntry(known?.name??spoken,say.spokenAs,say.aliases):undefined;
+      const edited=sayDrafts.has(key),aliases=say.aliases.split(',').map(a=>a.trim()).filter(Boolean);
+      if(edited){if(aliases.length)draft.aliases=aliases;else delete draft.aliases}
+      const wantsVoice=!!saved || !!draft.voice || draft.emotion!=='neutral' || draft.delivery!=='normal' || !!draft.aliases?.length || !!draft.gender;
+      const entry=hasStory && edited && say.spokenAs.trim()?sayingEntry(known?.name??spoken,say.spokenAs,say.aliases):undefined;
       if(!wantsVoice && !entry && !(edited && known))throw new Error('Pick a voice or type how to say the name first.');
-      if(wantsVoice){settings.assignments[key]={...draft};await saveSettings()}
-      if(entry)await saveSaying(entry);else if(edited && known)await removeSaying(known.name);
+      // Saving a row makes its voice the user's own choice, even if Readalong picked it.
+      if(wantsVoice){const own={...draft};delete own.auto;settings.assignments[key]=own;await saveSettings()}
+      if(entry)await saveSaying(entry);else if(hasStory && edited && known && !say.spokenAs.trim())await removeSaying(known.name);
       done();notice(entry || (edited && known)?`Saved ${spoken}. Audio you already have keeps the old sound.`:`Saved ${spoken}.`);
     }),true);
     const remove=button(inList?'Remove':'Clear',()=>safe(async()=>{
@@ -1104,7 +1130,7 @@ export function setup(ctx: SpindleFrontendContext) {
     }
     for(const row of rows){
       const saved=settings.assignments[row.key],known=sayingFor(baseName(row.name));
-      const summary:(Node|string)[]=[el('strong',row.you?`You (${row.name})`:baseName(row.name)),el('span',saved?.voice?voiceLabel(saved.voice):'No voice yet')];
+      const summary:(Node|string)[]=[el('strong',row.you?`You (${row.name})`:baseName(row.name)),el('span',saved?.voice?`${voiceLabel(saved.voice)}${saved.auto?', picked for you':''}`:'No voice yet')];
       if(known)summary.push(el('span',`said “${known.spokenAs}”`));
       if(!saved && !known && !row.you)summary.push(el('span','New','ra-badge'));
       const entry=disclosure(summary,openCast.has(row.key));
@@ -1140,6 +1166,7 @@ export function setup(ctx: SpindleFrontendContext) {
     byName.append(field('Or anyone else, by name',speakerInput),addByName);
     add.body.append(fromLibrary,byName,el('p','Side characters can have a voice too. For Readalong to tell several speakers apart in one reply, turn on “Mark feelings and who is speaking” under Connection.','ra-muted'));
     assignmentsCard.append(add.details,
+      toggle('Give new characters a voice automatically',settings.autoVoices,v=>{settings.autoVoices=v;void safe(saveSettings)},'When the story says a new character sounds female or male, Readalong picks an unused voice you marked that way. You can change it any time.'),
       toggle('Learn how to say new names',settings.promptPronunciations,v=>{settings.promptPronunciations=v;void safe(saveSettings)},'The story model suggests how to say each new name. Your own fixes always win.'),
       nextStep('Next: playback options','options'));
   }

@@ -58,7 +58,8 @@ export function readVoiceRef(raw:unknown):NativeVoiceRef|undefined {
 export function speakerCharacterId(speaker: string, characters: {id:string;name:string}[], fallback?: string): string | undefined {
   const name = speaker.trim().toLowerCase();
   if (name === 'narrator') return undefined;
-  const matches = characters.filter(c => c.name.trim().toLowerCase() === name);
+  // Library names may carry a title after '||'; speakers are matched on the name itself.
+  const matches = characters.filter(c => c.name.trim().toLowerCase() === name || c.name.split('||')[0].trim().toLowerCase() === name);
   return matches.length === 1 ? matches[0].id : fallback;
 }
 export function normalizeSettings(raw: unknown): Settings {
