@@ -10,6 +10,9 @@ export type VoiceGender = 'f' | 'm';
 /** How Google lists its prebuilt voices. A user's own marks in settings.voiceGenders win. */
 const GEMINI_FEMALE = ['Achernar','Aoede','Autonoe','Callirrhoe','Despina','Erinome','Gacrux','Kore','Laomedeia','Leda','Pulcherrima','Sulafat','Vindemiatrix','Zephyr'];
 export const GEMINI_VOICE_GENDERS: Readonly<Record<string,VoiceGender>> = Object.fromEntries(GEMINI_VOICES.map(name => [name.toLowerCase(), GEMINI_FEMALE.includes(name) ? 'f' : 'm'] as [string,VoiceGender]));
+/** How each Gemini studio voice sounds, from Google's voice list, in plain words. */
+export const GEMINI_VOICE_STYLES: Readonly<Record<string,string>> = {zephyr:'bright',puck:'upbeat',charon:'informative',kore:'firm',fenrir:'excitable',leda:'youthful',orus:'firm',aoede:'breezy',callirrhoe:'easy-going',autonoe:'bright',enceladus:'breathy',iapetus:'clear',umbriel:'easy-going',algieba:'smooth',despina:'smooth',erinome:'clear',algenib:'gravelly',rasalgethi:'informative',laomedeia:'upbeat',achernar:'soft',alnilam:'firm',schedar:'steady',gacrux:'mature',pulcherrima:'direct',achird:'friendly',zubenelgenubi:'casual',vindemiatrix:'gentle',sadachbia:'lively',sadaltager:'knowledgeable',sulafat:'warm'};
+export function voiceStyle(voice: string): string | undefined { return GEMINI_VOICE_STYLES[voice.trim().toLowerCase()] }
 /** 'f' or 'm' for a voice, or undefined when nobody has marked it. A saved 'n' clears a built-in mark. */
 export function voiceGender(settings: Pick<Settings,'voiceGenders'>, voice: string): VoiceGender | undefined {
   const key = voice.trim().toLowerCase(), own = settings.voiceGenders?.[key];

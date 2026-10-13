@@ -344,6 +344,10 @@ var DELIVERIES = ["normal", "whispers", "shouts", "softly", "slowly", "laughs", 
 var GEMINI_VOICES = ["Zephyr", "Puck", "Charon", "Kore", "Fenrir", "Leda", "Orus", "Aoede", "Callirrhoe", "Autonoe", "Enceladus", "Iapetus", "Umbriel", "Algieba", "Despina", "Erinome", "Algenib", "Rasalgethi", "Laomedeia", "Achernar", "Alnilam", "Schedar", "Gacrux", "Pulcherrima", "Achird", "Zubenelgenubi", "Vindemiatrix", "Sadachbia", "Sadaltager", "Sulafat"];
 var GEMINI_FEMALE = ["Achernar", "Aoede", "Autonoe", "Callirrhoe", "Despina", "Erinome", "Gacrux", "Kore", "Laomedeia", "Leda", "Pulcherrima", "Sulafat", "Vindemiatrix", "Zephyr"];
 var GEMINI_VOICE_GENDERS = Object.fromEntries(GEMINI_VOICES.map((name) => [name.toLowerCase(), GEMINI_FEMALE.includes(name) ? "f" : "m"]));
+var GEMINI_VOICE_STYLES = { zephyr: "bright", puck: "upbeat", charon: "informative", kore: "firm", fenrir: "excitable", leda: "youthful", orus: "firm", aoede: "breezy", callirrhoe: "easy-going", autonoe: "bright", enceladus: "breathy", iapetus: "clear", umbriel: "easy-going", algieba: "smooth", despina: "smooth", erinome: "clear", algenib: "gravelly", rasalgethi: "informative", laomedeia: "upbeat", achernar: "soft", alnilam: "firm", schedar: "steady", gacrux: "mature", pulcherrima: "direct", achird: "friendly", zubenelgenubi: "casual", vindemiatrix: "gentle", sadachbia: "lively", sadaltager: "knowledgeable", sulafat: "warm" };
+function voiceStyle(voice) {
+  return GEMINI_VOICE_STYLES[voice.trim().toLowerCase()];
+}
 function voiceGender(settings, voice) {
   const key = voice.trim().toLowerCase(), own = settings.voiceGenders?.[key];
   if (own)
@@ -2728,6 +2732,7 @@ var STYLE = `
 .ra .ra-voice-rows{display:flex;flex-direction:column;max-height:420px;overflow:auto;border:1px solid var(--ra-line);border-radius:10px}
 .ra .ra-voice-row{display:flex;align-items:center;gap:6px;padding:5px 8px 5px 12px;border-bottom:1px solid var(--ra-line)}.ra .ra-voice-row:last-child{border-bottom:0}
 .ra .ra-voice-name{flex:1;min-width:0;display:flex;align-items:center;gap:8px;overflow-wrap:anywhere}
+.ra .ra-voice-style{color:var(--ra-dim);font-size:12.5px}
 .ra button.ra-mark{min-height:30px;padding:4px 10px;font-size:12.5px;border-radius:15px;color:var(--ra-dim);background:transparent}
 .ra button.ra-mark[aria-pressed=true]{color:var(--ra-text);border-color:var(--ra-mark);background:rgba(231,178,76,.14);font-weight:600}
 .ra .ra-voice-rows>p{padding:12px}
@@ -3078,9 +3083,10 @@ function setup(ctx) {
       names.unshift(value);
     return groupedVoiceSelect(names, value, change, inherited ? `Main voice: ${voiceLabel(settings.voice)}` : undefined);
   }
-  function voiceLabel(name) {
-    const gender = name ? voiceGender(settings, name) : undefined;
-    return gender ? `${name} (${gender === "f" ? "female" : "male"})` : name;
+  function voiceLabel(name, describe = true) {
+    const gender = name ? voiceGender(settings, name) : undefined, style = describe && name ? voiceStyle(name) : undefined;
+    const parts = [gender ? gender === "f" ? "female" : "male" : "", style ?? ""].filter(Boolean);
+    return parts.length ? `${name} (${parts.join(", ")})` : name;
   }
   function groupedVoiceSelect(names, value, change, emptyLabel) {
     const s = el("select"), option = (v, label) => {
@@ -3304,7 +3310,7 @@ function setup(ctx) {
       const top = el("div", "", "ra-row ra-widget-top"), text = el("div", "", "ra-widget-text"), who = el("div", "", "ra-who");
       who.append(el("strong", speaking ? speakerLabel(currentSegments[position]?.speaker, "Voice") : "Readalong"));
       if (speaking && currentPassages[currentPassage]?.voice)
-        who.append(el("span", voiceLabel(currentPassages[currentPassage].voice)));
+        who.append(el("span", voiceLabel(currentPassages[currentPassage].voice, false)));
       const caption = el("p", warning || (speaking ? plainText(currentSegments[position]?.text ?? "") : status.textContent || "Choose a message."), speaking && !warning ? "ra-caption ra-reading" : "ra-caption");
       caption.title = warning ? status.textContent ?? warning : caption.textContent ?? "";
       text.append(who, caption);
@@ -4461,7 +4467,7 @@ function setup(ctx) {
       const segment = currentSegments[position], meta = el("div", "", "ra-meta"), voice = currentPassages[currentPassage]?.voice;
       meta.append(el("strong", speakerLabel(segment?.speaker, "Voice")));
       if (voice)
-        meta.append(el("span", voiceLabel(voice)));
+        meta.append(el("span", voiceLabel(voice, false)));
       meta.append(el("span", preparingAudio || incompleteAudio ? `${preparedCount} of ${currentPassages.length} parts ready` : `Sentence ${position + 1} of ${currentSegments.length}`, "ra-push"));
       const preparation = preparingAudio || incompleteAudio;
       const progress = el("progress");
@@ -4886,10 +4892,13 @@ function setup(ctx) {
         list.replaceChildren();
         for (const name of names) {
           const gender = voiceGender(settings, name);
-          if (!name.toLowerCase().includes(voiceQuery.toLowerCase()) || voiceFilter !== "all" && (gender ?? "none") !== voiceFilter)
+          const style = voiceStyle(name), query = voiceQuery.toLowerCase();
+          if (!(name.toLowerCase().includes(query) || !!style?.includes(query)) || voiceFilter !== "all" && (gender ?? "none") !== voiceFilter)
             continue;
           const item = el("div", "", "ra-voice-row"), label = el("span", "", "ra-voice-name");
           label.append(el("strong", name));
+          if (style)
+            label.append(el("span", style, "ra-voice-style"));
           if (name === settings.voice)
             label.append(el("span", "Main", "ra-badge"));
           const play = iconButton("speaker", `Listen to ${name}`, () => safe(() => preview(name)), "ra-icon");
@@ -4929,7 +4938,7 @@ function setup(ctx) {
         voiceQuery = v;
         drawList();
       });
-      search.placeholder = "Search voices";
+      search.placeholder = "Search by name or sound, like “warm”";
       search.setAttribute("aria-label", "Search voices");
       const list = el("div", "", "ra-voice-rows");
       drawList();

@@ -1,5 +1,5 @@
 import type { SpindleFrontendContext, SpindleCharacterEditorTabHandle, SpindleFloatWidgetHandle } from 'lumiverse-spindle-types';
-import { DEFAULTS, GEMINI_VOICES, parseSegments, DEFAULT_SPEECH_RULES, type SpeechRules, voiceGender, markVoiceGender, type VoiceGender, EMOTIONS, DELIVERIES, needsPcm, normalizeSettings, speakerCharacterId, plainText, stripCues, speechRequest, type CharacterInfo, type Settings, type SpeechSegment, type SpeechModel, type MessageInfo, type VoiceAssignment } from './shared';
+import { DEFAULTS, GEMINI_VOICES, voiceStyle, parseSegments, DEFAULT_SPEECH_RULES, type SpeechRules, voiceGender, markVoiceGender, type VoiceGender, EMOTIONS, DELIVERIES, needsPcm, normalizeSettings, speakerCharacterId, plainText, stripCues, speechRequest, type CharacterInfo, type Settings, type SpeechSegment, type SpeechModel, type MessageInfo, type VoiceAssignment } from './shared';
 import { PassageMarker } from './highlight';
 import { createNativeTtsClient, nativeSpeechRequest, type NativeConnection } from './native-tts';
 import { planSpeech, planMessageSpeech, prepareAll, estimatedSentenceIndex, isUnvoicedExtra, storyRoster, type SpeechPassage, type VoiceContext } from './playback-plan';
@@ -80,6 +80,7 @@ const STYLE = `
 .ra .ra-voice-rows{display:flex;flex-direction:column;max-height:420px;overflow:auto;border:1px solid var(--ra-line);border-radius:10px}
 .ra .ra-voice-row{display:flex;align-items:center;gap:6px;padding:5px 8px 5px 12px;border-bottom:1px solid var(--ra-line)}.ra .ra-voice-row:last-child{border-bottom:0}
 .ra .ra-voice-name{flex:1;min-width:0;display:flex;align-items:center;gap:8px;overflow-wrap:anywhere}
+.ra .ra-voice-style{color:var(--ra-dim);font-size:12.5px}
 .ra button.ra-mark{min-height:30px;padding:4px 10px;font-size:12.5px;border-radius:15px;color:var(--ra-dim);background:transparent}
 .ra button.ra-mark[aria-pressed=true]{color:var(--ra-text);border-color:var(--ra-mark);background:rgba(231,178,76,.14);font-weight:600}
 .ra .ra-voice-rows>p{padding:12px}
@@ -286,7 +287,12 @@ export function setup(ctx: SpindleFrontendContext) {
     return groupedVoiceSelect(names,value,change,inherited ? `Main voice: ${voiceLabel(settings.voice)}` : undefined);
   }
   /** A voice name as shown anywhere in the app: "Leda (female)" once the voice is marked. */
-  function voiceLabel(name: string) { const gender = name ? voiceGender(settings,name) : undefined; return gender ? `${name} (${gender==='f' ? 'female' : 'male'})` : name }
+  /** "Kore (female, firm)". The player uses the short form without how it sounds. */
+  function voiceLabel(name: string, describe = true) {
+    const gender = name ? voiceGender(settings,name) : undefined, style = describe && name ? voiceStyle(name) : undefined;
+    const parts = [gender ? (gender==='f' ? 'female' : 'male') : '', style ?? ''].filter(Boolean);
+    return parts.length ? `${name} (${parts.join(', ')})` : name;
+  }
   /** A voice picker sorted into Female, Male and Not marked once any voice is marked. */
   function groupedVoiceSelect(names: string[], value: string, change: (value: string)=>void, emptyLabel?: string) {
     const s = el('select'), option = (v: string, label: string) => { const o = el('option',label); o.value = v; return o };
@@ -399,7 +405,7 @@ export function setup(ctx: SpindleFrontendContext) {
     }else{
       const top=el('div','', 'ra-row ra-widget-top'),text=el('div','', 'ra-widget-text'),who=el('div','', 'ra-who');
       who.append(el('strong',speaking?speakerLabel(currentSegments[position]?.speaker,'Voice'):'Readalong'));
-      if(speaking && currentPassages[currentPassage]?.voice)who.append(el('span',voiceLabel(currentPassages[currentPassage].voice)));
+      if(speaking && currentPassages[currentPassage]?.voice)who.append(el('span',voiceLabel(currentPassages[currentPassage].voice,false)));
       // While reading, show the sentence itself. Otherwise the status says what to do next.
       const caption=el('p',warning || (speaking?plainText(currentSegments[position]?.text ?? ''):status.textContent || 'Choose a message.'),speaking && !warning?'ra-caption ra-reading':'ra-caption');
       caption.title=warning?status.textContent??warning:caption.textContent ?? '';text.append(who,caption);
@@ -988,7 +994,7 @@ export function setup(ctx: SpindleFrontendContext) {
     const float=()=>iconButton('float','Floating player',()=>safe(openWidget),'ra-icon ra-quiet ra-push');
     if (currentSegments.length) {
       const segment=currentSegments[position],meta=el('div','', 'ra-meta'),voice=currentPassages[currentPassage]?.voice;
-      meta.append(el('strong',speakerLabel(segment?.speaker,'Voice')));if(voice)meta.append(el('span',voiceLabel(voice)));
+      meta.append(el('strong',speakerLabel(segment?.speaker,'Voice')));if(voice)meta.append(el('span',voiceLabel(voice,false)));
       meta.append(el('span',(preparingAudio || incompleteAudio)?`${preparedCount} of ${currentPassages.length} parts ready`:`Sentence ${position+1} of ${currentSegments.length}`,'ra-push'));
       const preparation=preparingAudio || incompleteAudio;
       const progress=el('progress');progress.max=preparation?currentPassages.length:currentSegments.length;progress.value=preparation?preparedCount:phase==='ready'?0:position+1;progress.setAttribute('aria-label',preparation?'Speech preparation':'Playback progress');
@@ -1168,14 +1174,15 @@ export function setup(ctx: SpindleFrontendContext) {
       for(const [id,label] of [['all','All'],['f','Female'],['m','Male'],['none','Not marked']] as const){
         const b=button(`${label} ${counts[id]}`,()=>{voiceFilter=id;renderVoices()});b.dataset.raControl=`filter-${id}`;b.setAttribute('aria-pressed',String(voiceFilter===id));filters.append(b);
       }
-      const search=textInput(voiceQuery,v=>{voiceQuery=v;drawList()});search.placeholder='Search voices';search.setAttribute('aria-label','Search voices');
+      const search=textInput(voiceQuery,v=>{voiceQuery=v;drawList()});search.placeholder='Search by name or sound, like “warm”';search.setAttribute('aria-label','Search voices');
       const list=el('div','', 'ra-voice-rows');
       function drawList() {
         list.replaceChildren();
         for(const name of names) {
           const gender=voiceGender(settings,name);
-          if(!name.toLowerCase().includes(voiceQuery.toLowerCase()) || voiceFilter!=='all' && (gender??'none')!==voiceFilter)continue;
-          const item=el('div','', 'ra-voice-row'),label=el('span','', 'ra-voice-name');label.append(el('strong',name));
+          const style=voiceStyle(name),query=voiceQuery.toLowerCase();
+          if(!(name.toLowerCase().includes(query) || !!style?.includes(query)) || voiceFilter!=='all' && (gender??'none')!==voiceFilter)continue;
+          const item=el('div','', 'ra-voice-row'),label=el('span','', 'ra-voice-name');label.append(el('strong',name));if(style)label.append(el('span',style,'ra-voice-style'));
           if(name===settings.voice)label.append(el('span','Main','ra-badge'));
           const play=iconButton('speaker',`Listen to ${name}`,()=>safe(()=>preview(name)),'ra-icon');play.disabled=!settings.enabled;
           const mark=(g:VoiceGender,text:string)=>{const b=button(text,()=>setVoiceGender(name,g));b.dataset.raControl=`${name}-${g}`;b.className='ra-mark';b.setAttribute('aria-pressed',String(gender===g));b.setAttribute('aria-label',`Mark ${name} as ${text.toLowerCase()}`);return b};
