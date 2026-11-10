@@ -19,6 +19,7 @@ import {earlyPlaybackPrefix} from './early-playback';
 import {AutomaticPlayback} from './automatic-playback';
 import {CompletionInbox,type CompletedReply} from './auto-preparation';
 import {normalizePronunciations,pronunciationEntry,pronunciationSample,type Pronunciations,type PronunciationEntry} from './pronunciation';
+import { uuid } from './safe-id';
 
 const STYLE = `
 ::highlight(lumiverse-readalong){background:rgba(245,190,80,.30);color:inherit;text-decoration:underline;text-decoration-color:#e7b24c;text-decoration-thickness:2px;}
@@ -164,7 +165,7 @@ function timeLabel(seconds:number){const value=Math.floor(seconds);return `${Mat
 
 export function setup(ctx: SpindleFrontendContext) {
   let settings = normalizeSettings(DEFAULTS), ready = false, initialized = false, disposed = false;
-  const hasKeys={openrouter:false,local:false,freesound:false},frontendId=crypto.randomUUID();
+  const hasKeys={openrouter:false,local:false,freesound:false},frontendId=uuid();
   /** People found by reading the open story, refreshed when its messages load. */
   let storyPeople:Person[]=[],peopleFor='';
   const castDrafts=new Map<string,VoiceAssignment>(),openCast=new Set<string>();let castInitialized=false,addOpen=false,voiceQuery='',voiceFilter:'all'|'f'|'m'|'none'='all',fixName='',fixSay='',viewChosen=false;
@@ -261,7 +262,7 @@ export function setup(ctx: SpindleFrontendContext) {
   }
   function rpc(type: string, payload: Record<string,unknown> = {}): Promise<any> {
     if (disposed) return Promise.reject(new Error('Readalong was closed.'));
-    const requestId = crypto.randomUUID();
+    const requestId = uuid();
     return new Promise((resolve,reject) => {
       const timer = setTimeout(() => { pending.delete(requestId); reject(new Error('Readalong timed out. Check the extension permissions and connection.')) }, 70000);
       pending.set(requestId,{resolve,reject,timer}); ctx.sendToBackend({ type, requestId, frontendId, ...payload });

@@ -1,8 +1,9 @@
 import type { PreparedClip } from './prepared-audio';
 import {readRecordingPlan,recordingPlan,type RecordingMetadata,type RecordingPlan} from './saved-recording';
+import { sha256Digest } from './safe-id';
 
 export async function preparationHash(value:unknown):Promise<string> {
-  const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(JSON.stringify(value)));
+  const digest=await sha256Digest(new TextEncoder().encode(JSON.stringify(value)));
   return Array.from(new Uint8Array(digest),n=>n.toString(16).padStart(2,'0')).join('');
 }
 interface CachedAudio {id:string;userId:string;clips:(PreparedClip|undefined)[];bytes:number;at:number;recording?:RecordingMetadata}
